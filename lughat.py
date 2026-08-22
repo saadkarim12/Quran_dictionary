@@ -35,6 +35,8 @@ Usage:
     lughat.py sarf <root> [bab]     ishtiqaq saghir, with refusals
     lughat.py root <root>           corpus occurrences of a root
     lughat.py word <word>           search the mushaf text
+  lughat.py akbar <root>          the six permutations, per Ibn Jinni
+  lughat.py letter <root|letter>  Ibn Jinni on the root's letters
   lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
   lughat.py ingest <lexicon> --from PATH
                                   load a lexicon, ALL at verified = 0
@@ -1690,6 +1692,54 @@ def heading_root_bare(heading):
     return _as_root(h) if _BARE_HDR_RE.match(h) else None
 
 
+# The 29 letter-names, as the sources spell them. Needed to read Ibn Jinni's
+# per-letter chapters (باب الهمزة / حرف التاء) and, independently, to check
+# Ibn Faris against himself -- he opens nearly every article by naming his own
+# radicals, «السين والكاف والنون».
+LETTER_NAMES = {
+    "الهمزة": "ء", "الألف": "ا", "الالف": "ا", "الباء": "ب", "التاء": "ت",
+    "الثاء": "ث", "الجيم": "ج", "الحاء": "ح", "الخاء": "خ", "الدال": "د",
+    "الذال": "ذ", "الراء": "ر", "الزاي": "ز", "الزاء": "ز", "السين": "س",
+    "الشين": "ش", "الصاد": "ص", "الضاد": "ض", "الطاء": "ط", "الظاء": "ظ",
+    "العين": "ع", "الغين": "غ", "الفاء": "ف", "القاف": "ق", "الكاف": "ك",
+    "اللام": "ل", "الميم": "م", "النون": "ن", "الهاء": "ه", "الواو": "و",
+    "الياء": "ي",
+}
+
+SIRR_ATTRIBUTION = (
+    "Ibn Jinni, Sirr Sina'at al-I'rab. Digital text: OpenITI, CC BY-NC-SA. "
+    "https://github.com/OpenITI")
+
+KHASAIS_ATTRIBUTION = (
+    "Ibn Jinni, al-Khasa'is. Digital text: OpenITI, CC BY-NC-SA. "
+    "https://github.com/OpenITI")
+
+_SIRR_HDR_RE = re.compile(
+    r"^(?:CHECK|AUTO)?\s*(?:باب|حرف|زيادة)\s+(\S+)\s*$")
+
+
+def heading_letter(heading):
+    """Sirr Sina'at al-I'rab is organised letter by letter: "باب الهمزة",
+    "حرف التاء", and supplementary "زيادة التاء" sections. Returns the LETTER,
+    not a root -- this book is about the letters themselves."""
+    m = _SIRR_HDR_RE.match(clean_heading(heading).replace("CHECK", "")
+                           .replace("AUTO", "").strip())
+    if not m:
+        return None
+    return LETTER_NAMES.get(m.group(1).strip())
+
+
+_KHASAIS_HDR_RE = re.compile(r"^(?:باب|فصل)\b")
+
+
+def heading_chapter(heading):
+    """al-Khasa'is is organised by TOPIC, not by root -- 273 chapters of
+    "باب القول على ...". There is no root to key on, so the chapter title is
+    the headword and the link to a root is made by search, never by a key."""
+    h = clean_heading(heading)
+    return h if _KHASAIS_HDR_RE.match(h) and len(h) > 6 else None
+
+
 LISAN_ATTRIBUTION = (
     "Ibn Manzur, Lisan al-'Arab. Digital text: OpenITI, CC BY-NC-SA. "
     "https://github.com/OpenITI")
@@ -1714,6 +1764,26 @@ def detect_markdown_header(lines, i, spec):
         return ("__SECTION__", None, 1)
     root = spec["heading"](head)
     return (head.strip(), root, 1) if root else ("__ARTIFACT__", None, 1)
+
+
+def detect_by_heading(lines, i, spec, rule):
+    """A '### |' header run through a source-specific heading rule.
+
+    In these books every chapter IS marked, so a header the rule does not
+    recognise is a structural break -- a volume divider, a stray title -- and
+    never prose. It therefore CLOSES the chapter in progress.
+
+    Ibn Jinni's Sirr shows why. This witness never marks حرف النون, and the
+    volume divider "### | CHECK [جزء 2]" was being folded in as body text, so
+    the chapter headed حرف الميم ran to 109,605 bytes and contained the whole
+    of volume two -- half of it Ibn Jinni on NUN, served under MIM. Ending the
+    chapter leaves nun unassigned, which is a gap the tool can report; the
+    alternative was a misattribution it could not see."""
+    m = _HDR_RE.match(lines[i])
+    if not m:
+        return None
+    got = rule(m.group(1))
+    return (m.group(1).strip(), got, 1) if got else ("__SECTION__", None, 1)
 
 
 def detect_lisan(lines, i):
@@ -1802,6 +1872,40 @@ LEXICONS = {
         # book.
         "ordered_by": "last",
         "order_depth": 2,
+    },
+    "sirr": {
+        "title": "Sirr Sina'at al-I'rab",
+        "author": "Ibn Jinni (d. 392 AH)",
+        "edition": "OpenITI (ShamAY 0034702)",
+        "licence": "CC BY-NC-SA",
+        "licence_note": "OpenITI digital text; non-commercial, share-alike, "
+                        "attribution required. Personal study use.",
+        "url": "https://github.com/OpenITI",
+        "distributable": True,
+        "attribution": SIRR_ATTRIBUTION,
+        "heading": heading_letter,
+        "detect": lambda lines, i, spec: detect_by_heading(
+            lines, i, spec, heading_letter),
+        "keyed_by": "letter",       # NOT by root: this book is about letters
+        "ordered_by": "first",
+        "order_depth": 0,           # the letter order is the book's own
+    },
+    "khasais": {
+        "title": "al-Khasa'is",
+        "author": "Ibn Jinni (d. 392 AH)",
+        "edition": "OpenITI (Shamela 0009986)",
+        "licence": "CC BY-NC-SA",
+        "licence_note": "OpenITI digital text; non-commercial, share-alike, "
+                        "attribution required. Personal study use.",
+        "url": "https://github.com/OpenITI",
+        "distributable": True,
+        "attribution": KHASAIS_ATTRIBUTION,
+        "heading": heading_chapter,
+        "detect": lambda lines, i, spec: detect_by_heading(
+            lines, i, spec, heading_chapter),
+        "keyed_by": "chapter",      # topic-organised; no root to key on
+        "ordered_by": "first",
+        "order_depth": 0,
     },
 }
 
@@ -1899,7 +2003,12 @@ def parse_lexicon(text, corpus_roots, spec):
                 continue
             if cur:
                 yield cur
-            if hr == "__NOROOT__":
+            if spec.get("keyed_by") in ("letter", "chapter"):
+                # Not root-keyed. Ibn Jinni's Sirr is about the LETTERS and
+                # al-Khasa'is is about topics; inventing a root for either
+                # would be filing text under something the book never said.
+                root, how = None, spec["keyed_by"]
+            elif hr == "__NOROOT__":
                 root, how = None, "unparsed"
             else:
                 root, how = resolve_root(hr, corpus_roots)
@@ -1907,7 +2016,8 @@ def parse_lexicon(text, corpus_roots, spec):
             # The whole key, rotated so the source's primary radical leads.
             # Comparing one letter meant every heading inside كتاب الألف
             # scored identically and the check was near-vacuous.
-            ak = alpha_key(hr if hr != "__NOROOT__" else "")
+            ak = alpha_key(hr if hr not in ("__NOROOT__",)
+                           and depth else "")
             key = ((ak[order_ix],) + tuple(
                 x for j, x in enumerate(ak)
                 if j != (order_ix % len(ak))))[:depth] if ak else prev_key
@@ -1934,6 +2044,7 @@ def parse_lexicon(text, corpus_roots, spec):
     # A gap the reader cannot see is a gap they will mistake for absence.
     if spec.get("_unassigned") is not None:
         spec["_unassigned"][0] = unassigned[0]
+    del prev_key
 
 
 def parse_maqayis(text, corpus_roots):
@@ -2052,6 +2163,7 @@ def ingest_lexicon(conn, key, path):
         cur.execute("DELETE FROM entries WHERE source_id=? AND verified=0 "
                     "AND rejected=0", (sid,))
         corpus = {r[0] for r in cur.execute("SELECT root_ar FROM roots")}
+        spec = dict(spec, _unassigned=[0])
         # Keyed on the whole entry, not the headword. Headwords repeat --
         # al-Raghib has two separate articles headed أب -- so skipping by
         # headword deleted the undecided sibling of every decided row and
@@ -2102,11 +2214,102 @@ def ingest_lexicon(conn, key, path):
             stats[e["extraction"]] = stats.get(e["extraction"], 0) + 1
             n += 1
         conn.commit()
-    return n, stats, kept, recited
+    return n, stats, kept, recited, spec["_unassigned"][0]
 
 
 def ingest_maqayis(conn, path):
     return ingest_lexicon(conn, "maqayis", path)[:2]
+
+
+# ==========================================================================
+# 8c.  ISHTIQAQ AKBAR  --  Ibn Jinni's greater derivation
+# ==========================================================================
+#
+# Ibn Jinni's claim (al-Khasa'is) is that the six permutations of a triliteral
+# root often orbit one idea -- his demonstration is on ق و ل: قول، وقل، لوق،
+# قلو، ولق، لقو, all turning on lightness and speed.
+#
+# TWO DIFFERENT THINGS, and the tool must not blur them:
+#
+#   LISTING the six permutations is arithmetic, and saying which of them the
+#   Qur'an uses is a database lookup. Both are derivation and both are safe.
+#
+#   Claiming they SHARE A SENSE is Ibn Jinni's thesis about Arabic. It is not
+#   derivable from the letters, this tool cannot compute it, and it must be
+#   quoted from al-Khasa'is with a page or not asserted at all.
+#
+# It is also a minority method. Many philologists rejected it as speculative,
+# so it is supporting insight AFTER Ibn Faris and al-Raghib have established a
+# meaning -- never primary evidence -- and the output says so.
+
+REFUSAL_AKBAR_SENSE = (
+    "REFUSED. Whether these six permutations share a single idea is Ibn "
+    "Jinni's THESIS, argued in al-Khasa'is. It is not derivable from the "
+    "letters and this tool will not assert it. Quote him, with a page, or "
+    "leave it unsaid. Note also that al-ishtiqaq al-akbar is a minority "
+    "method: use it as supporting insight after Ibn Faris and al-Raghib have "
+    "established the meaning, never as primary evidence."
+)
+
+REFUSAL_AKBAR_NOT_THULATHI = (
+    "REFUSED. al-ishtiqaq al-akbar is stated for the THULATHI root -- six "
+    "permutations of three radicals. This root has %d, and nothing in Ibn "
+    "Jinni licenses extending the method to it."
+)
+
+
+class Permutation(object):
+    """One of the six orderings, and what the corpus says about it."""
+
+    def __init__(self, root, is_original, n_segments, n_lemmas, example):
+        self.root = root
+        self.is_original = is_original
+        self.n_segments = n_segments
+        self.n_lemmas = n_lemmas
+        self.example = example
+
+    @property
+    def occurs(self):
+        return self.n_segments > 0
+
+
+def permutations_of(root):
+    """The distinct orderings of a triliteral's radicals, in a fixed order so
+    the output is reproducible.  A root with a repeated radical has fewer than
+    six -- that is arithmetic, not an omission."""
+    letters = canonical_root(root)
+    if len(letters) != 3:
+        raise ValueError(REFUSAL_AKBAR_NOT_THULATHI % len(letters))
+    seen = []
+    for a in range(3):
+        for b in range(3):
+            for c in range(3):
+                if len({a, b, c}) != 3:
+                    continue
+                cand = letters[a] + letters[b] + letters[c]
+                if cand not in seen:
+                    seen.append(cand)
+    return sorted(seen, key=alpha_key)
+
+
+def ishtiqaq_akbar(conn, root):
+    """Pure retrieval over a computed list.  No claim is made about meaning."""
+    original = "".join(canonical_root(root))
+    out = []
+    for perm in permutations_of(root):
+        row = q(conn, "SELECT n_segments, n_lemmas FROM roots WHERE root_ar=?",
+                (perm,)).fetchone()
+        example = None
+        if row:
+            ex = q(conn, "SELECT form_ar, sura, aya, word, seg, features "
+                         "FROM segments WHERE root_ar=? AND is_stem=1 "
+                         "ORDER BY sura, aya, word, seg LIMIT 1",
+                   (perm,)).fetchone()
+            example = ex
+        out.append(Permutation(perm, perm == original,
+                               row["n_segments"] if row else 0,
+                               row["n_lemmas"] if row else 0, example))
+    return out
 
 
 # ==========================================================================
@@ -2532,6 +2735,105 @@ def cmd_review(conn, args):
             approved += 1
     _w("")
     _w("%d approved this session. The rest stay unserved." % approved)
+
+
+def letter_entries(conn, letter):
+    """Ibn Jinni on one letter -- APPROVED chapters only, like everything else
+    a reader sees."""
+    return list(q(conn,
+                  "SELECT e.*, s.title, s.author, s.edition, s.attribution "
+                  "FROM v_entries e JOIN sources s ON s.id = e.source_id "
+                  "WHERE s.key = 'sirr' AND e.headword LIKE ? ORDER BY e.id",
+                  ("%" + letter_name(letter) + "%",)))
+
+
+def letter_name(letter):
+    for name, ch in LETTER_NAMES.items():
+        if ch == letter and name.startswith("ال") and len(name) > 3:
+            return name
+    return letter
+
+
+def cmd_letter(conn, letter):
+    """Requirement 1a: what Ibn Jinni says about a root's LETTERS."""
+    letters = canonical_root(letter) if len(letter.strip()) > 1 else \
+        [letter.strip()]
+    _w(BAR)
+    _w("THE LETTERS   %s   (Ibn Jinni, Sirr Sina'at al-I'rab)"
+       % " ".join(letters))
+    _w(BAR)
+    for ch in letters:
+        _w("")
+        _w("%s  (%s)" % (ch, letter_name(ch)))
+        _w(RULE)
+        ents = letter_entries(conn, ch)
+        if not ents:
+            with unguarded(conn):
+                pending = conn.execute(
+                    "SELECT COUNT(*) n FROM entries e JOIN sources s "
+                    "ON s.id=e.source_id WHERE s.key='sirr' AND "
+                    "e.headword LIKE ? AND e.verified=0 AND e.rejected=0",
+                    ("%" + letter_name(ch) + "%",)).fetchone()["n"]
+            if pending:
+                _w("  %d chapter(s) ingested but NOT APPROVED, so not shown."
+                   % pending)
+                _w("  Run:  python3 lughat.py serve")
+            else:
+                _w("  %s" % NOT_FOUND_UR)
+                for line in _wrap(
+                        "%s: this witness of Sirr Sina'at al-I'rab has no "
+                        "chapter for this letter. That is a fact about the "
+                        "digitisation, not about Ibn Jinni -- the printed "
+                        "book treats all 29." % NOT_FOUND_EN, 68):
+                    _w("  " + line)
+            continue
+        for e in ents:
+            for line in render_entry(e["text_raw"])[:4]:
+                for w in _wrap(line, 70):
+                    _w("    " + w)
+            _w("      -- %s, %s, vol %s p. %s"
+               % (e["title"], e["edition"] or "", e["vol"], e["page"]))
+            _w("      %s" % e["attribution"])
+    _w("")
+
+
+def cmd_akbar(conn, root):
+    letters = canonical_root(root)
+    _w(BAR)
+    _w("AL-ISHTIQAQ AL-AKBAR   root: %s   (Ibn Jinni, al-Khasa'is)"
+       % " ".join(letters))
+    _w(BAR)
+    if len(letters) != 3:
+        for line in _wrap(REFUSAL_AKBAR_NOT_THULATHI % len(letters), 72):
+            _w(line)
+        return
+    perms = ishtiqaq_akbar(conn, root)
+    _w("The six permutations of these three radicals, and what the Qur'an")
+    _w("does with each. Listing them is arithmetic; the counts are the corpus.")
+    _w("")
+    _w("%-8s %-9s %-7s %s" % ("ORDER", "SEGMENTS", "LEMMAS", "FIRST OCCURRENCE"))
+    _w(RULE)
+    for p in perms:
+        mark = " <- the root asked for" if p.is_original else ""
+        if not p.occurs:
+            _w("%-8s %-9s %-7s %s%s"
+               % (p.root, "-", "-", "does not occur in the Qur'an", mark))
+            continue
+        ex = p.example
+        _w("%-8s %-9d %-7d %s  %d:%d:%d:%d%s"
+           % (p.root, p.n_segments, p.n_lemmas, ex["form_ar"], ex["sura"],
+              ex["aya"], ex["word"], ex["seg"], mark))
+    n = sum(1 for p in perms if p.occurs)
+    _w("")
+    _w("%d of the %d orderings occur in the Qur'an." % (n, len(perms)))
+    if len(perms) < 6:
+        _w("(Fewer than six because a radical repeats -- that is arithmetic.)")
+    _w("")
+    _w("shared sense:")
+    for line in _wrap(REFUSAL_AKBAR_SENSE, 70):
+        _w("  " + line)
+    _w("")
+    _w(QAC_ATTRIBUTION)
 
 
 def cmd_aya(conn, ref):
@@ -4105,6 +4407,122 @@ def _t(conn):
     return "و+اح+د -> واحد; 'إن ' + 'إلك' -> إن إلك"
 
 
+@test("HONESTY", "ishtiqaq akbar lists, and refuses to interpret")
+def _t(conn):
+    """Listing the six permutations is arithmetic and saying which occur is a
+    lookup. Claiming they share a sense is Ibn Jinni's THESIS -- not derivable
+    from the letters, and a minority method besides."""
+    perms = permutations_of("سكن")
+    ck(sorted(perms) == sorted(["سكن", "سنك", "كسن", "كنس", "نسك", "نكس"]),
+       "permutations wrong: %s" % perms)
+    ck(len(permutations_of("مدد")) == 3,
+       "a repeated radical must yield fewer than six -- that is arithmetic")
+    got = {p.root: p for p in ishtiqaq_akbar(conn, "سكن")}
+    for root in ("سكن", "كنس", "نسك", "نكس"):
+        n = q(conn, "SELECT n_segments FROM roots WHERE root_ar=?",
+              (root,)).fetchone()
+        ck(got[root].n_segments == n["n_segments"],
+           "%s counted %d, corpus says %d"
+           % (root, got[root].n_segments, n["n_segments"]))
+    for root in ("سنك", "كسن"):
+        ck(not got[root].occurs, "%s should not occur" % root)
+    # Captured SEPARATELY: sharing one buffer let the quadriliteral's refusal
+    # satisfy the assertion meant for the shared-sense refusal.
+    def render(root):
+        out = io.StringIO()
+        real, sys.stdout = sys.stdout, out
+        try:
+            cmd_akbar(conn, root)
+        finally:
+            sys.stdout = real
+        return out.getvalue()
+
+    body = render("سكن")
+    quad = render("دحرج")
+    ck("REFUSED" in quad and "thulathi" in quad.lower(),
+       "a quadriliteral was not refused: akbar is stated for three radicals")
+    ck("REFUSED" in body and "THESIS" in body,
+       "the shared-sense claim is not refused")
+    # asserted on the constant, and on a single word surviving the wrap:
+    # a phrase check would break the moment the line width changed
+    ck("minority method" in REFUSAL_AKBAR_SENSE,
+       "the refusal no longer says the method is a minority one")
+    ck("Ibn Faris and al-Raghib" in REFUSAL_AKBAR_SENSE,
+       "the refusal no longer says akbar comes AFTER the lexicographers")
+    ck("minority" in body, "the method's standing does not reach the reader")
+    try:
+        permutations_of("دحرج")
+    except ValueError:
+        pass
+    else:
+        raise Fail("permutations_of accepted a quadriliteral")
+    return "6 orderings, 4 attested; sense refused; rubaai refused"
+
+
+@test("HONESTY", "a book about letters is not keyed by root")
+def _t(conn):
+    """Sirr Sina'at al-I'rab treats the LETTERS and al-Khasa'is treats topics.
+    Inventing a root for either would file text under something the book never
+    said."""
+    for key, kind in (("sirr", "letter"), ("khasais", "chapter")):
+        ck(LEXICONS[key].get("keyed_by") == kind,
+           "%s is not marked as keyed by %s" % (key, kind))
+        with unguarded(conn):
+            bad = conn.execute(
+                "SELECT COUNT(*) FROM entries WHERE root_ar IS NOT NULL AND "
+                "source_id=(SELECT id FROM sources WHERE key=?)",
+                (key,)).fetchone()[0]
+        ck(bad == 0, "%s filed %d entries under a root" % (key, bad))
+    ck(heading_letter("AUTO باب الهمزة") == "ء", "letter heading not read")
+    ck(heading_letter("AUTO حرف التاء") == "ت", "letter heading not read")
+    ck(heading_letter("AUTO زيادة الياء") == "ي", "supplement not read")
+    ck(heading_letter("باب لحاق") is None, "a non-letter title became a letter")
+    return "sirr keyed by letter, khasais by chapter, neither by root"
+
+
+@test("HONESTY", "an unmarked chapter becomes a gap, never a neighbour's text")
+def _t(conn):
+    """This witness of Sirr never marks حرف النون, and the volume divider was
+    folded in as body text -- so حرف الميم ran to 109,605 bytes and half of it
+    was Ibn Jinni on NUN, served under MIM."""
+    fixture = "\n".join([
+        "### || AUTO حرف الميم", "PageV01P400", "# الميم حرف",
+        "### | CHECK [جزء 2]", "# unmarked nun chapter text here",
+        "### || AUTO حرف الهاء", "PageV01P450", "# الهاء حرف",
+    ])
+    got = list(parse_lexicon(fixture, set(), LEXICONS["sirr"]))
+    mim = [e for e in got if heading_letter(e["headword"]) == "م"]
+    ck(mim, "the mim chapter was lost")
+    ck("unmarked nun" not in "\n".join(mim[0]["lines"]),
+       "the mim chapter swallowed the unmarked chapter after it")
+    ck(any(heading_letter(e["headword"]) == "ه" for e in got),
+       "the chapter after the divider was lost")
+    with unguarded(conn):
+        n = conn.execute(
+            "SELECT length(text_raw) FROM entries e JOIN sources s "
+            "ON s.id=e.source_id WHERE s.key='sirr' AND "
+            "e.headword LIKE '%الميم%'").fetchone()[0]
+    ck(n < 30000, "the live mim chapter is %d bytes -- it has swallowed "
+                  "a neighbour again" % n)
+    return "divider closes the chapter; mim is %d bytes, not 109,605" % n
+
+
+@test("HONESTY", "a letter with no chapter says so, and blames the right thing")
+def _t(conn):
+    out = io.StringIO()
+    real, sys.stdout = sys.stdout, out
+    try:
+        cmd_letter(conn, "ن")
+    finally:
+        sys.stdout = real
+    body = out.getvalue()
+    ck(NOT_FOUND_UR in body, "the not-found line is missing")
+    ck("no chapter for this letter" in body, "the gap is not stated")
+    ck("digitisation, not about Ibn Jinni" in body,
+       "the gap is blamed on the author rather than the witness")
+    return "nun: absent from this witness, and said to be so"
+
+
 @test("HONESTY", "refusals are refusals, not empty strings")
 def _t(conn):
     res = generate("سكن")
@@ -4606,6 +5024,8 @@ USAGE = """lughat -- a local Qur'anic lexicography tool (offline, stdlib only)
   lughat.py sarf <root> [bab]     ishtiqaq saghir, with refusals
   lughat.py root <root>           corpus occurrences of a root
   lughat.py word <word>           search the mushaf text
+  lughat.py akbar <root>          the six permutations, per Ibn Jinni
+  lughat.py letter <root|letter>  Ibn Jinni on the root's letters
   lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
   lughat.py ingest <lexicon> --from PATH
                                   load a lexicon, ALL at verified = 0
@@ -4702,7 +5122,8 @@ def _main(argv):
         key = argv[2]
         path = argv[argv.index("--from") + 1]
         conn = connect()
-        n, stats, kept, recited = ingest_lexicon(conn, key, path)
+        n, stats, kept, recited, unassigned = ingest_lexicon(
+            conn, key, path)
         _w("%s" % LEXICONS[key]["title"])
         _w("ingested %d entries, ALL at verified = 0 (not served)." % n)
         for k in sorted(stats):
@@ -4713,6 +5134,11 @@ def _main(argv):
         if recited:
             _w("  %d of them had their volume/page CORRECTED by this "
                "re-extraction." % recited)
+        if unassigned:
+            # A gap the reader cannot see is a gap they will mistake for
+            # absence, so it is counted and printed rather than swallowed.
+            _w("  %d characters of the source reached no entry (section "
+               "preambles, unmarked chapters)." % unassigned)
         _w("")
         _w("Nothing above is visible to a query until it is approved:")
         _w("  python3 lughat.py review --stats")
@@ -4725,6 +5151,20 @@ def _main(argv):
 
     if cmd == "review":
         cmd_review(connect(), argv[2:])
+        return 0
+
+    if cmd == "letter":
+        if len(argv) < 3:
+            sys.stdout.write(USAGE)
+            return 2
+        cmd_letter(connect(), argv[2])
+        return 0
+
+    if cmd == "akbar":
+        if len(argv) < 3:
+            sys.stdout.write(USAGE)
+            return 2
+        cmd_akbar(connect(), argv[2])
         return 0
 
     if cmd == "aya":

@@ -12,8 +12,8 @@ phase at all, and one was never addressed. Corrected here.
 | # | Requirement | State |
 |---|---|---|
 | 1 | The root of the word | **Done** — deterministic, from the corpus |
-| 1a | Explanation of the root *letters* — Ibn Jinnī, *Sirr Ṣināʿat al-Iʿrāb* | **Was missing.** Now Phase 5 |
-| 1b | Ishtiqāq from Ibn Jinnī — *al-Khaṣāʾiṣ*, ishtiqāq akbar | **Was missing.** Now Phase 5 |
+| 1a | Explanation of the root *letters* — Ibn Jinnī, *Sirr Ṣināʿat al-Iʿrāb* | **Built** — `lughat.py letter`, 28 of 29 letters in this witness |
+| 1b | Ishtiqāq from Ibn Jinnī — *al-Khaṣāʾiṣ*, ishtiqāq akbar | **Built** — `lughat.py akbar`; al-Khaṣāʾiṣ ingested, search pending |
 | 1c | Ishtiqāq ṣaghīr table | **Done** |
 | 2 | How the word forms from the letters | **Half.** Ṣarf mechanics done; the word-centred view and the sourced aṣl are pending |
 | 3 | Synonyms | Phase 7, with the furūq |

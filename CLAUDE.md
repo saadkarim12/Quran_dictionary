@@ -406,6 +406,40 @@ data. Page markers and milestone ids are dropped, `# ` begins a paragraph,
 delete the row and re-insert it with a new id, orphaning every entry pointing
 at it — use `ON CONFLICT ... DO UPDATE`.
 
+## Ibn Jinnī: three things, kept apart
+
+**Listing** the six permutations of a triliteral is arithmetic. **Saying which
+of them the Qurʾān uses** is a database lookup. Both are derivation, both are
+safe, and `lughat.py akbar` does both.
+
+**Claiming they share an idea** is Ibn Jinnī's *thesis*, argued in
+al-Khaṣāʾiṣ. It is not derivable from the letters, this tool cannot compute
+it, and it is refused. It is also a *minority* method — supporting insight
+after Ibn Fāris and al-Rāghib have established a meaning, never primary
+evidence — and the output says so every time.
+
+Neither of his books is keyed by root. *Sirr Ṣināʿat al-Iʿrāb* is about the
+**letters** (`entries.root_ar` is NULL, the headword is the letter);
+al-Khaṣāʾiṣ is about **topics**. Inventing a root for either would file text
+under something the book never said, so `keyed_by` records what a source is
+actually organised by, and the parser refuses to resolve a root for those.
+
+### Trap 17 — an unmarked chapter is not the previous chapter
+
+This witness of *Sirr* never marks `حرف النون`, and the volume divider
+`### | CHECK [جزء 2]` was folded in as body text. So the chapter headed
+`حرف الميم` ran to **109,605 bytes** and half of it was Ibn Jinnī on **nūn**,
+ready to be served under **mīm**.
+
+In a book whose chapters *are* all marked, a header the rule does not
+recognise is a structural break, never prose: it **closes the chapter in
+progress**. Nūn then becomes unassigned text — a gap the tool counts and
+reports (`305,554 characters reached no entry`) — instead of a misattribution
+it cannot see.
+
+And when a letter has no chapter, the tool says the gap belongs to *this
+digitisation*, not to Ibn Jinnī, who treated all 29.
+
 ## Sourcing
 
 `roots.bab` is a **sourced column.** The bāb of a root is not derivable from
@@ -454,7 +488,10 @@ Single file, stdlib only, offline after `setup`.
     lughat.py root <root>           corpus occurrences of a root
     lughat.py word <word>           search the mushaf text
     lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
-    lughat.py ingest <lexicon> --from PATH  maqayis | mufradat | lisan
+    lughat.py akbar <root>          the six permutations, per Ibn Jinnī
+    lughat.py letter <root>         Ibn Jinnī on the root's letters
+    lughat.py ingest <lexicon> --from PATH
+                                    maqayis | mufradat | lisan | sirr | khasais
     lughat.py serve                 the approval gate as a local page
     lughat.py review [--stats]      the approval gate
 
@@ -467,6 +504,8 @@ Single file, stdlib only, offline after `setup`.
   CC BY-NC-SA. <https://github.com/OpenITI>
 - Ibn Manẓūr, *Lisān al-ʿArab*. OpenITI, CC BY-NC-SA.
   <https://github.com/OpenITI>
+- Ibn Jinnī, *Sirr Ṣināʿat al-Iʿrāb* and *al-Khaṣāʾiṣ*. OpenITI,
+  CC BY-NC-SA. <https://github.com/OpenITI>
 - Quranic Arabic Corpus, morphology v0.4 — © 2011 Kais Dukes, GNU GPL.
   <http://corpus.quran.com>
 - Tanzil Qur'an text (Uthmani) 1.0.2 — © 2008–2009 Tanzil.info,
