@@ -6617,6 +6617,29 @@ def _t(conn):
            "translate" % len(TRANSLATIONS)
 
 
+@test("INTEGRITY", "each translation is set in its own direction")
+def _t(conn):
+    """An Urdu line laid out left-to-right is unreadable, and so is an
+    English one laid out right-to-left. The direction comes from the
+    registry's language, not from guessing at the characters."""
+    ck(TRANSLATIONS["en.sahih"]["lang"] == "en", "English is not marked so")
+    ck(all(v["lang"] == "ur" for k, v in TRANSLATIONS.items()
+           if k.startswith("ur.")), "an Urdu translation is not marked so")
+    data = read_root(conn, "سكن")
+    seen = {}
+    for a in data["tafsir"]:
+        for t in a["translations"]:
+            seen[t["key"]] = t["rtl"]
+    if not seen:
+        raise Skip("no translation installed")
+    for key, rtl in seen.items():
+        want = TRANSLATIONS.get(key, {}).get("lang") != "en"
+        ck(rtl == want, "%s is laid out %s" % (key, "rtl" if rtl else "ltr"))
+    ck(".tr.ltr{direction:ltr" in READ_HTML,
+       "the page has no left-to-right column for a translation")
+    return "%s laid out by language, not by guess" % ", ".join(sorted(seen))
+
+
 @test("HONESTY", "a translation numbered unlike the mushaf is refused whole")
 def _t(conn):
     """Some editions count the basmala as an ayah. A single offset would put
@@ -8119,8 +8142,12 @@ h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.11em;
 .slot .att.sk{color:var(--och)}
 .slot .att i{font-style:normal;opacity:.75}
 .aya{font-size:1.2rem;line-height:2.1;color:var(--ink);margin:.2rem 0 .5rem;padding:.5rem .7rem;background:var(--surf);border-radius:4px;border:1px solid var(--rule)}
+.trs{display:grid;gap:.5rem;margin:0 0 .6rem;
+ grid-template-columns:repeat(auto-fit,minmax(19rem,1fr))}
+.tr.ltr{direction:ltr;text-align:left;font-family:inherit;line-height:1.7;
+ font-size:.95rem}
 .tr{direction:rtl;text-align:right;font-size:1rem;line-height:2;color:var(--body);margin:0 0 .6rem;padding:.5rem .7rem;border-right:2px solid var(--verd);background:var(--surf)}
-.tr.ur{font-family:"Noto Nastaliq Urdu","Jameel Noori Nastaleeq","Awami Nastaliq",serif;line-height:2.6}
+.tr.rtl{font-family:"Noto Nastaliq Urdu","Jameel Noori Nastaleeq","Awami Nastaliq","Geeza Pro",serif;line-height:2.5}
 .tr .by{display:block;margin-top:.35rem;font-size:.68rem;color:var(--faint);direction:ltr;text-align:left;font-family:inherit}
 .ayahead{display:flex;gap:.7rem;align-items:baseline;margin:1rem 0 .4rem}
 .ayahead b{color:var(--verd);font-variant-numeric:tabular-nums}
@@ -8507,11 +8534,11 @@ function draw(){
    h+='<div class="ayahead"><b>'+esc(a.ref)+'</b><span class="ar">'+
     esc(a.word)+'</span></div>';
    if(a.aya_text) h+='<div class="aya ar">'+esc(a.aya_text)+'</div>';
-   for(const t of (a.translations||[])){
-    if(HIDDEN.has(t.key)) continue;
-    h+='<div class="tr'+(t.key.startsWith("ur")?" ur":"")+'">'+esc(t.text)+
+   const tr=(a.translations||[]).filter(t=>!HIDDEN.has(t.key));
+   if(tr.length) h+='<div class="trs">'+tr.map(t=>
+     '<div class="tr'+(t.rtl?" rtl":" ltr")+'">'+esc(t.text)+
      '<span class="by">'+esc(t.title)+' &middot; '+esc(t.author)+'</span>'+
-     '</div>';}
+     '</div>').join("")+'</div>';
    const shown=a.passages.filter(x=>!HIDDEN.has(x.key));
    if(!shown.length){
     h+='<div class="card empty">'+(a.pending
@@ -8801,7 +8828,11 @@ def read_root(conn, query):
             "aya_text": aya_text(conn, a["sura"], a["aya"]),
             "translations": [
                 {"key": t["key"], "title": t["title"], "author": t["author"],
-                 "text": t["text"], "attribution": t["attribution"]}
+                 "text": t["text"], "attribution": t["attribution"],
+                 # the script decides the column's direction: an Urdu line
+                 # set left-to-right is unreadable, and so is an English one
+                 # set right-to-left
+                 "rtl": TRANSLATIONS.get(t["key"], {}).get("lang") != "en"}
                 for t in translations_for_aya(conn, a["sura"], a["aya"])],
             "pending": pend,
             "passages": [{
