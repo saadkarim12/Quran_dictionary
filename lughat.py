@@ -1083,7 +1083,7 @@ def all_refusals(result):
 #                    from its letters; it is read from a lexicon and carries
 #                    bab_source_id / bab_page.  NULL means unknown.
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = r"""
 PRAGMA journal_mode = WAL;
@@ -1200,10 +1200,13 @@ CREATE TABLE IF NOT EXISTS tafsir (
 
 -- The ONLY sanctioned read paths for sourced prose.  The query layer refuses
 -- to run any statement that names the base tables.
+-- rejected = 1 is filtered here as well as verified = 1. Every writer today
+-- pairs the flags correctly, but "(1,1) is unreachable" is a claim about all
+-- future writers. Making it structural costs one clause.
 CREATE VIEW IF NOT EXISTS v_entries AS
-    SELECT * FROM entries WHERE verified = 1;
+    SELECT * FROM entries WHERE verified = 1 AND rejected = 0;
 CREATE VIEW IF NOT EXISTS v_tafsir AS
-    SELECT * FROM tafsir WHERE verified = 1;
+    SELECT * FROM tafsir WHERE verified = 1 AND rejected = 0;
 
 CREATE INDEX IF NOT EXISTS ix_entry_root ON entries(root_ar);
 CREATE INDEX IF NOT EXISTS ix_entry_ver  ON entries(verified);
@@ -1415,9 +1418,9 @@ def migrate(conn):
     conn.execute("DROP VIEW IF EXISTS v_entries")
     conn.execute("DROP VIEW IF EXISTS v_tafsir")
     conn.execute("CREATE VIEW v_entries AS SELECT * FROM entries "
-                 "WHERE verified = 1")
+                 "WHERE verified = 1 AND rejected = 0")
     conn.execute("CREATE VIEW v_tafsir AS SELECT * FROM tafsir "
-                 "WHERE verified = 1")
+                 "WHERE verified = 1 AND rejected = 0")
     conn.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
     conn.commit()
     return done
@@ -2044,6 +2047,13 @@ def cmd_root(conn, root):
     for e in ents:
         src = q(conn, "SELECT title, author, edition, attribution FROM sources "
                       "WHERE id=?", (e["source_id"],)).fetchone()
+        if src is None:
+            # An entry with no source row has no citation, and an entry
+            # without a citation is not servable under the governing rule.
+            _w("")
+            _w("  [entry %d withheld: its source record is missing, so it "
+               "carries no citation]" % e["id"])
+            continue
         _w("")
         _w("  %s -- %s" % (src["title"], src["author"] or ""))
         if e["text_raw"] is None:
@@ -2120,7 +2130,9 @@ def cmd_review(conn, args):
             _w("!! the root was INFERRED (%s), not read straight from the "
                "heading" % row["extraction"])
         _w(RULE)
-        for line in render_entry(row["text_raw"])[:6]:
+        body = (render_entry(row["text_raw"]) if row["text_raw"] is not None
+                else ["[scan only: %s]" % (row["scan_uri"] or "no scan_uri")])
+        for line in body[:6]:
             for w in _wrap(line, 72):
                 _w("  " + w)
         _w(BAR)
@@ -3242,6 +3254,142 @@ def _t(conn):
     return "head of queue: %s (%d occurrences)" % (rows[0]["root"], freqs[0])
 
 
+@test("HONESTY", "a rejected row is unservable structurally, not by convention")
+def _t(conn):
+    """Every writer today pairs verified and rejected correctly. That is a
+    claim about all future writers, so the view enforces it instead."""
+    sql = q(conn, "SELECT sql FROM sqlite_master WHERE name='v_entries'"
+            ).fetchone()["sql"]
+    ck("rejected = 0" in sql.replace("rejected=0", "rejected = 0"),
+       "v_entries does not filter rejected: %s" % sql)
+    with unguarded(conn):
+        conn.execute("DELETE FROM entries WHERE source_id IN "
+                     "(SELECT id FROM sources WHERE key='_rj')")
+        conn.execute("DELETE FROM sources WHERE key='_rj'")
+        conn.execute("INSERT INTO sources (key,title,kind,attribution) "
+                     "VALUES ('_rj','RJ','lexicon','RJ')")
+        sid = conn.execute(
+            "SELECT id FROM sources WHERE key='_rj'").fetchone()[0]
+        # the contradictory state, written directly past the API
+        conn.execute("INSERT INTO entries (source_id,root_ar,text_raw,vol,"
+                     "page,verified,rejected) VALUES (?,?,?,?,?,1,1)",
+                     (sid, "سكن", "REJECTED YET VERIFIED", "1", "1"))
+        conn.commit()
+    try:
+        texts = [r["text_raw"] for r in
+                 q(conn, "SELECT text_raw FROM v_entries WHERE root_ar=?",
+                   ("سكن",))]
+        ck("REJECTED YET VERIFIED" not in texts,
+           "a row marked both verified and rejected was served")
+    finally:
+        with unguarded(conn):
+            conn.execute("DELETE FROM entries WHERE source_id=?", (sid,))
+            conn.execute("DELETE FROM sources WHERE id=?", (sid,))
+            conn.commit()
+    return "v_entries filters both flags; the (1,1) row stays hidden"
+
+
+@test("HONESTY", "a scan-only entry can be reviewed, not just stored")
+def _t(conn):
+    """text_raw is NULL for a scan-only source -- the schema says so and the
+    Urdu lexicons will all be like this. The reader path handled it; the
+    review path crashed, and ONE such row made the entire queue unreachable,
+    including the row itself, which could then never be rejected."""
+    with unguarded(conn):
+        conn.execute("DELETE FROM entries WHERE source_id IN "
+                     "(SELECT id FROM sources WHERE key='_sc')")
+        conn.execute("DELETE FROM sources WHERE key='_sc'")
+        conn.execute("INSERT INTO sources (key,title,kind,attribution) "
+                     "VALUES ('_sc','SCAN','scan','SCAN')")
+        sid = conn.execute(
+            "SELECT id FROM sources WHERE key='_sc'").fetchone()[0]
+        conn.execute("INSERT INTO entries (source_id,root_ar,headword,"
+                     "text_raw,scan_uri,vol,page,extraction,verified) "
+                     "VALUES (?,?,?,NULL,?,?,?,'direct',0)",
+                     (sid, "سكن", "(سكن)", "file:///scan/87.png", "3", "87"))
+        conn.commit()
+    try:
+        rows = _queue_rows(conn, limit=9999)
+        mine = [r for r in rows if r["source"] == "SCAN"]
+        ck(mine, "the scan-only entry is missing from the queue")
+        ck(mine[0]["scan_only"] is True, "not flagged as scan-only")
+        ck(any("scan" in l.lower() for l in mine[0]["lines"]),
+           "the reviewer is shown nothing about the scan: %s" % mine[0]["lines"])
+        # and the whole queue must still work with it present
+        ck(len(rows) > 1, "one scan-only row emptied the queue")
+        out = io.StringIO()
+        real, sys.stdout = sys.stdout, out
+        try:
+            cmd_review(conn, ["--stats"])
+        finally:
+            sys.stdout = real
+        ck("SCAN" in out.getvalue(), "stats do not see the scan source")
+    finally:
+        with unguarded(conn):
+            conn.execute("DELETE FROM entries WHERE source_id=?", (sid,))
+            conn.execute("DELETE FROM sources WHERE id=?", (sid,))
+            conn.commit()
+    return "scan-only rows are reviewable and do not poison the queue"
+
+
+@test("HONESTY", "an entry with no source row is withheld, not crashed on")
+def _t(conn):
+    """An entry whose source record is gone has no citation, and an entry
+    without a citation is not servable. It must also stay VISIBLE to review,
+    or it is counted as pending forever while being unreachable."""
+    with unguarded(conn):
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("DELETE FROM entries WHERE text_raw='ORPHANED PROSE'")
+        conn.execute("INSERT INTO entries (source_id,root_ar,headword,"
+                     "text_raw,vol,page,extraction,verified) "
+                     "VALUES (999999,?,?,?,?,?,'direct',1)",
+                     ("سكن", "(سكن)", "ORPHANED PROSE", "1", "1"))
+        eid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        out = io.StringIO()
+        real, sys.stdout = sys.stdout, out
+        try:
+            cmd_root(conn, "سكن")          # must not raise
+        finally:
+            sys.stdout = real
+        ck("ORPHANED PROSE" not in out.getvalue(),
+           "an entry with no citation was served")
+        ck("withheld" in out.getvalue(), "the reader is not told it exists")
+        with unguarded(conn):
+            conn.execute("UPDATE entries SET verified=0 WHERE id=?", (eid,))
+        ck(eid in [r["id"] for r in _queue_rows(conn, limit=9999)],
+           "an orphaned entry is invisible to review but counted as pending")
+    finally:
+        with unguarded(conn):
+            conn.execute("DELETE FROM entries WHERE id=?", (eid,))
+            conn.commit()
+    return "withheld from the reader, still visible to the reviewer"
+
+
+@test("HONESTY", "the review page never tells the reviewer a comfortable lie")
+def _t(conn):
+    """Two client-side defects, both of which destroyed or misreported human
+    decisions: Undo reached entries that were no longer on screen, and the
+    page announced an empty queue while thousands were pending."""
+    h = REVIEW_HTML
+    ck("esc(e.freq)" in h, "a field reaches innerHTML without escaping")
+    for field in ("e.headword", "e.root", "e.extraction", "e.source",
+                  "e.vol", "e.page", "e.freq"):
+        ck("esc(%s)" % field in h, "%s is interpolated unescaped" % field)
+    ck("'\"'" in h.replace('"', '\"') or "&#39;" in h,
+       "esc() does not cover the single quote")
+    # Undo must be cleared wherever the visible entry changes
+    for site in ("function skip()", "async function load()"):
+        seg = h[h.index(site):h.index(site) + 400]
+        ck("last=null" in seg, "%s does not clear the undo target" % site)
+    # and "empty" must be checked against the server, not assumed
+    ck("Fetching the next batch" in h and "if(q.length&&!busy)load();" in h,
+       "the page can claim an empty queue without asking the server")
+    return "every field escaped; undo scoped to the visible entry; no false empty"
+
+
 @test("HONESTY", "refusals are refusals, not empty strings")
 def _t(conn):
     res = generate("سكن")
@@ -3401,27 +3549,40 @@ kbd{font:inherit;font-size:.74rem;opacity:.75;border:1px solid currentColor;
   <span class="hint" id="hint"></span>
 </div></footer>
 <script>
-const T="__TOKEN__";let q=[],i=0,last=null,tot=0,done=0;
+const T="__TOKEN__";let q=[],i=0,last=null,tot=0,done=0,pending=0,busy=false;
 const api=(p,o)=>fetch(p+(p.includes("?")?"&":"?")+"t="+encodeURIComponent(T),o)
   .then(r=>r.json());
-function esc(s){return String(s).replace(/[&<>"]/g,c=>
-  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
-async function load(){
-  const ex=document.getElementById("filt").value;
+function esc(s){return String(s).replace(/[&<>"']/g,c=>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+async function refreshStats(){
   const st=await api("/api/stats");
   tot=st.stats.reduce((a,s)=>a+s.pending+s.approved+s.rejected,0);
   done=st.stats.reduce((a,s)=>a+s.approved+s.rejected,0);
+  pending=st.stats.reduce((a,s)=>a+s.pending,0);
+}
+async function load(){
+  busy=true;
+  // `last` belongs to the queue we are leaving. Carrying it across a reload
+  // let Undo un-approve an entry from the previous filter, off screen.
+  last=null;
+  const ex=document.getElementById("filt").value;
+  await refreshStats();
   const d=await api("/api/queue?extraction="+encodeURIComponent(ex));
-  q=d.entries;i=0;draw();
+  q=d.entries;i=0;busy=false;draw();
 }
 function draw(){
   const m=document.getElementById("main");
   document.getElementById("pi").style.width=(tot?100*done/tot:0)+"%";
   document.getElementById("ct").textContent=done+" / "+tot+" decided";
   if(i>=q.length){
-    m.innerHTML='<div class="done"><b>Queue empty for this filter.</b>'+
-      'Everything you did not approve stays unserved.</div>';
-    document.getElementById("hint").textContent="";return;}
+    // The server pages the queue. Saying "empty" here without asking would
+    // tell the reviewer they were finished with thousands still pending.
+    m.innerHTML='<div class="done"><b>'+
+      (q.length?"Fetching the next batch&hellip;":"Nothing left in this filter.")+
+      '</b>Everything you did not approve stays unserved.</div>';
+    document.getElementById("hint").textContent="";
+    if(q.length&&!busy)load();
+    return;}
   const e=q[i];
   const inferred=e.extraction!=="direct";
   m.innerHTML='<div class="card"><div class="meta">'+
@@ -3430,29 +3591,44 @@ function draw(){
     '<span class="root ar">'+esc(e.root)+'</span>'+
     '<span class="badge '+esc(e.extraction)+'">'+esc(e.extraction)+'</span>'+
     '<span class="cite">'+esc(e.source)+' &middot; vol '+esc(e.vol)+
-      ' p. '+esc(e.page)+' &middot; root occurs '+e.freq+'&times;</span></div>'+
+      ' p. '+esc(e.page)+' &middot; root occurs '+esc(e.freq)+'&times;</span></div>'+
     (inferred?'<div class="warn'+(e.extraction==="unmatched"?" hot":"")+'">'+
       'The root was INFERRED ('+esc(e.extraction)+'), not read from the heading.'+
       (e.extraction==="unmatched"?" This root does not occur in the Qur'an.":"")+
       '</div>':'')+
+    (e.scan_only?'<div class="warn hot">This source keyed in no text; the page '+
+      'image is the citation.</div>':'')+
     '<div class="txt ar">'+e.lines.map(l=>"<p>"+esc(l)+"</p>").join("")+
     '</div></div>';
-  document.getElementById("hint").textContent=(q.length-i)+" loaded";
+  document.getElementById("hint").textContent=
+    (q.length-i)+" in this batch &middot; "+pending+" pending";
 }
 async function decide(d){
-  if(i>=q.length)return;const e=q[i];
-  await api("/api/decide",{method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({id:e.id,decision:d})});
-  last=e;done++;i++;draw();
+  if(i>=q.length||busy)return;const e=q[i];busy=true;
+  try{
+    await api("/api/decide",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({id:e.id,decision:d})});
+    last=e;done++;pending--;i++;
+  }finally{busy=false;}
+  draw();
 }
-function skip(){if(i<q.length){i++;draw();}}
+function skip(){
+  // Undo must never reach past the entry the reviewer can actually see.
+  if(i<q.length){last=null;i++;draw();}
+}
 async function undo(){
-  if(!last)return;
-  await api("/api/decide",{method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({id:last.id,decision:"unset"})});
-  done--;i=Math.max(0,i-1);last=null;draw();
+  if(!last||busy)return;busy=true;
+  const target=last;
+  try{
+    await api("/api/decide",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({id:target.id,decision:"unset"})});
+    done--;pending++;last=null;
+    const at=q.findIndex(x=>x.id===target.id);
+    i=at>=0?at:Math.max(0,i-1);
+  }finally{busy=false;}
+  draw();
 }
 addEventListener("keydown",ev=>{
   if(ev.target.tagName==="SELECT")return;
@@ -3472,11 +3648,14 @@ REVIEW_PORT = 8765
 
 
 def _queue_rows(conn, extraction=None, limit=60):
+    # LEFT JOIN, not JOIN: an entry whose source row has gone missing would
+    # otherwise vanish from the queue while still counting as pending, so the
+    # reviewer can never reach the end and is never told why.
     sql = ("SELECT e.id, e.headword, e.root_ar, e.extraction, e.vol, e.page, "
-           "e.text_raw, s.title, s.author, s.edition, "
+           "e.text_raw, e.scan_uri, s.title, s.author, s.edition, "
            "COALESCE((SELECT n_segments FROM roots r "
            "          WHERE r.root_ar = e.root_ar), 0) AS freq "
-           "FROM entries e JOIN sources s ON s.id = e.source_id "
+           "FROM entries e LEFT JOIN sources s ON s.id = e.source_id "
            "WHERE e.verified = 0 AND e.rejected = 0")
     params = []
     if extraction:
@@ -3491,10 +3670,18 @@ def _queue_rows(conn, extraction=None, limit=60):
         out.append({
             "id": r["id"], "headword": r["headword"],
             "root": r["root_ar"] or "", "extraction": r["extraction"],
-            "vol": r["vol"], "page": r["page"], "freq": r["freq"],
-            "source": r["title"], "author": r["author"] or "",
+            "vol": r["vol"], "page": r["page"], "freq": int(r["freq"] or 0),
+            "source": r["title"] or "(source row missing)",
+            "author": r["author"] or "",
             "edition": r["edition"] or "",
-            "lines": render_entry(r["text_raw"]),
+            # text_raw is NULL for a scan-only source, which the schema
+            # explicitly permits. The reader path handled that; the review
+            # path crashed on it, and one such row killed the whole queue.
+            "lines": (render_entry(r["text_raw"])
+                      if r["text_raw"] is not None
+                      else ["[scan only — no text keyed in]",
+                            r["scan_uri"] or "(no scan_uri either)"]),
+            "scan_only": r["text_raw"] is None,
         })
     return out
 
@@ -3503,7 +3690,8 @@ def _queue_stats(conn):
     with unguarded(conn):
         rows = list(conn.execute(
             "SELECT extraction, "
-            "SUM(verified=1) approved, SUM(rejected=1) rejected, "
+            "SUM(verified=1 AND rejected=0) approved, "
+            "SUM(rejected=1) rejected, "
             "SUM(verified=0 AND rejected=0) pending "
             "FROM entries GROUP BY extraction ORDER BY extraction"))
     return [{"extraction": r["extraction"], "approved": r["approved"],
@@ -3514,12 +3702,17 @@ def _decide(conn, entry_id, decision, reason=None):
     if decision not in ("approve", "reject", "unset"):
         raise ValueError("decision must be approve, reject or unset")
     with unguarded(conn):
+        # Each branch clears the OTHER branch's audit field. Leaving them
+        # behind produced rows that were verified=1 while still carrying a
+        # reject_reason -- an audit trail that contradicts itself.
         if decision == "approve":
             conn.execute("UPDATE entries SET verified=1, rejected=0, "
-                         "verified_at=datetime('now') WHERE id=?", (entry_id,))
+                         "reject_reason=NULL, verified_at=datetime('now') "
+                         "WHERE id=?", (entry_id,))
         elif decision == "reject":
             conn.execute("UPDATE entries SET verified=0, rejected=1, "
-                         "reject_reason=? WHERE id=?", (reason, entry_id))
+                         "verified_at=NULL, reject_reason=? WHERE id=?",
+                         (reason, entry_id))
         else:
             conn.execute("UPDATE entries SET verified=0, rejected=0, "
                          "verified_at=NULL, reject_reason=NULL WHERE id=?",
@@ -3564,8 +3757,14 @@ def make_review_app(conn, token):
 
         def _authed(self, qs):
             got = qs.get("t", [""])[0]
-            # constant-time, so the token cannot be guessed a byte at a time
-            return secrets.compare_digest(got, token)
+            try:
+                # constant-time, so the token cannot be guessed byte by byte
+                return secrets.compare_digest(got, token)
+            except TypeError:
+                # compare_digest raises on a non-ASCII str. A token that
+                # cannot be compared is not a valid token; it must not be an
+                # unhandled exception on an UNAUTHENTICATED route.
+                return False
 
         def do_GET(self):
             import urllib.parse as up
@@ -3592,6 +3791,20 @@ def make_review_app(conn, token):
                     {"stats": st}, ensure_ascii=False))
             return self._send(404, json.dumps({"error": "no such route"}))
 
+        def handle_one_request(self):
+            # Any unexpected error must become a 500, not a dropped connection
+            # with no HTTP response at all -- the reviewer would just see the
+            # queue stop, with nothing to explain it.
+            try:
+                return http.server.BaseHTTPRequestHandler.handle_one_request(
+                    self)
+            except Exception:                                   # noqa: BLE001
+                sys.stderr.write(traceback.format_exc())
+                try:
+                    self._send(500, json.dumps({"error": "server error"}))
+                except Exception:                               # noqa: BLE001
+                    pass
+
         def do_POST(self):
             import urllib.parse as up
             u = up.urlparse(self.path)
@@ -3600,11 +3813,25 @@ def make_review_app(conn, token):
                 return self._send(403, json.dumps({"error": "bad token"}))
             if u.path != "/api/decide":
                 return self._send(404, json.dumps({"error": "no such route"}))
-            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return self._send(400, json.dumps({"error": "bad length"}))
+            if n < 0:
+                # rfile.read(-1) blocks until the peer closes: a handful of
+                # these would exhaust the thread pool.
+                return self._send(400, json.dumps({"error": "bad length"}))
             if n > 64 * 1024:
                 return self._send(413, json.dumps({"error": "too large"}))
             try:
                 payload = json.loads(self.rfile.read(n).decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("body must be an object")
+                if not isinstance(payload.get("id"), int) or \
+                        isinstance(payload.get("id"), bool):
+                    # int() would silently accept 1.9 and "1" and decide a
+                    # different entry than the caller named.
+                    raise ValueError("id must be an integer")
                 with DB_LOCK:
                     res = _decide(conn, int(payload["id"]),
                                   payload["decision"], payload.get("reason"))
