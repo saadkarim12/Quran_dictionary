@@ -261,6 +261,69 @@ not arise**. Refusing quadriliterals was a self-imposed gap. The corpus proves
 the templates: `زَلْزَلَة` 22:1, `زِلْزَال` 99:1, `دَمْدَمَ` 91:14, `وَسْوَسَ` 7:20 —
 all EXACT.
 
+## The build path is not the query path
+
+    INGEST  ->  entries, verified = 0  ->  REVIEW (a person)  ->  verified = 1
+                        |                                              |
+                    never served                                    served
+
+`lughat.py ingest` writes `verified = 0`, always. `lughat.py review` is the
+**only** writer of `verified = 1`, one entry at a time, after showing a person
+the heading, the derived root, how it was derived, the citation, and the text.
+Approval stamps `verified_at`. A test asserts the ingest INSERT pins the
+column to `0`, because a build path that could write `1` makes the gate
+decorative.
+
+A root with pending-but-unapproved entries says so. A gap the reader knows
+about is a gap; a gap they don't is a lie by omission.
+
+### Trap 13 — a digitisation artifact can file one root's article under another
+
+OpenITI's Maqāyīs inserts `### |` headers **in the middle of a word**:
+
+    ### | اله
+    # مزة والكاف والراء أصل واحد، وهو الحفر
+
+That is `الهمزة` split in two — and the fragment `اله` canonicalises to `ءله`,
+the root of **الله**. Read as a heading, it files Ibn Fāris's article on أكر
+(digging) under the divine name, with a page citation, looking perfectly
+sourced. It was the *first* entry in the review queue.
+
+**Only a parenthesised heading `(سكن)` starts an entry.** `[باب ...]` closes
+one and starts nothing. Every other `### |` line is text belonging to the
+entry in progress, rejoined using exactly the whitespace the source itself
+has — `اله` + `مزة` → `الهمزة` — so no spacing is invented and no text is
+dropped. This removed 403 false entries.
+
+### Two spelling bridges, both recorded as inferences
+
+Measured, not assumed. Direct heading matching covers 81% of corpus roots;
+the misses are systematic:
+
+- **geminate** — Maqāyīs heads a muḍāʿaf root with two letters (`أب`) where
+  the corpus writes three (`ءبب`). 152 entries.
+- **weak_final** — Maqāyīs heads a weak-lām root with ى/ي (`دنى`) where the
+  corpus writes و (`دنو`). 37 entries.
+
+Both are inferences, so `entries.extraction` records which, and review shows
+it. Coverage: **1,510 of 1,642 corpus roots** have an entry.
+
+### Verbatim means verbatim
+
+`entries.text_raw` holds the source block **byte for byte**, mARkdown markup
+included. The markup is stripped at *display* time by `render_entry()`, so
+the transformation is a readable rule rather than something baked into the
+data. Page markers and milestone ids are dropped, `# ` begins a paragraph,
+`~~` continues one, `%` separates hemistichs.
+
+### Migrations are additive
+
+`entries` can hold rows a person has read and approved. `migrate()` only ever
+`ALTER TABLE ... ADD COLUMN`; a test greps it for `DROP TABLE` and
+`DELETE FROM entries`. Note also that `INSERT OR REPLACE` on `sources` would
+delete the row and re-insert it with a new id, orphaning every entry pointing
+at it — use `ON CONFLICT ... DO UPDATE`.
+
 ## Sourcing
 
 `roots.bab` is a **sourced column.** The bāb of a root is not derivable from
@@ -308,9 +371,15 @@ Single file, stdlib only, offline after `setup`.
     lughat.py sarf <root> [bab]     ishtiqāq ṣaghīr, with refusals
     lughat.py root <root>           corpus occurrences of a root
     lughat.py word <word>           search the mushaf text
+    lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
+    lughat.py ingest maqayis --from PATH   load a lexicon, all verified = 0
+    lughat.py review [--stats]      the approval gate
 
 ## Attribution (required by the licences)
 
+- Ibn Fāris, *Muʿjam Maqāyīs al-Lugha*, ed. ʿAbd al-Salām Muḥammad Hārūn
+  (Beirut: Dār al-Jīl, 1420/1999), 6 vols. Digital text: OpenITI,
+  CC BY-NC-SA. <https://github.com/OpenITI>
 - Quranic Arabic Corpus, morphology v0.4 — © 2011 Kais Dukes, GNU GPL.
   <http://corpus.quran.com>
 - Tanzil Qur'an text (Uthmani) 1.0.2 — © 2008–2009 Tanzil.info,

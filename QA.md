@@ -162,6 +162,35 @@ Then check the reverse — a real attestation that must NOT be missed:
 accusative tanwīn's alif is being left in the stem and real evidence is being
 hidden — the mirror-image failure, and just as wrong.
 
+## H. The lexicon layer: is anything served that you did not approve?
+
+    python3 lughat.py review --stats
+
+Every row must read `pending` except ones you have personally approved.
+
+    python3 lughat.py root سكن
+
+If you have not reviewed سكن, this must say entries are *ingested but not
+approved* and show none of them. Then approve one and confirm it appears with
+its volume and page:
+
+    python3 lughat.py review --extraction=direct
+
+Spot-check the citation against a copy of Maqāyīs: the سكن entry should be at
+**vol 3, p. 87**, and should read
+«السين والكاف والنون أصل واحد مطرد، يدل على خلاف الاضطراب والحركة».
+
+Then check the case that motivated the whole guard:
+
+    python3 lughat.py root اله | head -20
+
+The entry must be Ibn Fāris on **أله** (التعبد), at vol 1 p. 126 — *not* the
+article on أكر (الحفر) at p. 125. Those two are adjacent in the source and a
+digitisation artifact put the second under the first. If you ever see a root's
+article whose opening words spell out *different* letters than the root you
+asked for — Ibn Fāris always opens «الهمزة واللام والهاء…» naming his own
+radicals — that is this bug returning, and it is the most serious kind.
+
 ---
 
 ## What a finding looks like

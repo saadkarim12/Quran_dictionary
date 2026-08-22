@@ -36,6 +36,10 @@ Usage:
     lughat.py root <root>           corpus occurrences of a root
     lughat.py word <word>           search the mushaf text
   lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
+  lughat.py ingest maqayis --from PATH
+                                  load a lexicon, ALL at verified = 0
+  lughat.py review [--stats]      the approval gate: the only writer of
+                                  verified = 1
 """
 
 import contextlib
@@ -1075,7 +1079,7 @@ def all_refusals(result):
 #                    from its letters; it is read from a lexicon and carries
 #                    bab_source_id / bab_page.  NULL means unknown.
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = r"""
 PRAGMA journal_mode = WAL;
@@ -1088,6 +1092,11 @@ CREATE TABLE IF NOT EXISTS sources (
     edition       TEXT,
     kind          TEXT NOT NULL,      -- corpus | lexicon | tafsir | scan
     licence       TEXT,
+    licence_note  TEXT,
+    -- 0 = local personal use only (in copyright, or a licence that forbids
+    -- redistribution).  Kept accurate per row so the question "what may this
+    -- ever ship with?" stays answerable instead of archaeological.
+    distributable INTEGER NOT NULL DEFAULT 0,
     url           TEXT,
     attribution   TEXT NOT NULL       -- reproduced verbatim wherever cited
 );
@@ -1155,7 +1164,15 @@ CREATE TABLE IF NOT EXISTS entries (
     vol        TEXT,
     page       TEXT,
     scan_uri   TEXT,
+    -- how root_ar was arrived at, so review can see what was inferred:
+    -- 'direct'         the heading canonicalised straight to this root
+    -- 'geminate'       heading had 2 letters, corpus root is the doubled form
+    -- 'weak_final'     final و/ي differ between heading and corpus
+    -- 'unmatched'      parsed, but no corpus root -- root_ar is the heading's
+    -- 'unparsed'       the heading is not a root at all (a bab title, etc.)
+    extraction TEXT,
     verified   INTEGER NOT NULL DEFAULT 0,
+    verified_at TEXT,
     CHECK (text_raw IS NOT NULL OR scan_uri IS NOT NULL)
 );
 
@@ -1180,6 +1197,8 @@ CREATE VIEW IF NOT EXISTS v_entries AS
 CREATE VIEW IF NOT EXISTS v_tafsir AS
     SELECT * FROM tafsir WHERE verified = 1;
 
+CREATE INDEX IF NOT EXISTS ix_entry_root ON entries(root_ar);
+CREATE INDEX IF NOT EXISTS ix_entry_ver  ON entries(verified);
 CREATE INDEX IF NOT EXISTS ix_seg_root   ON segments(root_ar);
 CREATE INDEX IF NOT EXISTS ix_seg_alif   ON segments(norm_alif);
 CREATE INDEX IF NOT EXISTS ix_seg_drop   ON segments(norm_drop);
@@ -1260,6 +1279,9 @@ def connect(path=DB_PATH, create=False):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    if conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+                    "AND name='entries'").fetchone()[0]:
+        migrate(conn)
     conn.set_authorizer(_authorizer)
     return conn
 
@@ -1343,11 +1365,66 @@ def _extract_member(blob):
     raise SystemExit("%s not found in the downloaded archive" % CORPUS_MEMBER)
 
 
+# Columns added after v1.  Migrating rather than rebuilding matters: entries
+# may hold rows a person has read and approved, and that work must survive.
+_MIGRATIONS_V2 = [
+    ("sources", "licence_note", "TEXT"),
+    ("sources", "distributable", "INTEGER NOT NULL DEFAULT 0"),
+    ("entries", "extraction", "TEXT"),
+    ("entries", "verified_at", "TEXT"),
+    ("tafsir", "extraction", "TEXT"),
+    ("tafsir", "verified_at", "TEXT"),
+]
+
+
+def migrate(conn):
+    """Additive only.  Never drops a table that can hold reviewed work."""
+    # Checks the actual columns rather than trusting the version stamp: a
+    # stamp can run ahead of the table when the version is bumped in the same
+    # change that adds a column, and CREATE TABLE IF NOT EXISTS will not add
+    # it to a table that already exists.
+    done = 0
+    for table, col, decl in _MIGRATIONS_V2:
+        exists = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+            (table,)).fetchone()[0]
+        if not exists:
+            continue
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+        if col not in cols:
+            conn.execute("ALTER TABLE %s ADD COLUMN %s %s"
+                         % (table, col, decl))
+            done += 1
+    # v_entries / v_tafsir are SELECT *, so they must be rebuilt to see the
+    # new columns.
+    conn.execute("DROP VIEW IF EXISTS v_entries")
+    conn.execute("DROP VIEW IF EXISTS v_tafsir")
+    conn.execute("CREATE VIEW v_entries AS SELECT * FROM entries "
+                 "WHERE verified = 1")
+    conn.execute("CREATE VIEW v_tafsir AS SELECT * FROM tafsir "
+                 "WHERE verified = 1")
+    conn.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
+    conn.commit()
+    return done
+
+
+def schema_columns_ok(conn):
+    """True when every column this build needs actually exists."""
+    for table, col, _ in _MIGRATIONS_V2:
+        ex = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE "
+                          "type='table' AND name=?", (table,)).fetchone()[0]
+        if ex and col not in {r[1] for r in
+                              conn.execute("PRAGMA table_info(%s)" % table)}:
+            return False
+    return True
+
+
 def load(conn, path=CORPUS_TXT, rebuild=False):
     with open(path, "rb") as fh:
         text = fh.read().decode("utf-8")
 
     conn.set_authorizer(None)      # ingestion, not the query path
+    migrate(conn)
     have = conn.execute("PRAGMA user_version").fetchone()[0]
     existing = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE "
                             "type='table' AND name='segments'").fetchone()[0]
@@ -1441,6 +1518,213 @@ def counts(conn):
             "SELECT COUNT(DISTINCT sura) FROM segments").fetchone()[0],
         "roots": c.execute("SELECT COUNT(*) FROM roots").fetchone()[0],
     }
+
+
+# ==========================================================================
+# 8b.  INGESTION  --  lexicons
+# ==========================================================================
+#
+# Ingestion is the BUILD path, and it is kept away from the query path on
+# purpose.  What it writes is verified = 0, always, without exception, and
+# verified = 0 is never served.  Nothing here is servable until a person has
+# looked at it and said so (`lughat.py review`).
+#
+# The text is copied BYTE FOR BYTE.  What is stored in entries.text_raw is
+# exactly the bytes of the source block, OpenITI markup included; the markup
+# is stripped at DISPLAY time by the documented rule in render_entry(), so the
+# transformation is readable and reversible instead of baked in.
+
+MAQAYIS_ATTRIBUTION = (
+    "Ibn Faris, Mu'jam Maqayis al-Lugha, ed. 'Abd al-Salam Muhammad Harun "
+    "(Beirut: Dar al-Jil, 1420/1999), 6 vols. Digital text: OpenITI, "
+    "CC BY-NC-SA. https://github.com/OpenITI")
+
+_HDR_RE = re.compile(r"^### \|+ *(.*)$")
+_PAGE_RE = re.compile(r"PageV(\d+)P(\d+)")
+_MS_RE = re.compile(r"ms\d+")
+
+
+# An entry heading in this witness is ALWAYS parenthesised: (سكن), (أبت).
+# Anything else on a "### |" line is one of two other things, and neither is
+# an entry:
+#
+#   [باب الهمزة والتاء وما يثلثهما]   a section title
+#   اله  /  آخ  /  : إذ  /  اح        a DIGITISATION ARTIFACT -- a header
+#                                     inserted in the middle of a word
+#
+# The artifacts are the dangerous ones.  "### | اله" is followed by
+# "# مزة والكاف والراء أصل واحد، وهو الحفر" -- that is the word الهمزة split
+# across a header boundary, and the fragment اله canonicalises to ءله, the
+# root of الله.  Treating it as a heading files Ibn Faris on أكر under the
+# root of the divine name.  A lexicography tool that does that is worse than
+# one with no lexicon in it.
+#
+# So: only (...) starts an entry.  A [...] line closes the current entry and
+# starts nothing.  Every other "### |" line is TEXT belonging to the entry in
+# progress, rejoined using exactly the whitespace the source itself has --
+# "اله" + "مزة" -> الهمزة, "إن " + "إلك" -> إن إلك.  No spacing is invented.
+
+_ENTRY_HDR_RE = re.compile(r"^\(\s*([؀-ۿ]+)\s*\)\s*[:\-]?\s*$")
+_SECTION_HDR_RE = re.compile(r"^\[.*\]\s*$")
+
+
+def _heading_root(heading):
+    """The root this heading names, or None if it does not name one."""
+    m = _ENTRY_HDR_RE.match(heading.strip())
+    if not m:
+        return None
+    try:
+        letters = canonical_root(m.group(1))
+    except (ValueError, TransliterationError):
+        return None
+    return "".join(letters) if 2 <= len(letters) <= 5 else None
+
+
+def resolve_root(heading_root, corpus_roots):
+    """Map a lexicon heading onto a corpus root, saying HOW.
+
+    Two spelling conventions differ between Maqayis and the corpus, and both
+    were found by measuring coverage rather than by assumption:
+
+      geminate    Maqayis heads a mudaaf root with two letters -- أب for the
+                  corpus's ءبب.  151 roots.
+      weak_final  Maqayis heads a weak-lam root with ى/ي where the corpus
+                  writes و -- (دنى) for دنو, (صلى) for صلو.
+
+    Both are inferences, so both are recorded and neither is hidden from the
+    reviewer."""
+    if heading_root is None:
+        return None, "unparsed"
+    if heading_root in corpus_roots:
+        return heading_root, "direct"
+    if len(heading_root) == 2:
+        doubled = heading_root + heading_root[1]
+        if doubled in corpus_roots:
+            return doubled, "geminate"
+    if heading_root and heading_root[-1] in ("ي", "و"):
+        other = heading_root[:-1] + ("و" if heading_root[-1] == "ي" else "ي")
+        if other in corpus_roots:
+            return other, "weak_final"
+    return heading_root, "unmatched"
+
+
+def parse_maqayis(text, corpus_roots):
+    """Yield one dict per entry.  text_raw is the block verbatim."""
+    page = (None, None)
+    cur = None
+    for line in text.splitlines():
+        m = _PAGE_RE.search(line)
+        if m:
+            page = (int(m.group(1)), int(m.group(2)))
+        h = _HDR_RE.match(line)
+        if h:
+            head = h.group(1)
+            if _SECTION_HDR_RE.match(head.strip()):
+                if cur:
+                    yield cur
+                cur = None
+                continue
+            hr = _heading_root(head)
+            if hr is None:
+                # a digitisation artifact: text, not a heading
+                if cur is not None:
+                    cur["lines"].append(line)
+                continue
+            if cur:
+                yield cur
+            root, how = resolve_root(hr, corpus_roots)
+            cur = {"headword": head.strip(), "root_ar": root,
+                   "extraction": how, "vol": page[0], "page": page[1],
+                   "lines": []}
+        elif cur is not None:
+            cur["lines"].append(line)
+    if cur:
+        yield cur
+
+
+def render_entry(raw):
+    """Strip OpenITI structural markup for DISPLAY.  This is the digitisation's
+    annotation, not the author's words, and the rule is written here so it can
+    be read: page markers and milestone ids are dropped, '# ' begins a
+    paragraph, '~~' continues the previous one, '%' separates hemistichs."""
+    out = []
+    glue = ""
+    for line in raw.splitlines():
+        line = _PAGE_RE.sub("", line)
+        line = _MS_RE.sub("", line)
+        h = _HDR_RE.match(line)
+        if h:
+            # an artifact header: its content is the first half of a word (or
+            # phrase) whose second half is on the next line.  Carry it, with
+            # the source's own trailing space, and glue it on.
+            glue = h.group(1)
+            continue
+        if line.startswith("~~"):
+            cont, line = True, line[2:]
+        elif line.startswith("# "):
+            cont, line = False, line[2:]
+        elif line.startswith("#"):
+            cont, line = False, line[1:]
+        else:
+            cont = bool(out)
+        if glue:
+            line = glue + line.lstrip("# ").lstrip("~")
+            glue = ""
+            cont = True
+        line = line.strip()
+        if not line:
+            continue
+        if cont and out:
+            out[-1] = (out[-1] + " " + line).strip()
+        else:
+            out.append(line)
+    return [l.replace("%", "\n").strip() for l in out]
+
+
+def ingest_maqayis(conn, path):
+    """Load Mu'jam Maqayis al-Lugha.  Every row lands verified = 0."""
+    with open(path, "rb") as fh:
+        text = fh.read().decode("utf-8")
+    with unguarded(conn):
+        cur = conn.cursor()
+        # ON CONFLICT, not INSERT OR REPLACE: replace would delete the row
+        # and re-insert it with a NEW id, orphaning every entry that points
+        # at it -- including ones a person has already approved.
+        cur.execute(
+            "INSERT INTO sources (key,title,author,edition,kind,"
+            "licence,licence_note,distributable,url,attribution) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET title=excluded.title,"
+            "author=excluded.author,edition=excluded.edition,"
+            "licence=excluded.licence,licence_note=excluded.licence_note,"
+            "distributable=excluded.distributable,url=excluded.url,"
+            "attribution=excluded.attribution",
+            ("maqayis", "Mu'jam Maqayis al-Lugha", "Ibn Faris (d. 395 AH)",
+             "ed. Harun, Dar al-Jil, 1420/1999, 6 vols", "lexicon",
+             "CC BY-NC-SA",
+             "OpenITI digital text; non-commercial, share-alike, attribution "
+             "required. Personal study use.", 1,
+             "https://github.com/OpenITI", MAQAYIS_ATTRIBUTION))
+        sid = cur.execute(
+            "SELECT id FROM sources WHERE key='maqayis'").fetchone()[0]
+        cur.execute("DELETE FROM entries WHERE source_id=?", (sid,))
+        corpus = {r[0] for r in cur.execute("SELECT root_ar FROM roots")}
+        n = 0
+        stats = {}
+        for e in parse_maqayis(text, corpus):
+            raw = "\n".join(e["lines"]).strip()
+            if not raw:
+                continue
+            cur.execute(
+                "INSERT INTO entries (source_id,root_ar,headword,text_raw,"
+                "text_norm,vol,page,extraction,verified) "
+                "VALUES (?,?,?,?,?,?,?,?,0)",
+                (sid, e["root_ar"], e["headword"], raw,
+                 norm_alif(raw), e["vol"], e["page"], e["extraction"]))
+            stats[e["extraction"]] = stats.get(e["extraction"], 0) + 1
+            n += 1
+        conn.commit()
+    return n, stats
 
 
 # ==========================================================================
@@ -1723,7 +2007,17 @@ def cmd_root(conn, root):
     _w("")
     _w("Lexicon entries for this root:")
     ents = list(q(conn, "SELECT * FROM v_entries WHERE root_ar = ?", (root_ar,)))
-    if not ents:
+    pending = 0
+    with unguarded(conn):
+        r = conn.execute("SELECT COUNT(*) n FROM entries WHERE root_ar=? AND "
+                         "verified=0", (root_ar,)).fetchone()
+        pending = r["n"] if r else 0
+    if not ents and pending:
+        _w("  %d entry/entries for this root are INGESTED BUT NOT APPROVED."
+           % pending)
+        _w("  They are not shown, because unreviewed text is never served.")
+        _w("  Run:  python3 lughat.py review")
+    elif not ents:
         _w("  %s" % NOT_FOUND_UR)
         for line in _wrap(
                 "%s. No lexicon has been ingested yet, so this tool has "
@@ -1733,13 +2027,103 @@ def cmd_root(conn, root):
                 % NOT_FOUND_EN, 68):
             _w("  " + line)
     for e in ents:
-        _w("  %s" % (e["text_raw"] if e["text_raw"] is not None
-                     else "[scan only: %s]" % e["scan_uri"]))
-        _w("      -- %s vol %s p. %s" % (
-            q(conn, "SELECT title FROM sources WHERE id=?",
-              (e["source_id"],)).fetchone()["title"], e["vol"], e["page"]))
+        src = q(conn, "SELECT title, author, edition, attribution FROM sources "
+                      "WHERE id=?", (e["source_id"],)).fetchone()
+        _w("")
+        _w("  %s -- %s" % (src["title"], src["author"] or ""))
+        if e["text_raw"] is None:
+            _w("  [scan only: %s]" % e["scan_uri"])
+        else:
+            for line in render_entry(e["text_raw"]):
+                for w in _wrap(line, 70):
+                    _w("    " + w)
+        _w("      -- %s, vol %s p. %s" % (src["edition"] or "", e["vol"],
+                                          e["page"]))
+        _w("      %s" % src["attribution"])
     _w("")
     _w(QAC_ATTRIBUTION)
+
+
+def cmd_review(conn, args):
+    """The human approval gate.  Ingestion writes verified = 0; this is the
+    only thing that writes verified = 1, and it does so one entry at a time
+    after showing a person exactly what they are approving.
+
+    Entries are offered most-useful-first (by how many times the root occurs
+    in the Qur'an), because the gate is only honoured if it is bearable."""
+    only = None
+    for a in args:
+        if a.startswith("--extraction="):
+            only = a.split("=", 1)[1]
+    if "--stats" in args:
+        _w(BAR)
+        _w("REVIEW QUEUE")
+        _w(BAR)
+        with unguarded(conn):
+            rows = list(conn.execute(
+                "SELECT s.title, e.extraction, e.verified, COUNT(*) n "
+                "FROM entries e JOIN sources s ON s.id=e.source_id "
+                "GROUP BY s.title, e.extraction, e.verified "
+                "ORDER BY s.title, e.extraction, e.verified"))
+        _w("%-26s %-11s %-9s %s" % ("SOURCE", "EXTRACTION", "STATE", "COUNT"))
+        _w(RULE)
+        for r in rows:
+            _w("%-26s %-11s %-9s %d"
+               % (r["title"][:26], r["extraction"] or "-",
+                  "APPROVED" if r["verified"] else "pending", r["n"]))
+        _w("")
+        _w("Only APPROVED rows are ever served. Run `review` to work the "
+           "queue.")
+        return
+
+    sql = ("SELECT e.*, s.title FROM entries e JOIN sources s "
+           "ON s.id = e.source_id WHERE e.verified = 0")
+    params = []
+    if only:
+        sql += " AND e.extraction = ?"
+        params.append(only)
+    sql += (" ORDER BY COALESCE((SELECT n_segments FROM roots r "
+            "WHERE r.root_ar = e.root_ar), 0) DESC, e.id")
+    with unguarded(conn):
+        pending = list(conn.execute(sql, params))
+    if not pending:
+        _w("Nothing pending%s." % (" for extraction=%s" % only if only else ""))
+        return
+    _w("%d entries pending. y=approve  n=skip  q=quit" % len(pending))
+    approved = 0
+    for row in pending:
+        _w("")
+        _w(BAR)
+        occ = q(conn, "SELECT n_segments n FROM roots WHERE root_ar=?",
+                (row["root_ar"],)).fetchone()
+        _w("%s   heading %s   -> root %s   [%s]"
+           % (row["title"], row["headword"], row["root_ar"] or "-",
+              row["extraction"]))
+        _w("vol %s  p. %s   |  root occurs %s times in the Qur'an"
+           % (row["vol"], row["page"], occ["n"] if occ else 0))
+        if row["extraction"] not in ("direct",):
+            _w("!! the root was INFERRED (%s), not read straight from the "
+               "heading" % row["extraction"])
+        _w(RULE)
+        for line in render_entry(row["text_raw"])[:6]:
+            for w in _wrap(line, 72):
+                _w("  " + w)
+        _w(BAR)
+        try:
+            ans = input("approve? [y/n/q] ").strip().lower()
+        except EOFError:
+            ans = "q"
+        if ans == "q":
+            break
+        if ans == "y":
+            with unguarded(conn):
+                conn.execute("UPDATE entries SET verified=1, "
+                             "verified_at=datetime('now') WHERE id=?",
+                             (row["id"],))
+                conn.commit()
+            approved += 1
+    _w("")
+    _w("%d approved this session. The rest stay unserved." % approved)
 
 
 def cmd_aya(conn, ref):
@@ -2567,6 +2951,166 @@ def _t(conn):
     return "Buckwalter and Arabic both resolve"
 
 
+# A small mARkdown fixture with every shape the real file has, so the
+# ingestion tests do not depend on a 3.7MB download being present.
+_FIXTURE = "\n".join([
+    "######OpenITI#",
+    "#META# 020.BookTITLE\t:: معجم مقاييس اللغة",
+    "#META#",
+    "### | [باب السين والكاف وما يثلثهما]",
+    "PageV03P087",
+    "### | (سكن) ",
+    "# السين والكاف والنون أصل واحد مطرد، يدل على خلاف الاضطراب والحركة.",
+    "~~ويقال سكن الشيء يسكن سكونا فهو ساكن.",
+    "### | اله",
+    "# مزة تكملة لهذا السطر.",
+    "PageV01P125",
+    "### | (أكر)",
+    "# الهمزة والكاف والراء أصل واحد، وهو الحفر.",
+])
+
+
+@test("HONESTY", "ingestion never writes a servable row")
+def _t(conn):
+    """The build path may propose; only a person may approve. Ingestion that
+    could write verified = 1 would make the review gate decorative."""
+    src = open(os.path.abspath(__file__), "rb").read().decode("utf-8")
+    body = src[src.index("def ingest_maqayis"):src.index("# 9.  ATTESTATION")]
+    ck("verified" in body, "the ingest INSERT does not mention verified")
+    ck("verified=1" not in body.replace(" ", ""),
+       "ingestion can write verified = 1")
+    ck("VALUES (?,?,?,?,?,?,?,?,0)" in body,
+       "the ingest INSERT does not pin verified to 0")
+    n = q(conn, "SELECT COUNT(*) n FROM v_entries").fetchone()["n"]
+    total = 0
+    with unguarded(conn):
+        total = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+    if total:
+        ck(n < total, "every ingested row is already being served")
+    return "ingest pins verified = 0; %d of %d rows servable" % (n, total)
+
+
+@test("HONESTY", "a digitisation artifact cannot file text under a root")
+def _t(conn):
+    """OpenITI inserts headers mid-word: '### | اله' followed by '# مزة...'
+    is the word الهمزة split in two, and اله canonicalises to the root of
+    الله. Treating it as a heading files one root's article under another --
+    a sourced-looking quotation that the source never wrote there."""
+    got = list(parse_maqayis(_FIXTURE, {"سكن", "ءكر", "ءله"}))
+    roots = [e["root_ar"] for e in got]
+    ck(roots == ["سكن", "ءكر"], "parsed %s; اله must not become an entry"
+       % roots)
+    ck(not any("تكملة" in "\n".join(e["lines"]) and e["root_ar"] == "ءله"
+               for e in got), "artifact text filed under ءله")
+    # the artifact's text is not lost -- it belongs to the entry in progress
+    skn = got[0]
+    ck(any("تكملة" in l for l in skn["lines"]),
+       "the artifact's text was dropped instead of rejoined")
+    ck("الهمزة تكملة" in " ".join(render_entry("\n".join(skn["lines"]))),
+       "the split word was not rejoined using the source's own spacing")
+    # section titles start nothing
+    ck(all(not (e["headword"] or "").startswith("[") for e in got),
+       "a section title became an entry")
+    return "only (root) headings create entries; artifact text is rejoined"
+
+
+@test("HONESTY", "ingested text is byte-exact, and markup is stripped only "
+                 "for display")
+def _t(conn):
+    got = list(parse_maqayis(_FIXTURE, {"سكن", "ءكر"}))
+    raw = "\n".join(got[0]["lines"])
+    for line in raw.splitlines():
+        ck(line in _FIXTURE, "a stored line is not in the source: %r" % line)
+    ck("~~" in raw and "# " in raw,
+       "markup was stripped before storage; text_raw must be verbatim")
+    shown = render_entry(raw)
+    ck(not any("~~" in l or l.startswith("# ") for l in shown),
+       "display leaked mARkdown markup")
+    ck("PageV" not in " ".join(shown), "display leaked a page marker")
+    ck("خلاف الاضطراب والحركة" in " ".join(shown), "the text itself was lost")
+    return "stored verbatim (%d chars), rendered clean" % len(raw)
+
+
+@test("HONESTY", "an ingested entry is not served until it is approved")
+def _t(conn):
+    with unguarded(conn):
+        conn.execute("SAVEPOINT ing")
+        conn.execute("INSERT INTO sources (key,title,kind,attribution) "
+                     "VALUES ('_ing','ING','lexicon','ING')")
+        sid = conn.execute(
+            "SELECT id FROM sources WHERE key='_ing'").fetchone()[0]
+        conn.execute("INSERT INTO entries (source_id,root_ar,headword,"
+                     "text_raw,vol,page,extraction,verified) "
+                     "VALUES (?,?,?,?,?,?,'direct',0)",
+                     (sid, "سكن", "(سكن)", "PENDING PROSE", "3", "87"))
+        eid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    try:
+        out = io.StringIO()
+        real, sys.stdout = sys.stdout, out
+        try:
+            cmd_root(conn, "سكن")
+        finally:
+            sys.stdout = real
+        ck("PENDING PROSE" not in out.getvalue(), "an unapproved row was served")
+        ck("NOT APPROVED" in out.getvalue(),
+           "the reader is not told that pending text exists")
+        # now approve it, exactly as `review` does
+        with unguarded(conn):
+            conn.execute("UPDATE entries SET verified=1, "
+                         "verified_at=datetime('now') WHERE id=?", (eid,))
+        out = io.StringIO()
+        real, sys.stdout = sys.stdout, out
+        try:
+            cmd_root(conn, "سكن")
+        finally:
+            sys.stdout = real
+        ck("PENDING PROSE" in out.getvalue(),
+           "approving did not make the row servable")
+        with unguarded(conn):
+            r = conn.execute("SELECT verified_at FROM entries WHERE id=?",
+                             (eid,)).fetchone()
+        ck(r["verified_at"], "approval left no audit stamp")
+    finally:
+        with unguarded(conn):
+            conn.execute("ROLLBACK TO ing")
+            conn.execute("RELEASE ing")
+    return "pending hidden but announced; approved served; stamped"
+
+
+@test("HONESTY", "an inferred root is recorded as inferred")
+def _t(conn):
+    """Two spelling bridges map a heading onto a corpus root. Both are
+    inferences and the reviewer must see which is which."""
+    corpus = {"ءبب", "دنو", "سكن"}
+    ck(resolve_root("سكن", corpus) == ("سكن", "direct"), "direct broke")
+    ck(resolve_root("ءب", corpus) == ("ءبب", "geminate"), "geminate broke")
+    ck(resolve_root("دني", corpus) == ("دنو", "weak_final"), "weak_final broke")
+    ck(resolve_root("زقز", corpus) == ("زقز", "unmatched"), "unmatched broke")
+    ck(resolve_root(None, corpus) == (None, "unparsed"), "unparsed broke")
+    with unguarded(conn):
+        rows = dict(conn.execute("SELECT extraction, COUNT(*) FROM entries "
+                                 "GROUP BY extraction"))
+    if rows:
+        ck("direct" in rows, "no extraction provenance recorded: %s" % rows)
+    return "direct / geminate / weak_final / unmatched / unparsed all tagged"
+
+
+@test("HONESTY", "migration is additive: approved work survives it")
+def _t(conn):
+    """Bumping the schema must never drop a table that can hold rows a person
+    has read and approved."""
+    src = open(os.path.abspath(__file__), "rb").read().decode("utf-8")
+    body = src[src.index("def migrate("):src.index("def schema_columns_ok")]
+    for danger in ("DROP TABLE", "DELETE FROM entries", "DELETE FROM tafsir"):
+        ck(danger not in body, "migrate() contains %r" % danger)
+    loader = src[src.index("def load("):src.index("def counts(")]
+    ck("entries" not in loader.split("DROP TABLE")[-1][:200]
+       if "DROP TABLE" in loader else True,
+       "the loader drops entries")
+    ck(schema_columns_ok(conn), "the live schema is missing a column")
+    return "no destructive statement in migrate(); live schema complete"
+
+
 @test("HONESTY", "refusals are refusals, not empty strings")
 def _t(conn):
     res = generate("سكن")
@@ -2627,6 +3171,10 @@ USAGE = """lughat -- a local Qur'anic lexicography tool (offline, stdlib only)
   lughat.py root <root>           corpus occurrences of a root
   lughat.py word <word>           search the mushaf text
   lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
+  lughat.py ingest maqayis --from PATH
+                                  load a lexicon, ALL at verified = 0
+  lughat.py review [--stats]      the approval gate: the only writer of
+                                  verified = 1
 
 Roots and words may be typed in Arabic (سكن) or Buckwalter (skn).
 """
@@ -2704,6 +3252,33 @@ def _main(argv):
             sys.stdout.write(USAGE)
             return 2
         cmd_root(connect(), argv[2])
+        return 0
+
+    if cmd == "ingest":
+        if len(argv) < 3:
+            sys.stderr.write("usage: lughat.py ingest maqayis --from PATH\n")
+            return 2
+        if argv[2] != "maqayis":
+            sys.stderr.write("unknown source %r; known: maqayis\n" % argv[2])
+            return 2
+        if "--from" not in argv:
+            sys.stderr.write("ingest needs --from PATH (an OpenITI text)\n")
+            return 2
+        path = argv[argv.index("--from") + 1]
+        conn = connect()
+        n, stats = ingest_maqayis(conn, path)
+        _w("ingested %d entries, ALL at verified = 0 (not served)." % n)
+        for k in sorted(stats):
+            _w("  %-11s %5d" % (k, stats[k]))
+        _w("")
+        _w("Nothing above is visible to a query until it is approved:")
+        _w("  python3 lughat.py review --stats")
+        _w("  python3 lughat.py review")
+        _w(MAQAYIS_ATTRIBUTION)
+        return 0
+
+    if cmd == "review":
+        cmd_review(connect(), argv[2:])
         return 0
 
     if cmd == "aya":
