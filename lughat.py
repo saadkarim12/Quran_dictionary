@@ -6780,6 +6780,12 @@ def _t(conn):
            "the gloss is being split into paragraphs against the Arabic")
         ck("%s" in GLOSS_WARNING and "not checked by anyone" in GLOSS_WARNING,
            "the warning does not say whose words these are not")
+        # 4. a root with no gloss must LOOK like one, not like a broken tool
+        cov = read_root(conn, "سكن")["gloss_coverage"]
+        ck("here" in cov and "roots" in cov,
+           "the page cannot tell a missing gloss from a missing feature")
+        ck("No machine gloss for this root" in READ_HTML,
+           "an absent gloss is silently absent")
     finally:
         with unguarded(conn):
             conn.execute("ROLLBACK TO gl")
@@ -8612,6 +8618,15 @@ function draw(){
    '"'+(HIDDEN.has("gloss:"+g.lang)?"":" checked")+'> '+esc(g.language)+
    ' \u2014 machine</label>';
  h+='</div>';
+ const gc=r.gloss_coverage;
+ if(gc && !gc.here)
+  h+='<div class="cls" style="margin:-.3rem 0 .8rem">'+
+   (gc.langs.length
+     ? 'No machine gloss for this root. '+gc.langs.map(
+         x=>esc(x.language)+' '+x.entries).join(", ")+' entries glossed so '+
+       'far, across '+gc.roots+' root'+(gc.roots==1?"":"s")+'.'
+     : 'No machine glosses are loaded.')+
+   ' <code>lughat.py gloss --from=FILE</code> imports more.</div>';
  for(const c of r.cards){
   if(HIDDEN.has(c.key)) continue;
   if(!c.entries.length){
@@ -9090,6 +9105,22 @@ def read_root(conn, query):
                     for g in e["glosses"]})
     out["gloss_langs"] = [{"lang": l, "language": GLOSS_LANGS.get(l, l)}
                           for l in langs]
+    # An absent gloss must be VISIBLY absent. Showing no switches at all made
+    # a root with none look identical to a tool with the feature broken, so
+    # the coverage is stated: what exists overall, and whether this root has
+    # any of it.
+    with unguarded(conn):
+        have = list(conn.execute(
+            "SELECT lang, COUNT(DISTINCT entry_id) n FROM glosses "
+            "GROUP BY lang ORDER BY lang"))
+        rooted = conn.execute(
+            "SELECT COUNT(DISTINCT e.root_ar) FROM glosses g JOIN entries e "
+            "ON e.id = g.entry_id").fetchone()[0]
+    out["gloss_coverage"] = {
+        "langs": [{"lang": r["lang"], "language": GLOSS_LANGS.get(r["lang"],
+                                                                 r["lang"]),
+                   "entries": r["n"]} for r in have],
+        "roots": rooted, "here": bool(langs)}
     out["tafsir_sources"] = [
         {"key": r["key"], "title": r["title"]}
         for r in q(conn, "SELECT key, title FROM sources WHERE kind='tafsir' "
