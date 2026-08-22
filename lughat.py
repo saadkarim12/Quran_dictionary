@@ -4096,10 +4096,17 @@ def cmd_review(conn, args):
 
     Entries are offered most-useful-first (by how many times the root occurs
     in the Qur'an), because the gate is only honoured if it is bearable."""
-    only = root = None
+    only = root = source = contains = None
     for a in args:
         if a.startswith("--extraction="):
             only = a.split("=", 1)[1]
+        elif a.startswith("--source="):
+            # A book keyed by letter, topic or pair has no root to filter on,
+            # so without this its chapters are unreachable behind 15,000
+            # lexicon entries.
+            source = a.split("=", 1)[1]
+        elif a.startswith("--contains="):
+            contains = a.split("=", 1)[1]
         elif a.startswith("--root="):
             # The queue is 15,768 entries deep. Anyone reading ONE word wants
             # that word's articles decided now, not in frequency order three
@@ -4153,6 +4160,12 @@ def cmd_review(conn, args):
     if root:
         sql += " AND e.root_ar = ?"
         params.append(root)
+    if source:
+        sql += (" AND e.source_id = (SELECT id FROM sources WHERE key = ?)")
+        params.append(source)
+    if contains:
+        sql += " AND (e.headword LIKE ? OR e.text_raw LIKE ?)"
+        params += ["%" + contains + "%"] * 2
     sql += (" ORDER BY COALESCE((SELECT n_segments FROM roots r "
             "WHERE r.root_ar = e.root_ar), 0) DESC, e.id")
     with unguarded(conn):
@@ -4163,6 +4176,10 @@ def cmd_review(conn, args):
             why.append("extraction=%s" % only)
         if root:
             why.append("root %s" % root)
+        if source:
+            why.append("source %s" % source)
+        if contains:
+            why.append("text containing %s" % contains)
         _w("Nothing pending%s." % (" for " + " and ".join(why) if why else ""))
         return
     _w("%d entries pending. y=approve  n=skip  q=quit" % len(pending))
@@ -4180,9 +4197,14 @@ def cmd_review(conn, args):
         if row["flags"]:
             _w("!! FLAG: %s -- check the heading against the printed page"
                % row["flags"])
-        if row["extraction"] not in ("direct",):
+        if row["extraction"] in ("geminate", "weak_final", "unmatched"):
             _w("!! the root was INFERRED (%s), not read straight from the "
                "heading" % row["extraction"])
+        elif row["extraction"] not in ("direct", None):
+            # letter / chapter / pair: nothing was inferred, the book simply
+            # is not keyed by root. Calling that an inference would teach the
+            # reviewer to ignore the warning that matters.
+            _w("   this book is keyed by %s, not by root" % row["extraction"])
         _w(RULE)
         body = (render_entry(row["text_raw"]) if row["text_raw"] is not None
                 else ["[scan only: %s]" % (row["scan_uri"] or "no scan_uri")])
@@ -7214,6 +7236,15 @@ kbd{font:inherit;font-size:.74rem;opacity:.75;border:1px solid currentColor;
     <option value="tafsir">tafsir passages</option>
   </select>
   <input id="root" type="search" placeholder="one root, e.g. سكن" size="14">
+  <select id="src">
+    <option value="">every source</option>
+    <option value="maqayis">Maqāyīs</option>
+    <option value="mufradat">Mufradāt</option>
+    <option value="lisan">Lisān</option>
+    <option value="furuq">Furūq (al-ʿAskarī)</option>
+    <option value="sirr">Sirr (Ibn Jinnī)</option>
+    <option value="khasais">Khaṣāʾiṣ (Ibn Jinnī)</option>
+  </select>
   <select id="filt">
     <option value="">every extraction</option>
     <option value="direct">direct only</option>
@@ -7259,6 +7290,7 @@ async function load(){
   document.getElementById("root").style.display=tf?"none":"";
   const d=await api("/api/queue?table="+encodeURIComponent(table())+
     "&root="+encodeURIComponent(tf?"":rt)+
+    "&source="+encodeURIComponent(tf?"":document.getElementById("src").value)+
     "&extraction="+encodeURIComponent(tf?"":ex));
   if(d.error){
    document.getElementById("main").innerHTML=
@@ -7346,6 +7378,7 @@ addEventListener("keydown",ev=>{
 document.getElementById("filt").addEventListener("change",load);
 document.getElementById("tbl").addEventListener("change",load);
 document.getElementById("root").addEventListener("change",load);
+document.getElementById("src").addEventListener("change",load);
 // the counter is the WHOLE queue; when a root is filtering it, the batch
 // count below is the honest number for what is on screen
 document.getElementById("root").addEventListener("keydown",ev=>{
@@ -7408,7 +7441,8 @@ def _tafsir_queue_rows(conn, limit=60):
     return out
 
 
-def _queue_rows(conn, extraction=None, limit=60, table="entries", root=None):
+def _queue_rows(conn, extraction=None, limit=60, table="entries", root=None,
+                source=None):
     if _table(table) == "tafsir":
         return _tafsir_queue_rows(conn, limit)
     # LEFT JOIN, not JOIN: an entry whose source row has gone missing would
@@ -7424,6 +7458,9 @@ def _queue_rows(conn, extraction=None, limit=60, table="entries", root=None):
     if extraction:
         sql += " AND e.extraction = ?"
         params.append(extraction)
+    if source:
+        sql += " AND e.source_id = (SELECT id FROM sources WHERE key = ?)"
+        params.append(source)
     if root:
         # The queue is 15,768 entries in frequency order, which is the right
         # default and useless when you are looking at ONE word in the reader
@@ -7560,9 +7597,11 @@ def make_review_app(conn, token):
                 except ValueError as e:
                     return self._send(400, json.dumps({"error": str(e)}))
                 root = (qs.get("root", [""])[0] or "").strip()
+                srck = (qs.get("source", [""])[0] or "").strip() or None
                 try:
                     with DB_LOCK:
-                        rows = _queue_rows(conn, ex, table=tbl, root=root)
+                        rows = _queue_rows(conn, ex, table=tbl, root=root,
+                                           source=srck)
                 except ValueError as e:
                     # a root that is not a root is the reviewer's typo, not a
                     # server error: say so and leave the queue as it was
