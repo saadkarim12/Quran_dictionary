@@ -52,6 +52,7 @@ Usage:
   lughat.py read [--port=N]       the READING surface: approved sources only
 """
 
+import collections
 import contextlib
 import inspect
 import hashlib
@@ -1541,6 +1542,42 @@ _NEW_TABLES = {
             text       TEXT NOT NULL,
             UNIQUE (source_id, sura, aya)
         )""",
+    # MACHINE TRANSLATION, and the one table in this database whose text is
+    # nobody's words.
+    #
+    # `translations` above holds a NAMED TRANSLATOR's published lines, which
+    # is why it is served ungated: a person wrote them and is credited. This
+    # table holds the output of a neural model run over a scholar's Arabic.
+    # It is a reading aid the owner of this database asked for, and it is
+    # kept apart from every sourced string in the program:
+    #
+    #   - it is NEVER inside a citation card. The bordered card means
+    #     "verbatim, cited"; putting generated Urdu inside it would spend the
+    #     one visual promise this page makes.
+    #   - it is OFF by default and must be switched on, like the translator
+    #     checkboxes -- and for a stronger reason, since no translator's name
+    #     stands behind it.
+    #   - it records the `engine` and `model` that produced each line, so a
+    #     reader can tell WHICH machine, and a later run can replace one
+    #     engine's output without touching another's.
+    #   - it is keyed to a PARAGRAPH of the rendered entry, not to the entry,
+    #     because side-by-side reading needs the two to line up.
+    #
+    # It is not reviewed, and must never be: `review` stamps verified = 1,
+    # which in this program means a person vouched for a SOURCE. Nobody can
+    # vouch for this, so it does not enter that gate at all.
+    "glosses": """
+        CREATE TABLE IF NOT EXISTS glosses (
+            id         INTEGER PRIMARY KEY,
+            entry_id   INTEGER NOT NULL REFERENCES entries(id),
+            para       INTEGER NOT NULL,
+            lang       TEXT NOT NULL,
+            text       TEXT NOT NULL,
+            engine     TEXT NOT NULL,
+            model      TEXT NOT NULL,
+            created_at TEXT,
+            UNIQUE (entry_id, para, lang, engine)
+        )""",
 }
 
 _MIGRATIONS_V2 = [
@@ -1570,6 +1607,21 @@ _MIGRATIONS_V2 = [
     # the same claim.
     ("entries", "verified_by", "TEXT"),
     ("tafsir", "verified_by", "TEXT"),
+    # WHY an entry is filed under its root, where that was not read off a
+    # heading. For a scan-only OCR source the link rests on two agreeing
+    # facts, and the second of them -- the ayat the page quotes -- is also
+    # what the reader is shown, from the app's OWN mushaf. Stored beside the
+    # claim, as bab_evidence and anchor_evidence already are, rather than
+    # recomputed at query time where a drift between the two computations
+    # would be invisible (trap 8).
+    ("entries", "link_evidence", "TEXT"),
+    # HOW an entry's page number was arrived at, beside bab_method and
+    # anchor_method which answer the same question for other claims. It does
+    # NOT go in `flags`: that column drives the alphabetical-order badge, and
+    # a warrant that is true of a third of a source would dilute the badge
+    # until a reviewer stopped reading it -- which is the failure the order
+    # check was tuned to avoid in the first place.
+    ("entries", "page_method", "TEXT"),
 ]
 
 
@@ -1924,6 +1976,12 @@ LISAN_ATTRIBUTION = (
     "Ibn Manzur, Lisan al-'Arab. Digital text: OpenITI, CC BY-NC-SA. "
     "https://github.com/OpenITI")
 
+MUTARADIFAAT_ATTRIBUTION = (
+    "'Abd al-Rahman Kilani, Mutaradifat al-Qur'an ma'a al-Furuq al-Lughawiyya "
+    "(Urdu). Scanned by KitaboSunnat; no text layer. The text stored here is "
+    "OCR (Azure AI Document Intelligence, prebuilt-read) and is NOT the "
+    "author's words: it is a search key only. Cite the page image.")
+
 _LISAN_BARE = re.compile(r"^# ([؀-ۿ]{2,8})\s*$")
 # The colon after the repeated root is NOT always written -- Lisan has both
 # "# ] بدأ : في أسماء الله" and "# ] سكن السكون ضد الحركة" -- and a leading
@@ -2135,6 +2193,45 @@ LEXICONS = {
         "keyed_by": "chapter",      # topic-organised; no root to key on
         "ordered_by": "first",
         "order_depth": 0,
+    },
+    # Kilani is a SCAN-ONLY source and the only one here whose stored text is
+    # not the book's.  It has no `detect`/`heading` because it is not parsed
+    # by parse_lexicon at all -- see ingest_mutaradifaat, which reads OCR
+    # JSON.  Three things follow from that and are enforced, not remarked:
+    #
+    #   text_raw IS NULL          there is nothing verbatim to show.  The OCR
+    #                             goes in text_norm, which this program has
+    #                             always treated as a search key that is never
+    #                             displayed.  The schema's CHECK (text_raw IS
+    #                             NOT NULL OR scan_uri IS NOT NULL) then makes
+    #                             the citation compulsory.
+    #   keyed_by 'urdu'           the book is arranged by URDU headword, and
+    #                             the OCR lost precisely that key: Azure ran an
+    #                             Arabic model over Nasta'liq, so only 82 of
+    #                             6,585 words came back holding an Urdu-only
+    #                             letter.  So it cannot be ASKED about a root,
+    #                             gets no root card, and is searched -- exactly
+    #                             like al-Khasa'is, for the same reason.
+    #   a root link needs TWO     the OCR corrupts headwords (دَابِر came back
+    #   agreeing facts            دَايِر), so a headword alone may not name a
+    #                             root.  See mutaradifaat_link().
+    "mutaradifaat": {
+        "title": "Mutaradifat al-Qur'an ma'a al-Furuq al-Lughawiyya",
+        "author": "'Abd al-Rahman Kilani",
+        "edition": "KitaboSunnat scan, 1026 pp.; OCR of scan pp. 395-414 "
+                   "(Azure prebuilt-read, api-version 2024-11-30)",
+        "licence": "in copyright",
+        "licence_note": "Not redistributable. No text of this book is stored "
+                        "or served: only an OCR search key and a page number.",
+        "url": "",
+        "distributable": False,
+        "attribution": MUTARADIFAAT_ATTRIBUTION,
+        "heading": None,
+        "detect": None,
+        "keyed_by": "urdu",
+        "ordered_by": "first",
+        "order_depth": 0,
+        "scan_only": True,
     },
 }
 
@@ -2455,6 +2552,252 @@ def ingest_lexicon(conn, key, path):
 
 def ingest_maqayis(conn, path):
     return ingest_lexicon(conn, "maqayis", path)[:2]
+
+
+# --------------------------------------------------------------------------
+# 8b-bis.  MUTARADIFAAT  --  a scan-only source, and the one whose stored
+#          text is not the author's
+# --------------------------------------------------------------------------
+#
+# Every other source in this program stores its book verbatim.  This one
+# cannot: the scan has no text layer, and what OCR returns is not Kilani's
+# words.  Measured on these 20 pages, mean engine confidence is 0.483, and
+# the Urdu in particular comes back wrong -- پاکیزہ reads باكيزه, کلمہ reads
+# كلمن.  Rendering any of it as his prose would be a fabricated attribution
+# arriving by a new door: not invented by a model, but corrupted by a scanner
+# and then dressed in a scholar's name.
+#
+# So NOTHING from this source is ever displayed.  The OCR is stored in
+# text_norm -- which this program has always defined as a search key that is
+# never shown -- and text_raw is NULL, which the schema already understands
+# as "scan-only: the page image is the citation".  The reader is given a page
+# number and the app's OWN mushaf text for the ayat the page quotes.
+#
+# WHY A ROOT LINK NEEDS TWO AGREEING FACTS.  The OCR corrupts headwords too
+# (دَابِر comes back دَايِر, a ba' read as ya'), so "the headword contains these
+# radicals" is not by itself enough to file a page under a root -- that is
+# how a scanner's error becomes a claim about a book.  This is the same
+# problem the tafsir anchoring has, and it takes the same shape of answer:
+#
+#   FACT 1, the proposal      the OCR'd headword contains the root's radicals
+#                             in order, by root_search_re -- the same written
+#                             -down rule the `mentions` search uses, with the
+#                             same stated costs.
+#   FACT 2, the confirmation  the ayat the page quotes, recovered independently
+#                             by folding the OCR through mushaf_key() and
+#                             matching trigrams against the corpus, intersect
+#                             the ayat where that root actually occurs.
+#
+# Fact 2 alone is useless and it is worth saying why, because it looks
+# plausible: every ayah contains الله or قال, so intersecting recovered ayat
+# against ALL roots just ranks the commonest function roots first.  It can
+# CONFIRM a hypothesis; it cannot GENERATE one.
+#
+# Measured on scan pp. 395-414: 65 entries parsed, 6 confirmed by both facts.
+# The other 59 are not served as entries -- 35 recover no ayah at all and 17
+# have a headword too corrupt to propose anything.  A 6/65 yield is a true
+# report of what this OCR can support, and inflating it by dropping fact 2
+# would be trading a measured gap for an unmeasured claim.
+
+# The printed folio is the scan page minus this.  Confirmed on 13 of the 20
+# OCR'd pages and independently at scan 45 (prints 28) and scan 72 (prints
+# 55), so it holds across roughly 370 pages of span.  It is used for ORDERING
+# and NAVIGATION only: where a page's own header was misread, the entry keeps
+# `header unread` and the display says the number was derived, not read.
+# "Read off the page" and "derived from the modal offset" are different
+# warrants and this program does not collapse them.
+MUTARADIFAAT_PAGE_OFFSET = 17
+
+# numeral + dash + vowelled Arabic headword + colon.  The DIGIT IS NOISE and
+# is thrown away: the OCR gives ٣- for an entry the book prints ٢-, and two
+# consecutive ٣- appear on scan 395 and again on 396.  It is never used for
+# ordering and never becomes an id.
+_MUT_HEAD = re.compile(r"^\s*[٠-٩۰-۹\d]{1,2}\s*[-–]\s*"
+                       r"([ؠ-يً-ْٰ]{2,12})\s*[:؛]")
+
+
+def mutaradifaat_entries(pages):
+    """Split OCR pages into entries.  [(scan, printed_or_None, head, lines)]"""
+    out = []
+    for scan, printed, lines in pages:
+        cur = None
+        for ln in lines:
+            m = _MUT_HEAD.match(ln)
+            if m:
+                if cur:
+                    out.append(cur)
+                cur = [scan, printed, m.group(1), [ln]]
+            elif cur:
+                cur[3].append(ln)
+        if cur:
+            out.append(cur)
+    return out
+
+
+def _mushaf_trigrams(conn):
+    """(trigram -> {(sura, aya)}) folded by mushaf_key, as the tafsir does."""
+    ayat = collections.OrderedDict()
+    for s, a, f in q(conn, "SELECT sura, aya, form_ar FROM words "
+                           "ORDER BY sura, aya, word"):
+        ayat.setdefault((s, a), []).append(f)
+    tri = {}
+    for (s, a), forms in ayat.items():
+        k = mushaf_key(" ".join(forms)).split()
+        for i in range(len(k) - 2):
+            tri.setdefault(" ".join(k[i:i + 3]), set()).add((s, a))
+    return tri
+
+
+def mutaradifaat_ayat(tri, lines):
+    """The ayat an OCR'd page quotes.  Two trigrams, as score_ocr.py uses.
+
+    One trigram is not enough: the fold is deliberately loose (it deletes all
+    three long vowels) and a single 3-word run coincides across the mushaf."""
+    k = mushaf_key(" ".join(lines)).split()
+    per = collections.Counter()
+    for i in range(len(k) - 2):
+        for sa in tri.get(" ".join(k[i:i + 3]), ()):
+            per[sa] += 1
+    return {sa for sa, n in per.items() if n >= 2}
+
+
+def mutaradifaat_link(head, ayat, root_ayat, res):
+    """The two agreeing facts.  Returns the root, or None to refuse.
+
+    Ambiguity refuses too: if two roots are both proposed AND both confirmed,
+    nothing here can choose between them, and picking one would be a guess
+    wearing the costume of a rule."""
+    h = norm_alif(head) or head
+    conf = [r for r in root_ayat if res[r].search(h) and (ayat & root_ayat[r])]
+    return conf[0] if len(conf) == 1 else None
+
+
+def _mut_pages(doc):
+    """[(scan, printed_or_None, lines)] from either shape of the OCR file.
+
+    THE WARRANT MUST TRAVEL WITH THE VALUE. The first version of this file
+    stored the raw OCR reading of the page header in a field called
+    `printed`, with nothing marking the six of twenty that are WRONG -- so a
+    consumer that trusted it cited Kilani's entry on قِتَال to printed p. 392,
+    a real page of this book that does not contain it. A misread header is
+    worse than a missing one for exactly that reason.
+
+    The current shape carries `page_method` ('header' | 'offset') beside an
+    always-populated `printed_page`, so the warrant cannot be separated from
+    the number. Where only the old shape is present the number is verified
+    against the offset here instead, and disagreement is treated as absence.
+    """
+    if isinstance(doc, dict):
+        out = []
+        for p in doc["pages"]:
+            out.append((p["scan_page"],
+                        p["printed_page"] if p["page_method"] == "header"
+                        else None,
+                        p["lines"]))
+        return out
+    # legacy: a bare array whose `printed` is the raw, untrustworthy reading
+    return [(scan, printed, lines) for scan, printed, lines in doc]
+
+
+def ingest_mutaradifaat(conn, path):
+    """Load Kilani from OCR JSON.  Stores NO text of the book.
+
+    `path` is either ocr/pages.json or the directory holding it.  Every row
+    lands verified = 0, text_raw NULL, and the OCR in text_norm."""
+    key = "mutaradifaat"
+    spec = LEXICONS[key]
+    if os.path.isdir(path):
+        path = os.path.join(path, "pages.json")
+    with open(path, "rb") as fh:
+        doc = json.loads(fh.read().decode("utf-8"))
+    # The file grew a header when its author found the trap below; the old
+    # shape was a bare array. Both are read, and the version that carries the
+    # warrant is preferred -- see _mut_pages.
+    pages = _mut_pages(doc)
+
+    with unguarded(conn):
+        cur = conn.cursor()
+        prior = cur.execute("SELECT id, edition FROM sources WHERE key=?",
+                            (key,)).fetchone()
+        if prior is not None:
+            decided = cur.execute(
+                "SELECT COUNT(*) FROM entries WHERE source_id=? AND "
+                "(verified=1 OR rejected=1)", (prior["id"],)).fetchone()[0]
+            if decided and (prior["edition"] or "") != spec["edition"]:
+                raise SystemExit(
+                    "REFUSED. Source %r already holds %d reviewed entries and "
+                    "this ingest would change its edition. Those entries' page "
+                    "numbers belong to the OLD scan. Use a NEW key."
+                    % (key, decided))
+        cur.execute(
+            "INSERT INTO sources (key,title,author,edition,kind,"
+            "licence,licence_note,distributable,url,attribution) "
+            "VALUES (?,?,?,?,'lexicon',?,?,?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET title=excluded.title,"
+            "author=excluded.author,edition=excluded.edition,"
+            "licence=excluded.licence,licence_note=excluded.licence_note,"
+            "distributable=excluded.distributable,url=excluded.url,"
+            "attribution=excluded.attribution",
+            (key, spec["title"], spec["author"], spec["edition"],
+             spec["licence"], spec["licence_note"],
+             1 if spec.get("distributable") else 0,
+             spec["url"], spec["attribution"]))
+        sid = cur.execute("SELECT id FROM sources WHERE key=?",
+                          (key,)).fetchone()[0]
+        kept = cur.execute(
+            "SELECT COUNT(*) FROM entries WHERE source_id=? AND "
+            "(verified=1 OR rejected=1)", (sid,)).fetchone()[0]
+        cur.execute("DELETE FROM entries WHERE source_id=? AND verified=0 "
+                    "AND rejected=0", (sid,))
+
+        tri = _mushaf_trigrams(conn)
+        root_ayat = collections.defaultdict(set)
+        for r, s, a in cur.execute(
+                "SELECT root_ar, sura, aya FROM segments "
+                "WHERE root_ar IS NOT NULL"):
+            root_ayat[r].add((s, a))
+        res = {r: root_search_re(r) for r in root_ayat}
+
+        n = linked = 0
+        for scan, printed, head, lines in mutaradifaat_entries(pages):
+            ayat = mutaradifaat_ayat(tri, lines)
+            root = mutaradifaat_link(head, ayat, root_ayat, res)
+            # A page header the OCR misread is WORSE than one it could not
+            # read: scan 396's header came back 349 and scan 411's came back
+            # 392 for a page printed 394.  Storing that number would cite a
+            # real page of this book that does not contain this entry -- the
+            # citation being the whole product.  So the printed number is
+            # trusted only where it AGREES with the offset; 6 of these 20
+            # pages disagree, and they are derived and said to be derived.
+            derived = scan - MUTARADIFAAT_PAGE_OFFSET
+            if printed == derived:
+                page_method = "header"
+            else:
+                page_method = "offset+%d%s" % (
+                    MUTARADIFAAT_PAGE_OFFSET,
+                    "" if printed is None else
+                    " (header misread as %s)" % printed)
+                printed = None
+            # `flags` stays for genuine anomalies only -- see page_method.
+            flags = []
+            cur.execute(
+                "INSERT INTO entries (source_id, headword, root_ar, text_raw, "
+                "text_norm, vol, page, scan_uri, extraction, flags, "
+                "link_evidence, page_method, verified) "
+                "VALUES (?,?,?,NULL,?,NULL,?,?,?,?,?,?,0)",
+                (sid, head, root,
+                 # the OCR: a SEARCH KEY, never displayed
+                 norm_alif(" ".join(lines)) or "",
+                 str(printed if printed else derived),
+                 "scan p. %d" % scan,
+                 "ocr-confirmed" if root else "ocr-unconfirmed",
+                 ",".join(flags) or None,
+                 " ".join("%d:%d" % sa for sa in sorted(ayat)) or None,
+                 page_method))
+            n += 1
+            linked += bool(root)
+        conn.commit()
+    return n, linked, kept
 
 
 # ==========================================================================
@@ -3058,7 +3401,7 @@ def _blocks_with_pages(raw):
 
 
 KEYED_BY_WORD = {"chapter": "topic", "letter": "the letters themselves",
-                 "pair": "pairs of words"}
+                 "pair": "pairs of words", "urdu": "Urdu headword"}
 
 
 def root_keyed(source_key):
@@ -3724,6 +4067,81 @@ def aya_text(conn, sura, aya):
     return " ".join(r["form_ar"] for r in q(
         conn, "SELECT form_ar FROM words WHERE sura=? AND aya=? ORDER BY word",
         (sura, aya)))
+
+
+# The mushaf trigram index, built once per process. A lexicon entry quotes
+# the Qur'an constantly, and where it does, this program already HOLDS the
+# ayah -- and, if the reader installed one, a named translator's Urdu for it.
+# Showing a machine's rendering of a quotation instead would be strictly
+# worse than showing a person's, and measurably so: NLLB turned the sura name
+# الأنعام into گائے ("cow", which is al-Baqara) and rendered
+# إن صلاتك سكن لهم as a sentence about relationships.
+_MUSHAF_TRI = None
+
+
+def _mushaf_tri(conn):
+    global _MUSHAF_TRI
+    if _MUSHAF_TRI is None:
+        _MUSHAF_TRI = _mushaf_trigrams(conn)
+    return _MUSHAF_TRI
+
+
+def quoted_ayat(conn, text, limit=4):
+    """The ayat a passage quotes, by the fold the tafsir anchoring uses.
+
+    TWO trigrams, not one, and the ayah must be UNIQUELY identified. The fold
+    deletes all three long vowels, so it is deliberately loose -- loose enough
+    that a single 3-word run coincides across the mushaf, and loose enough
+    that فبأي آلاء ربكما تكذبان identifies nothing at all because it occurs 31
+    times. Both restrictions are the same ones that made the tafsir anchor
+    trustworthy, and they are what keep a WRONG published translation from
+    being attached to a scholar's sentence -- which would be a worse failure
+    than the machine's, because it would carry a translator's name."""
+    tri = _mushaf_tri(conn)
+    k = mushaf_key(text).split()
+    per = collections.Counter()
+    for i in range(len(k) - 2):
+        for sa in tri.get(" ".join(k[i:i + 3]), ()):
+            per[sa] += 1
+    # THREE trigrams, not two. Measured on al-Raghib's article on سكن: at a
+    # threshold of 2, one paragraph matched 8 ayat of which 6 were WRONG --
+    # 50:9, 25:48, 31:10, 43:11 all share من السماء ماء, and 16:72 and 16:81
+    # share والله جعل لكم. At 3 exactly the two quoted ayat survive, and both
+    # are confirmed by al-Raghib's own printed citations. The tafsir anchoring
+    # can afford 2 because it also demands the editor's printed ayah number;
+    # here there is usually no number, so the text alone must carry it.
+    printed = {int(n) for n in re.findall(r"/\s*(\d{1,3})\s*\]", text)}
+    hits = [sa for sa, n in per.items()
+            # ...unless the author printed the ayah number himself, which is
+            # a second and independent fact, exactly as the tafsir anchor uses
+            if n >= 3 or (n >= 2 and sa[1] in printed)]
+    # ranked by how much of the ayah was actually recognised, then in mushaf
+    # order, so a passing 3-word echo never outranks a full quotation
+    hits.sort(key=lambda sa: (-per[sa], sa))
+    return hits[:limit]
+
+
+def quoted_with_translation(conn, text):
+    """[{ref, ayah, translations}] for the ayat a passage quotes."""
+    out = []
+    for sura, aya in quoted_ayat(conn, text):
+        trs = [{"key": t["key"], "title": t["title"], "author": t["author"],
+                "text": t["text"]}
+               for t in translations_for_aya(conn, sura, aya)]
+        out.append({"ref": "%d:%d" % (sura, aya),
+                    "ayah": aya_text(conn, sura, aya),
+                    "translations": trs})
+    return out
+
+
+def quoted_by_para(conn, raw):
+    """{paragraph index: [quoted ayah, ...]} for one entry's rendered text."""
+    out = {}
+    for i, para in enumerate(render_entry(raw)):
+        got = quoted_with_translation(conn, para)
+        if got:
+            out[i] = got
+    return out
 
 
 # ==========================================================================
@@ -5949,6 +6367,179 @@ def _t(conn):
     return "pending hidden but announced; approved served; stamped"
 
 
+@test("HONESTY", "Kilani's OCR is a search key and never reaches the reader")
+def _t(conn):
+    """The one source here whose stored text is not its author's words.
+
+    The scan has no text layer; the OCR misreads Urdu (پاکیزہ -> باكيزه) and
+    corrupts Arabic (خَاوِيَةٍ -> خَاوِيَتٍ). Serving any of it as Kilani's
+    prose would be a fabricated attribution arriving by a new door. So the
+    OCR lives in text_norm -- a search key this program never displays -- and
+    text_raw is NULL, which the schema already reads as scan-only."""
+    ck(LEXICONS["mutaradifaat"]["keyed_by"] == "urdu",
+       "Kilani must not be root-keyed: he is arranged by Urdu headword")
+    ck(not root_keyed("mutaradifaat"),
+       "a book that cannot be asked about a root must get no root card")
+    marker = "OCR-TEXT-THAT-MUST-NEVER-BE-SERVED"
+    with unguarded(conn):
+        conn.execute("SAVEPOINT kil")
+        conn.execute(
+            "INSERT INTO sources (key,title,author,edition,kind,licence,"
+            "distributable,url,attribution) VALUES "
+            "('mutaradifaat','K','K','K','lexicon','in copyright',0,'','K') "
+            "ON CONFLICT(key) DO NOTHING")
+        sid = conn.execute("SELECT id FROM sources WHERE key='mutaradifaat'"
+                           ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO entries (source_id,root_ar,headword,text_raw,"
+            "text_norm,page,scan_uri,extraction,link_evidence,page_method,"
+            "verified) VALUES (?,'سكن','X',NULL,?,'383','scan p. 400',"
+            "'ocr-confirmed','20:88','header',1)", (sid, marker))
+    try:
+        blob = json.dumps(read_root(conn, "سكن"), ensure_ascii=False)
+        ck(marker not in blob,
+           "the OCR reached the reading payload -- it is not the book's text")
+        syn = read_root(conn, "سكن")["synonyms"]
+        ck(syn["entries"], "an approved Kilani entry did not reach its tab")
+        e = syn["entries"][0]
+        ck("text" not in e and "headword" not in e,
+           "the payload carries text or a headword from an OCR'd source")
+        ck(e["scan"] and e["page"],
+           "a scan-only entry must carry its page: it IS the citation")
+        ck(any(a["ref"] == "20:88" for a in e["ayat"]),
+           "the ayah evidence did not survive to the reader")
+        # and what IS shown is OUR mushaf, not the scan's rendering of it
+        ck(e["ayat"][0]["text"] == aya_text(conn, 20, 88),
+           "the ayah shown is not this program's own mushaf text")
+    finally:
+        with unguarded(conn):
+            conn.execute("ROLLBACK TO kil")
+            conn.execute("RELEASE kil")
+    return "OCR stays in text_norm; the reader gets our mushaf and a page"
+
+
+@test("HONESTY", "a Kilani root link needs two agreeing facts")
+def _t(conn):
+    """A headword alone cannot file a page under a root: the OCR corrupts
+    headwords too (دَابِر came back دَايِر). So the ayat the page quotes must
+    independently contain the root -- and where two roots both pass, nothing
+    here can choose, so it refuses."""
+    root_ayat = {"جسد": {(20, 88), (21, 8)}, "جسم": {(2, 247), (63, 4)}}
+    res = {r: root_search_re(r) for r in root_ayat}
+    ck(mutaradifaat_link("جَسَد", {(20, 88)}, root_ayat, res) == "جسد",
+       "both facts agreeing did not produce a link")
+    # fact 1 without fact 2: the headword proposes, nothing confirms
+    ck(mutaradifaat_link("جَسَد", set(), root_ayat, res) is None,
+       "a headword alone linked a root -- fact 2 is not being required")
+    ck(mutaradifaat_link("جَسَد", {(2, 255)}, root_ayat, res) is None,
+       "unrelated ayat confirmed a link")
+    # fact 2 without fact 1: the page quotes it, but no headword proposes it
+    ck(mutaradifaat_link("قِتَال", {(20, 88)}, root_ayat, res) is None,
+       "ayat alone linked a root -- fact 2 cannot GENERATE a hypothesis")
+    return "neither fact links a root alone; both must agree"
+
+
+@test("HONESTY", "a misread page header is derived, never trusted")
+def _t(conn):
+    """Worse than a header the OCR could not read is one it read WRONG: scan
+    411 came back 392 for a page printed 394, and storing that would cite a
+    real page of this book that does not contain the entry. The number is
+    trusted only where it agrees with the offset."""
+    pages = [[411, 392, ["٣- قِتَال: x"]],      # misread
+             [400, 383, ["٢- جَسَد: y"]],       # agrees
+             [395, None, ["١- رابط: z"]]]       # unread
+    got = mutaradifaat_entries(pages)
+    ck(len(got) == 3, "entry splitting broke")
+    for scan, printed, head, _lines in got:
+        derived = scan - MUTARADIFAAT_PAGE_OFFSET
+        if scan == 400:
+            ck(printed == derived, "an agreeing header should be trusted")
+        else:
+            ck(printed != derived,
+               "this fixture must disagree or it tests nothing")
+    ck(411 - MUTARADIFAAT_PAGE_OFFSET == 394,
+       "the offset no longer yields the page printed on scan 411")
+    return "the offset is the warrant where the header disagrees"
+
+
+@test("HONESTY", "machine Urdu is never a source and never says it is")
+def _t(conn):
+    """The owner of this database asked for a machine translation to read
+    beside the Arabic, knowing it is not a source. That is a legitimate
+    reading aid and a standing hazard: generated prose is least visible
+    exactly where it sits next to a scholar's words. So it is kept in its own
+    table, its own payload key, its own block outside the card, behind a
+    switch that is off, and labelled at every appearance."""
+    # it is NOT in entries, and so cannot be reviewed into a source
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(glosses)")}
+    ck({"engine", "model", "para", "lang"} <= cols,
+       "a gloss does not record which machine produced it")
+    ck("verified" not in cols,
+       "glosses have a review flag -- nobody can vouch for a machine")
+
+    h = READ_HTML
+    # the card's border means verbatim-and-cited; the gloss must be OUTSIDE
+    ck("'</div></div>'+glossBlock(e)" in h,
+       "the gloss is not appended outside the closing card div")
+    ck("if(!GLOSS) return \"\";" in h,
+       "the gloss renders without the switch being on")
+    ck('localStorage.getItem("lughat.gloss")==="1"' in h,
+       "the gloss switch does not default to off")
+    ck("MACHINE TRANSLATION" in h, "the gloss block carries no label")
+    ck("esc(g[i].text)" in h, "gloss text reaches innerHTML unescaped")
+    # the label must be inside the block, not once at the top of the page
+    blk = h[h.index("function glossBlock("):]
+    blk = blk[:blk.index("\n}")]
+    ck("MACHINE TRANSLATION" in blk,
+       "the label is not emitted with every block")
+    # the published translation is a DIFFERENT claim and must not borrow the
+    # machine's block, nor the machine the published one's attribution
+    qblk = h[h.index("function quotedBlock("):]
+    qblk = qblk[:qblk.index("\n}")]
+    ck("MACHINE" not in qblk,
+       "a named translator's Urdu is labelled as machine output")
+    ck("esc(t.author)" in qblk,
+       "a published translation is shown without its translator")
+    ck("esc(q.ayah)" in qblk,
+       "the quoted ayah is not this program's own mushaf text")
+    ck("if(!GLOSS)" in qblk, "the quoted block ignores the switch")
+
+    # and the payload keeps it in its own key, never merged into `lines`
+    marker = "MACHINE-URDU-MUST-NOT-BE-A-LINE"
+    with unguarded(conn):
+        conn.execute("SAVEPOINT gl")
+        row = conn.execute(
+            "SELECT e.id FROM entries e JOIN sources s ON s.id=e.source_id "
+            "WHERE e.verified=1 AND s.key IN ('maqayis','lisan','mufradat') "
+            "AND e.root_ar='سكن' LIMIT 1").fetchone()
+    try:
+        if row is None:
+            raise Skip("no approved entry on سكن to gloss")
+        with unguarded(conn):
+            # OR REPLACE: this database may already hold a real gloss for
+            # this paragraph, and the test must not depend on it being empty
+            conn.execute(
+                "INSERT OR REPLACE INTO glosses "
+                "(entry_id,para,lang,text,engine,model) "
+                "VALUES (?,0,'ur',?,'nllb','600M')", (row["id"], marker))
+        data = read_root(conn, "سكن")
+        for c in data["cards"]:
+            for e in c["entries"]:
+                ck(marker not in " ".join(e["lines"]),
+                   "machine Urdu was merged into the scholar's own lines")
+        found = [g for c in data["cards"] for e in c["entries"]
+                 for g in e["gloss"].values() if g["text"] == marker]
+        ck(found, "a stored gloss did not reach its own payload key")
+        ck(found[0]["engine"] == "nllb", "the engine was not carried through")
+        ck("MACHINE TRANSLATION" in data["gloss_note"],
+           "the payload does not say what a gloss is")
+    finally:
+        with unguarded(conn):
+            conn.execute("ROLLBACK TO gl")
+            conn.execute("RELEASE gl")
+    return "own table, own key, own block, off by default, labelled"
+
+
 @test("HONESTY", "an inferred root is recorded as inferred")
 def _t(conn):
     """Two spelling bridges map a heading onto a corpus root. Both are
@@ -8092,6 +8683,26 @@ h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.11em;
 .ct{display:flex;gap:.6rem;align-items:baseline;flex-wrap:wrap;
  margin-bottom:.55rem}
 .ct b{color:var(--ink);font-size:1rem}
+.refuse{border-left:3px solid var(--mad);background:var(--madbg);
+ color:var(--body);padding:.55rem .75rem;border-radius:3px;
+ margin:0 0 .6rem;font-size:.86rem;line-height:1.55}
+.refuse b{color:var(--mad)}
+.gloss{margin:-.35rem 0 1rem;padding:.55rem .75rem;border:1px dashed var(--och);
+ border-radius:4px;background:var(--ochbg)}
+.glosshead{font-size:.64rem;letter-spacing:.06em;text-transform:uppercase;
+ color:var(--och);font-weight:600;margin-bottom:.4rem}
+.gloss p.ur{font-family:"Noto Nastaliq Urdu","Jameel Noori Nastaleeq",
+ "Awami Nastaliq",serif;direction:rtl;text-align:right;line-height:2.6;
+ font-size:.95rem;color:var(--body);margin:0 0 .5rem}
+.quoted{margin:-.35rem 0 1rem;padding:.55rem .75rem;border-left:3px solid var(--verd);background:var(--verdbg);border-radius:0 4px 4px 0}
+.qhead{cursor:pointer;list-style:none;font-size:.64rem;letter-spacing:.06em;text-transform:uppercase;color:var(--verd);font-weight:600;margin-bottom:.4rem}
+.quoted summary::-webkit-details-marker{display:none}
+.quoted[open] .qhead{margin-bottom:.5rem}
+.quoted .aya{font-size:1.05rem;line-height:1.9;margin:.2rem 0 .5rem}
+.gsw{margin-left:auto;font-size:.78rem;color:var(--mut);display:flex;
+ gap:.3rem;align-items:center;white-space:nowrap;padding:.45rem .2rem;
+ cursor:pointer}
+@media (max-width:560px){.gsw{margin-left:0}}
 .ct .who{color:var(--mut);font-size:.86rem}
 .cite{margin-left:auto;font-size:.78rem;color:var(--faint);
  font-variant-numeric:tabular-nums}
@@ -8128,7 +8739,7 @@ h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.11em;
 .toclist{display:flex;flex-wrap:wrap;gap:.3rem}
 .toclist a{font-size:.95rem;text-decoration:none;color:var(--ink);background:var(--surf);border:1px solid var(--rule);border-radius:3px;padding:.15rem .45rem;direction:rtl}
 .toclist a small{color:var(--faint);font-size:.62rem;direction:ltr;margin-inline-start:.35rem}
-.tabs{display:flex;gap:.3rem;margin:0 0 1.2rem;border-bottom:1px solid var(--rule)}
+.tabs{display:flex;gap:.3rem;margin:0 0 1.2rem;flex-wrap:wrap;align-items:center;border-bottom:1px solid var(--rule)}
 .tabs button{font:inherit;font-size:.82rem;padding:.45rem .8rem;border:0;border-bottom:2px solid transparent;background:none;color:var(--mut);cursor:pointer}
 .tabs button.on{color:var(--ink);border-bottom-color:var(--verd);font-weight:600}
 .pk{max-width:940px;margin:0 auto;display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;padding:.6rem 1.1rem .2rem}
@@ -8317,11 +8928,62 @@ function att(f){
  return o;}
 
 const VIEWS=[["dict","Dictionary"],["jinni","Ishtiqāq — Ibn Jinnī"],
-              ["quran","Qur’an"]];
+              ["quran","Qur’an"],["syn","Synonyms"]];
 let VIEW=(()=>{try{return localStorage.getItem("lughat.view")||"dict";}
               catch(e){return "dict";}})();
+let GLOSS=(()=>{try{return localStorage.getItem("lughat.gloss")==="1";}
+                catch(e){return false;}})();
 const TABBAR='<nav class="tabs">'+VIEWS.map(v=>
-  '<button data-v="'+v[0]+'">'+v[1]+'</button>').join("")+'</nav>';
+  '<button data-v="'+v[0]+'">'+v[1]+'</button>').join("")+
+  '<label class="gsw" title="machine-translated Urdu beside the Arabic">'+
+  '<input type="checkbox" id="gsw"'+(GLOSS?" checked":"")+'> Urdu</label>'+
+  '</nav>';
+
+// MACHINE URDU. Rendered OUTSIDE the card, because the card's border is this
+// page's one visual promise -- verbatim, cited -- and no machine's output may
+// borrow it. Off unless switched on, and labelled every time it appears: a
+// label shown once at the top of a long page is a label the reader scrolls
+// past and then forgets while reading the thing it qualifies.
+function quotedBlock(e){
+ if(!GLOSS) return "";
+ const Q=e.quoted||{}; const ks=Object.keys(Q);
+ if(!ks.length) return "";
+ let h="";
+ for(const k of ks) for(const q of Q[k]){
+  // the ayah is OUR mushaf text and the Urdu is a NAMED translator's, so
+  // this block carries an attribution and the machine block cannot
+  // FOLDED. An ayah is long -- 2:102 alone outruns the article quoting it --
+  // and 41 of them opened at once on ع ل م buried the scholar's own words,
+  // which is the same mistake the sarf grid made before it was folded. The
+  // summary still names the ayah, so nothing is hidden, only closed.
+  h+='<details class="quoted"><summary class="qhead">Qur\u2019\u0101n '+
+   esc(q.ref)+' &mdash; quoted here'+
+   ((q.translations||[]).length?', with '+esc(q.translations[0].author):'')+
+   '</summary>'+
+   '<div class="aya ar">'+esc(q.ayah)+'</div>';
+  for(const t of (q.translations||[]))
+   h+='<div class="tr ur">'+esc(t.text)+'<span class="by">'+esc(t.title)+
+    ' &middot; '+esc(t.author)+'</span></div>';
+  h+='</details>';
+ }
+ return h;
+}
+
+function glossBlock(e){
+ if(!GLOSS) return "";
+ const g=e.gloss||{}, ks=Object.keys(g);
+ if(!ks.length) return "";
+ const eng=g[ks[0]];
+ let h='<div class="gloss"><div class="glosshead">MACHINE TRANSLATION'+
+  ' &mdash; not a source, not checked by anyone &middot; '+
+  esc(eng.engine)+' '+esc(eng.model)+'</div>';
+ // paragraph indices line up with e.lines, so the two can be read against
+ // each other; a paragraph with no gloss is left out rather than blanked
+ for(let i=0;i<e.lines.length;i++)
+  if(g[i]) h+='<p class="ur">'+esc(g[i].text)+'</p>';
+ return h+'</div>';
+}
+
 function showView(v){
  VIEW=v;
  try{localStorage.setItem("lughat.view",v);}catch(e){}
@@ -8380,7 +9042,7 @@ function draw(){
       'not read one at a time">bulk-approved</span>':'')+
     '<span class="cite">vol '+esc(e.vol)+' p. '+esc(e.page)+'</span></div>'+
     '<div class="txt ar">'+e.lines.map(l=>"<p>"+esc(l)+"</p>").join("")+'</div>'+
-    '<div class="attrib">'+esc(c.attribution)+'</div></div>';}
+    '<div class="attrib">'+esc(c.attribution)+'</div></div>'+glossBlock(e)+quotedBlock(e);}
  }
 
  h+='<h2>Synonyms and opposites</h2>';
@@ -8441,7 +9103,7 @@ function draw(){
     '<span class="who">'+esc(e.title)+'</span>'+
     '<span class="cite">vol '+esc(e.vol)+' p. '+esc(e.page)+'</span></div>'+
     '<div class="txt ar">'+e.lines.map(l=>"<p>"+esc(l)+"</p>").join("")+'</div>'+
-    '<div class="attrib">'+esc(e.attribution)+'</div></div>';
+    '<div class="attrib">'+esc(e.attribution)+'</div></div>'+glossBlock(e)+quotedBlock(e);
  }
 
  if(r.tafsir&&r.tafsir.length){
@@ -8543,12 +9205,66 @@ function draw(){
   h+='<tr><td class="ar">'+esc(l.lemma)+'</td><td>'+esc(l.pos)+'</td><td>'+
    l.n+'</td><td class="ar">'+esc(l.form)+'</td></tr>';
  h+='</tbody></table></div></section>';
+
+ // ---- Synonyms: Kilani, whose words are never shown ------------------
+ h+='<section data-view="syn">';
+ const S=r.synonyms||{};
+ h+='<h2>Synonyms &mdash; Kīlānī</h2>';
+ if(!S.present){
+  h+='<div class="msg">This source is not loaded. <code>lughat.py ingest '+
+   'mutaradifaat --from data/mutaradifaat/ocr/pages.json</code></div>';
+ }else{
+  h+='<div class="cls" style="margin:-.3rem 0 .6rem">'+esc(S.title)+
+   ' &middot; '+esc(S.author)+'</div>';
+  // Two refusals, both stated before any result -- the reader must know what
+  // this card is NOT before reading what it is.
+  h+='<div class="refuse"><b>Not his words.</b> '+esc(S.not_quoted)+'</div>';
+  h+='<div class="refuse"><b>Keyed by '+esc(S.keyed_by)+'.</b> '+
+   esc(S.no_urdu)+'</div>';
+  if(S.covers && S.covers.n){
+   h+='<div class="cls">Approved coverage: printed pp. '+S.covers.lo+'&ndash;'+
+    S.covers.hi+' ('+S.covers.n+' entries) of a 1,026-page book.</div>';
+  }
+  if(!S.entries.length){
+   h+='<div class="msg">No entry of Kīlānī is filed under <b class="ar">'+
+    esc(r.root)+'</b>. That means this root was not confirmed on any '+
+    'OCR&rsquo;d page &mdash; not that the book is silent on it: '+
+    (S.covers && S.covers.n ? 'only pp. '+S.covers.lo+'&ndash;'+S.covers.hi+
+     ' have been OCR&rsquo;d and approved.' : 'nothing has been approved yet.')+
+    (S.pending ? ' '+S.pending+' entries are waiting on review: <code>'+
+     'lughat.py review --source=mutaradifaat</code>' : '')+'</div>';
+  }
+  for(const e of S.entries){
+   h+='<div class="card"><div class="ct"><b>Entry on <span class="ar">'+
+    esc(r.root)+'</span></b><span class="cite">printed p. '+esc(e.page)+
+    ' &middot; '+esc(e.scan)+'</span></div>';
+   h+='<div class="cls" style="font-size:.72rem;margin:-.2rem 0 .5rem">'+
+    (e.page_read
+      ? 'page number read off the page&rsquo;s own header'
+      : 'page number DERIVED, not read &mdash; '+esc(e.page_method))+
+    '</div>';
+   h+='<div class="cls">Filed here because two facts agree: the entry&rsquo;s '+
+    'headword carries these radicals, and the āyāt this page quotes contain '+
+    'this root. The āyāt below are <b>this program&rsquo;s</b> muṣḥaf text, '+
+    'not the scan&rsquo;s.</div>';
+   for(const a of (e.ayat||[]))
+    h+='<div class="ayahead"><b>'+esc(a.ref)+'</b></div>'+
+     '<div class="aya ar">'+esc(a.text)+'</div>';
+   h+='</div>';
+  }
+ }
+ h+='</section>';
  m.innerHTML=TABBAR+h;
  showView(VIEW);
  const toc=document.getElementById("toc");
  if(toc) toc.addEventListener("toggle",()=>{if(toc.open)tocOpen();});
  m.querySelectorAll(".tabs button").forEach(b=>
   b.addEventListener("click",()=>showView(b.dataset.v)));
+ const gs=document.getElementById("gsw");
+ if(gs) gs.addEventListener("change",()=>{
+  GLOSS=gs.checked;
+  try{localStorage.setItem("lughat.gloss",GLOSS?"1":"0");}catch(e){}
+  draw();showView(VIEW);});
  m.querySelectorAll("input[type=checkbox]").forEach(cb=>{
   cb.addEventListener("change",()=>{
    const k=cb.dataset.k;
@@ -8568,6 +9284,35 @@ if(q0){box.value=q0;go();}
 """
 
 READ_PORT = 8766
+
+
+GLOSS_IS_A_MACHINE = (
+    "MACHINE TRANSLATION. No translator wrote this and nobody has checked "
+    "it. It was produced by a neural model run over the Arabic beside it, "
+    "offline, in the build path -- this program does not translate anything "
+    "while you read. It is a reading aid and it is NOT evidence: where it "
+    "disagrees with the Arabic, the Arabic is what the scholar wrote. These "
+    "texts are 10th-century technical prose, which is the register machine "
+    "translation is worst at, so expect it to be fluent and wrong rather "
+    "than obviously broken.")
+
+
+def entry_glosses(conn, entry_id, lang="ur"):
+    """Machine Urdu for one entry, as {paragraph index: {...}}.
+
+    Read through `q` like everything else on the query path. These rows are
+    NOT gated by verified: the gate means "a person vouched for this source",
+    and nobody vouches for a machine's output -- so instead of a review stamp
+    they carry the engine and model that produced them, and the page states
+    what they are. A row here is never rendered as, beside, or inside a
+    sourced string without that statement; see the honesty tests."""
+    out = {}
+    for g in q(conn, "SELECT para, text, engine, model FROM glosses "
+                     "WHERE entry_id=? AND lang=? ORDER BY para",
+               (entry_id, lang)):
+        out[g["para"]] = {"text": g["text"], "engine": g["engine"],
+                          "model": g["model"]}
+    return out
 
 
 def jinni_chapters(conn):
@@ -8718,7 +9463,7 @@ def read_root(conn, query):
         if not root_keyed(src["key"]):
             continue
         ents = list(q(conn,
-                      "SELECT text_raw, scan_uri, vol, page, extraction, "
+                      "SELECT id, text_raw, scan_uri, vol, page, extraction, "
                       "headword, verified_by FROM v_entries WHERE "
                       "source_id=? AND root_ar=? ORDER BY id",
                       (src["id"], root)))
@@ -8742,6 +9487,17 @@ def read_root(conn, query):
                 "lines": (render_entry(e["text_raw"])
                           if e["text_raw"] is not None
                           else ["[scan only]", e["scan_uri"] or ""]),
+                # kept in its OWN key, never merged into `lines`: a reader
+                # and a later maintainer must both be able to see at a glance
+                # which strings are the scholar's and which are a machine's.
+                "gloss": entry_glosses(conn, e["id"]),
+                # where a paragraph QUOTES the Qur'an, this program already
+                # holds the ayah and a named translator's Urdu for it. Those
+                # beat a machine's rendering of the same words outright, and
+                # they carry an attribution, so they are kept apart from the
+                # gloss as well as from the scholar's own lines.
+                "quoted": (quoted_by_para(conn, e["text_raw"])
+                           if e["text_raw"] is not None else {}),
             })
         out["cards"].append(card)
 
@@ -8753,7 +9509,9 @@ def read_root(conn, query):
             "letter": ch, "name": letter_name(ch),
             "entries": [{"lines": render_entry(e["text_raw"])[:3],
                          "vol": e["vol"], "page": e["page"],
-                         "title": e["title"], "attribution": e["attribution"]}
+                         "title": e["title"], "attribution": e["attribution"],
+                         "gloss": entry_glosses(conn, e["id"]),
+                         "quoted": quoted_by_para(conn, e["text_raw"])}
                         for e in ents]})
     out["letter_cards"] = letter_cards
 
@@ -8834,6 +9592,106 @@ def read_root(conn, query):
                         "words": list(OPPOSITION_WORDS)}
 
     out["akbar_refusal"] = REFUSAL_AKBAR_SENSE
+    out["synonyms"] = kilani_for_root(conn, root)
+    out["gloss_note"] = GLOSS_IS_A_MACHINE
+    # engines present for THIS root, so the switch is offered only where it
+    # would do something and the reader can see which machine wrote the Urdu
+    seen = {}
+    for c in out["cards"]:
+        for e in c["entries"]:
+            for g in e["gloss"].values():
+                seen[(g["engine"], g["model"])] = True
+    for c in out["letter_cards"]:
+        for e in c["entries"]:
+            for g in e["gloss"].values():
+                seen[(g["engine"], g["model"])] = True
+    out["gloss_engines"] = [{"engine": k[0], "model": k[1]} for k in seen]
+    return out
+
+
+REFUSAL_KILANI_NOT_QUOTED = (
+    "This book's own words are NOT shown, and cannot be. The scan carries no "
+    "text layer, so what exists here is OCR: mean engine confidence 0.483, "
+    "and the Urdu in particular comes back wrong (پاکیزہ read as باكيزه). "
+    "Even the Arabic is corrupted -- خَاوِيَةٍ read as خَاوِيَتٍ, and the "
+    "headword دَابِر read as دَايِر. Rendering any of it as Kilani's prose "
+    "would attribute to him words he did not write. So the OCR is kept as a "
+    "SEARCH KEY only, and what you see below is this program's own mushaf "
+    "text for the ayat the page quotes, plus the page to open in the scan.")
+
+REFUSAL_KILANI_NO_URDU = (
+    "Urdu search is NOT available for this book, and the reason is worth "
+    "stating: it is arranged BY URDU HEADWORD, and the OCR lost exactly that "
+    "key. The engine ran an ARABIC model over Nasta'liq, so only 82 of its "
+    "6,585 words came back holding an Urdu-only letter. The book can "
+    "therefore be reached only through the Arabic it quotes.")
+
+
+def kilani_pages(conn):
+    """The OCR'd range, read off the ingested rows rather than hardcoded.
+
+    Hardcoding "pp. 378-397" would go stale the day more pages are OCR'd,
+    and a stale coverage note reads as a claim about the book."""
+    row = q(conn, "SELECT MIN(CAST(page AS INTEGER)) lo, "
+                  "MAX(CAST(page AS INTEGER)) hi, COUNT(*) n FROM v_entries "
+                  "WHERE source_id=(SELECT id FROM sources WHERE key=?)",
+            ("mutaradifaat",)).fetchone()
+    return (row["lo"], row["hi"], row["n"]) if row and row["n"] else (None, None, 0)
+
+
+def _kilani_pending(conn):
+    """How many of his entries are still undecided -- a NUMBER, never text.
+
+    Self-contained for the same reason furuq_articles' count is: the one
+    unguarded read the reading surface is allowed must sit alone, so that
+    what it can reach is obvious by inspection rather than by reading on."""
+    with unguarded(conn):
+        return conn.execute(
+            "SELECT COUNT(*) FROM entries WHERE verified=0 AND rejected=0 "
+            "AND source_id=(SELECT id FROM sources WHERE key='mutaradifaat')"
+        ).fetchone()[0]
+
+
+def kilani_for_root(conn, root):
+    """Kilani on one root: a page reference and our OWN text, never his.
+
+    He is keyed by Urdu headword, so -- like al-Khasa'is, and for the same
+    reason -- he cannot be ASKED about a root and gets no root card. What is
+    reported is that a numbered entry of his sits on a page whose quoted ayat
+    contain this root, which is a fact about where to look, not about what he
+    says there."""
+    src = q(conn, "SELECT title, author, edition FROM sources WHERE key=?",
+            ("mutaradifaat",)).fetchone()
+    lo, hi, n_served = kilani_pages(conn)
+    out = {"present": src is not None,
+           "title": src["title"] if src else None,
+           "author": src["author"] if src else None,
+           "edition": src["edition"] if src else None,
+           "keyed_by": KEYED_BY_WORD["urdu"],
+           "not_quoted": REFUSAL_KILANI_NOT_QUOTED,
+           "no_urdu": REFUSAL_KILANI_NO_URDU,
+           "covers": {"lo": lo, "hi": hi, "n": n_served},
+           "entries": []}
+    if src is None:
+        return out
+    out["pending"] = _kilani_pending(conn)
+    for r in q(conn, "SELECT page, scan_uri, page_method, link_evidence "
+                     "FROM v_entries WHERE root_ar=? AND source_id="
+                     "(SELECT id FROM sources WHERE key='mutaradifaat') "
+                     "ORDER BY CAST(page AS INTEGER)", (root,)):
+        refs = (r["link_evidence"] or "").split()
+        out["entries"].append({
+            "page": r["page"],
+            "scan": r["scan_uri"],
+            # the warrant for the page number: read off the header, or
+            # derived from the offset. Not the same claim.
+            "page_read": r["page_method"] == "header",
+            "page_method": r["page_method"],
+            "ayat": [{"ref": ref,
+                      "text": aya_text(conn, int(ref.split(":")[0]),
+                                       int(ref.split(":")[1]))}
+                     for ref in refs],
+        })
     return out
 
 
@@ -9081,6 +9939,29 @@ def _main(argv):
             _w("")
             _w("Nothing above is visible to a query until it is approved:")
             _w("  python3 lughat.py review --stats")
+            return 0
+        if argv[2] == "mutaradifaat":
+            # Not parse_lexicon's shape: OCR JSON, and it stores no text of
+            # the book at all.
+            path = argv[argv.index("--from") + 1]
+            conn = connect()
+            n, linked, kept = ingest_mutaradifaat(conn, path)
+            _w("%s" % LEXICONS["mutaradifaat"]["title"])
+            _w("ingested %d entries, ALL at verified = 0 (not served)." % n)
+            _w("  %d carry a root, confirmed by TWO agreeing facts: the "
+               "headword" % linked)
+            _w("  proposes it and the ayat the page quotes contain it.")
+            _w("  %d are stored unconfirmed and are keyed to nothing." % (n - linked))
+            if kept:
+                _w("  %d entries you had already decided were left untouched."
+                   % kept)
+            _w("")
+            _w("NO TEXT OF THIS BOOK IS STORED. text_raw is NULL; the OCR is")
+            _w("a search key in text_norm and is never displayed. The page")
+            _w("image is the citation.")
+            _w("")
+            _w("Nothing above is visible to a query until it is approved:")
+            _w("  python3 lughat.py review --source=mutaradifaat")
             return 0
         key = argv[2]
         path = argv[argv.index("--from") + 1]
