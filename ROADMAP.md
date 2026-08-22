@@ -18,7 +18,7 @@ phase at all, and one was never addressed. Corrected here.
 | 2 | How the word forms from the letters | **Half.** Ṣarf mechanics done; the word-centred view and the sourced aṣl are pending |
 | 3 | Synonyms | Phase 7, with the furūq |
 | 3 | **Opposites (aḍdād)** | **Was never addressed.** Now Phase 7, and needs a source |
-| 4 | Dictionary + tafsir cards, exact text, selectable | **Done for the lexicons** — `lughat.py read` serves selectable cards, empty ones included. Tafsir is Phase 6 |
+| 4 | Dictionary + tafsir cards, exact text, selectable | **Done** — `lughat.py read` serves selectable cards, empty ones included; al-Baghawī anchored to 5,463 āyāt and shown on the root's own verses. More tafāsīr are more of the same work |
 | 5 | Same root elsewhere in the Qurʾān | **Done** |
 | 5 | Same root in ḥadīth | Phase 9 |
 

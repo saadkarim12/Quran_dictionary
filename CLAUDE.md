@@ -509,6 +509,78 @@ it cannot see.
 And when a letter has no chapter, the tool says the gap belongs to *this
 digitisation*, not to Ibn Jinnī, who treated all 29.
 
+## Tafsir: the anchor is the product, not the text
+
+A commentary is keyed by **āyah**, and no digitisation carries a
+machine-readable sura:aya index. So the anchor has to be derived — and a wrong
+anchor is the worst thing available here: it files al-Baghawī's comment on one
+verse under another verse, with his name and a page number on it, looking
+perfectly sourced.
+
+**Two independent facts must agree.** This witness opens each pericope by
+quoting the āyāt it is about, with the editor's numbers inside the quotation:
+
+    # {الر تلك آيات الكتاب الحكيم (1) } .
+
+So there is the **quoted text**, which either matches an āyah of the corpus or
+does not, and the **printed number**, which the editor supplied. An anchor is
+accepted only when a quotation matches **exactly one** āyah *and* that āyah's
+number is the number printed beside it. Where a pericope quotes several āyāt,
+every quotation that matches must land in the same sūra.
+
+Measured on al-Baghawī: **2,096 of 2,160 pericopes anchor, covering 5,463 of
+the 6,236 āyāt, and the number disagreed with the text in ZERO cases.** The 64
+that do not anchor are **not ingested** and are counted in the report — an
+unanchored comment is a comment about nothing.
+
+### The fold, and why a loose key is safe here
+
+The editor prints modern orthography; the corpus holds the Uthmani rasm. `الكتاب`
+is written with a dagger alif; `الصلاة` is written `صلوة` — a **wāw** where the
+printed edition has an alif. So `mushaf_key()` folds marks off, hamza carriers
+together, `ى`→`ي`, `ة`→`ه`, and then deletes **all three long vowels**.
+Dropping the alif alone still leaves `لصلوه` against `لصله`, and 2:110 fails to
+match itself.
+
+That is a very loose key. It is safe only because it is never used alone:
+
+1. an anchor is taken only from a key that is **unique** across the 6,236 āyāt
+   (`فبأي آلاء ربكما تكذبان` occurs 31 times and therefore anchors nothing), and
+2. the **printed āyah number must agree** with the āyah the key found.
+
+Loosening the key from the strict one moved the anchored count from 985 to
+2,096 and the disagreement count from 0 to 0. Like `norm_alif` / `norm_drop`,
+this key is a **comparison key and is never displayed**; a test asserts the
+reading surface never calls it.
+
+### Trap 18 — the digitisation's marks are inside the quotation too
+
+`كلما رزقوا منها ms0042 من ثمرة` — the milestone id sits in the middle of the
+Qurʾānic quotation, so the quotation matched nothing. That is **trap 14 in a
+new place**: clean the text with the same rules that clean the body *before*
+matching it. Leaving them in cost 293 anchors, and every one of them looked
+like the mufassir quoting something the muṣḥaf does not contain.
+
+### A pericope has a range, and a citation has a beginning
+
+A pericope covers several āyāt (`tafsir.aya`, `tafsir.aya_to`) and can run for
+six pages. The citation is where the passage **begins** — citing 2:35 to p. 86
+because the discussion ended there sends the reader to the wrong page — and
+where it ends is recorded separately in `page_to`.
+
+The sūra header is a level-1 marker and, like a `[باب ...]` title in Maqāyīs,
+it **closes what is in progress and opens nothing**. Treating it as a pericope
+reported 114 sūra preambles as 114 comments that could not be anchored — a
+refusal count that overstated the gap by more than a third.
+
+### Two queues, one gate
+
+`review --tafsir` works the tafsir queue, and `serve` has a second tab for it.
+What is being approved there is not a root but an **anchor**, so the anchor's
+evidence is printed above the text every time. A table name cannot be a bound
+parameter, so the queue interpolates one — through `REVIEWABLE`, a whitelist of
+exactly two tables, checked on every entry point including the HTTP route.
+
 ## Sourcing
 
 ### The bāb comes from the muṣḥaf, because the lexicons have no vowels
@@ -596,10 +668,13 @@ Single file, stdlib only, offline after `setup`.
     lughat.py akbar <root>          the six permutations, per Ibn Jinnī
     lughat.py letter <root>         Ibn Jinnī on the root's letters
     lughat.py mentions <root>       search the books not keyed by root
-    lughat.py ingest <lexicon> --from PATH
-                                    maqayis | mufradat | lisan | sirr | khasais
+    lughat.py tafsir <sura:aya>     approved commentary on an ayah
+    lughat.py ingest <source> --from PATH
+                                    maqayis | mufradat | lisan | sirr |
+                                    khasais | baghawi
     lughat.py serve [--port=N]      the approval gate as a local page
     lughat.py review [--stats]      the approval gate
+    lughat.py review --tafsir       the same gate, for commentary
     lughat.py read [--port=N]       the reading surface: approved sources only
 
 ## Two servers, and why they are two
@@ -632,6 +707,9 @@ attestation* and shown with the corpus's grammatical tag, per trap 4.
   <https://github.com/OpenITI>
 - Ibn Jinnī, *Sirr Ṣināʿat al-Iʿrāb* and *al-Khaṣāʾiṣ*. OpenITI,
   CC BY-NC-SA. <https://github.com/OpenITI>
+- al-Baghawī, *Maʿālim al-Tanzīl fī Tafsīr al-Qurʾān*, ed. al-Nimr,
+  Ḍamīriyya and al-Ḥarsh (Dār Ṭayba, 1417/1997), 8 vols. Digital text:
+  OpenITI, CC BY-NC-SA. <https://github.com/OpenITI>
 - Quranic Arabic Corpus, morphology v0.4 — © 2011 Kais Dukes, GNU GPL.
   <http://corpus.quran.com>
 - Tanzil Qur'an text (Uthmani) 1.0.2 — © 2008–2009 Tanzil.info,

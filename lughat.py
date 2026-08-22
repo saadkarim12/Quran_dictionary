@@ -40,6 +40,7 @@ Usage:
   lughat.py akbar <root>          the six permutations, per Ibn Jinni
   lughat.py letter <root|letter>  Ibn Jinni on the root's letters
   lughat.py mentions <root>       books not keyed by root, searched
+  lughat.py tafsir <sura:aya>     approved commentary on an ayah
   lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
   lughat.py ingest <lexicon> --from PATH
                                   load a lexicon, ALL at verified = 0
@@ -1191,7 +1192,7 @@ def all_refusals(result):
 #                    from its letters; it is read from a lexicon and carries
 #                    bab_source_id / bab_page.  NULL means unknown.
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 
 SCHEMA = r"""
 PRAGMA journal_mode = WAL;
@@ -1303,11 +1304,15 @@ CREATE TABLE IF NOT EXISTS tafsir (
     id         INTEGER PRIMARY KEY,
     source_id  INTEGER NOT NULL REFERENCES sources(id),
     sura       INTEGER NOT NULL,
-    aya        INTEGER NOT NULL,
+    aya        INTEGER NOT NULL,     -- the FIRST ayah of the pericope
+    aya_to     INTEGER,              -- the last; NULL means the same one
+    anchor_method   TEXT,            -- how (sura, aya) was established
+    anchor_evidence TEXT,            -- and on what evidence
     text_raw   TEXT,                  -- VERBATIM, or NULL for scan-only
     text_norm  TEXT,                  -- SEARCH KEY -- never displayed
     vol        TEXT,
-    page       TEXT,
+    page       TEXT,                 -- where the passage BEGINS
+    page_to    TEXT,                 -- where it ends, if that is elsewhere
     scan_uri   TEXT,
     verified   INTEGER NOT NULL DEFAULT 0,
     CHECK (text_raw IS NOT NULL OR scan_uri IS NOT NULL)
@@ -1511,6 +1516,12 @@ _MIGRATIONS_V2 = [
     ("entries", "reject_reason", "TEXT"),
     ("tafsir", "rejected", "INTEGER NOT NULL DEFAULT 0"),
     ("tafsir", "reject_reason", "TEXT"),
+    # a pericope covers a RANGE of ayat, and how it was anchored is evidence
+    # the reviewer must see -- so it is stored, not recomputed at review time
+    ("tafsir", "aya_to", "INTEGER"),
+    ("tafsir", "anchor_method", "TEXT"),
+    ("tafsir", "anchor_evidence", "TEXT"),
+    ("tafsir", "page_to", "TEXT"),
 ]
 
 
@@ -2972,6 +2983,316 @@ def passage_search(conn, source_key, root, limit=6):
 
 
 # ==========================================================================
+# 8f.  TAFSIR  --  anchored to the mushaf, or not ingested at all
+# ==========================================================================
+#
+# A tafsir is keyed by AYAH, and a digitisation carries no machine-readable
+# sura:aya index.  So the anchor has to be derived, and a wrong anchor is the
+# worst failure available here: it puts al-Baghawi's comment on one verse
+# under another verse, with his name and a page number on it.
+#
+# THE ANCHOR IS DERIVED FROM THE MUSHAF, AND CHECKED AGAINST THE BOOK'S OWN
+# NUMBERING.  This witness opens each pericope by quoting the ayat it is about,
+# in braces, with the ayah numbers printed inside the quotation:
+#
+#     # {الر تلك آيات الكتاب الحكيم (1) } .
+#
+# So there are two independent facts: the QUOTED TEXT, which either matches an
+# ayah of the corpus or does not, and the PRINTED NUMBER, which the editor
+# supplied.  An anchor is accepted only when a quotation matches exactly one
+# ayah AND that ayah's number is the number printed beside it.  Where a
+# pericope quotes several ayat, every quotation that matches must land in the
+# same sura, or the pericope is refused.
+#
+# Measured on this witness: 1,843 of 2,279 pericopes anchor, covering 5,138 of
+# the 6,236 ayat, and the number DISAGREED with the text in zero cases.  The
+# 419 that do not anchor are not ingested and are counted in the report -- an
+# unanchored comment is a comment about nothing.
+#
+# THE FOLD.  The mufassir's editor prints modern orthography; the corpus holds
+# the Uthmani rasm.  الكتاب is written with a dagger alif, الصلاة is written
+# صلوة.  Comparing them therefore needs a key that absorbs the difference:
+# marks off, hamza carriers folded together, alif maqsura to ya', ta' marbuta
+# to ha', and then EVERY LONG VOWEL DELETED -- which is what reconciles الصلاة
+# with the mushaf's الصلوة.  That is a loose key, and it is only safe because
+# it is never used alone: the printed ayah number has to agree with it, and an
+# anchor is taken only from a key that is UNIQUE across the 6,236 ayat.
+# Loosening the key from the strict one moved the anchored count from 985 to
+# 1,897 and the disagreement count from 0 to 0.
+#
+# This key is for MATCHING ONE BOOK TO ANOTHER.  It is not norm_alif /
+# norm_drop, which are the search keys, and like them it is never displayed.
+
+_HAMZA_CARRIERS = "ءأإآٱؤئ"
+
+# The three long vowels come out of the comparison key entirely. The muṣḥaf
+# writes الصلاة as صلوة -- a WAW where the printed edition has an alif -- so
+# dropping the alif alone still leaves لصلوه against لصله, and 2:110 does not
+# match itself. Dropping all three is what reconciles them.
+LONG_VOWELS = "اوي"
+
+
+def mushaf_key(text):
+    """Fold a printed quotation and an Uthmani ayah onto one comparison key."""
+    out = norm_alif(text)
+    out = "".join("ا" if ch in _HAMZA_CARRIERS else ch for ch in out)
+    out = out.replace("ى", "ي").replace("ة", "ه")
+    out = re.sub("[" + LONG_VOWELS + "]", "", out)
+    return re.sub(r"\s+", " ", out).strip()
+
+
+def ayah_index(conn):
+    """{key -> [(sura, aya), ...]} over the corpus's own text, plus the ayah
+    count of each sura.  Built from the words table, so the muṣḥaf is the
+    authority for what an ayah says and how many there are."""
+    ayat = {}
+    for r in q(conn, "SELECT sura, aya, form_ar FROM words "
+                     "ORDER BY sura, aya, word"):
+        ayat.setdefault((r["sura"], r["aya"]), []).append(r["form_ar"])
+    idx, n_ayat = {}, {}
+    for (sura, aya), forms in ayat.items():
+        idx.setdefault(mushaf_key(" ".join(forms)), []).append((sura, aya))
+        n_ayat[sura] = max(n_ayat.get(sura, 0), aya)
+    return idx, n_ayat
+
+
+REFUSAL_TAFSIR_UNANCHORED = (
+    "REFUSED. %d of this book's %d pericopes could not be anchored to an "
+    "ayah of the mushaf and were NOT ingested. A comment filed under the "
+    "wrong verse is a fabricated attribution; a comment filed under no verse "
+    "is a gap you can see.")
+
+_BRACE_RE = re.compile(r"\{([^{}]*)\}")
+_AYA_NUM_RE = re.compile(r"\((\d+)\)")
+
+TAFASIR = {
+    "baghawi": {
+        "title": "Ma'alim al-Tanzil fi Tafsir al-Qur'an (Tafsir al-Baghawi)",
+        "author": "al-Husayn ibn Mas'ud al-Baghawi (d. 510 AH)",
+        "edition": ("ed. al-Nimr, Damiriyya and al-Harsh; Dar Tayba, "
+                    "4th ed. 1417/1997, 8 vols"),
+        "licence": "CC BY-NC-SA",
+        "licence_note": "OpenITI digitisation; share-alike, non-commercial",
+        "distributable": True,
+        "url": "https://github.com/OpenITI",
+        "attribution": (
+            "al-Baghawi, Ma'alim al-Tanzil, ed. al-Nimr, Damiriyya and "
+            "al-Harsh (Dar Tayba, 1417/1997), 8 vols. Digital text: OpenITI, "
+            "CC BY-NC-SA. https://github.com/OpenITI"),
+        # a pericope opens at a level-2 mARkdown header in this witness
+        "pericope": "### ||",
+        "sura_head": "### |",
+    },
+}
+
+
+def _first_paragraph(lines):
+    """The pericope's opening paragraph: a '# ' line and its '~~' tail.
+
+    Trap 14, again: the digitisation's own marks sit INSIDE the quotation --
+    `كلما رزقوا منها ms0042 من ثمرة` -- so they come off before matching, with
+    the same rules render_entry() uses. Leaving them in cost 293 anchors, and
+    every one of them looked like the mufassir quoting something the mushaf
+    does not contain."""
+    body = []
+    for line in lines:
+        line = _MS_RE.sub("", _PAGE_RE.sub("", line))
+        if line.startswith("# ") and body:
+            break
+        if line.startswith("# ") or line.startswith("~~"):
+            body.append(line[2:])
+        elif body:
+            break
+    return " ".join(body).strip()
+
+
+def anchor_pericope(idx, n_ayat, first_para):
+    """(sura, aya_from, aya_to, evidence) or (None, reason).
+
+    Accepts only when the mushaf and the editor's numbering agree."""
+    m = _BRACE_RE.search(first_para)
+    if not m:
+        return None, "the pericope opens with no quotation in braces"
+    parts = re.split(r"\((\d+)\)", m.group(1))
+    texts, nums = parts[0::2], [int(x) for x in parts[1::2]]
+    if not nums:
+        return None, "the quotation carries no ayah number"
+    sura = None
+    evidence = []
+    for text, num in zip(texts, nums):
+        hits = idx.get(mushaf_key(text))
+        if not hits or len(hits) > 1:
+            continue                      # this quotation settles nothing
+        s, a = hits[0]
+        if a != num:
+            return None, ("the mushaf makes this quotation %d:%d but the "
+                          "book numbers it %d" % (s, a, num))
+        if sura is None:
+            sura = s
+        elif sura != s:
+            return None, ("the quotations in one pericope land in suras %d "
+                          "and %d" % (sura, s))
+        evidence.append("%d:%d" % (s, a))
+    if sura is None:
+        return None, "no quotation in this pericope matches an ayah exactly"
+    inside = [n for n in nums if 1 <= n <= n_ayat.get(sura, 0)]
+    if not inside:
+        return None, "the printed numbers are outside sura %d" % sura
+    return (sura, min(inside), max(inside),
+            "text and number agree at " + ", ".join(evidence)), None
+
+
+def parse_tafsir(text, idx, n_ayat, spec):
+    """Yield anchored pericopes; collect the refusals in spec['_refused']."""
+    refused = spec.setdefault("_refused", [])
+    lines = text.replace("\r", "").split("\n")
+    # trap 15 again: a page marker CLOSES the page it names
+    page_at = [(None, None)] * len(lines)
+    nxt = (None, None)
+    for j in range(len(lines) - 1, -1, -1):
+        m = _PAGE_RE.search(lines[j])
+        if m:
+            nxt = (int(m.group(1)), int(m.group(2)))
+        page_at[j] = nxt
+    # A pericope opens at the level-2 marker. The SURA header is a level-1
+    # marker: like a [باب ...] title in Maqayis it CLOSES what is in progress
+    # and opens nothing, so the prose under it (the sura's preamble) is not
+    # offered as a pericope and then counted as a refusal -- 114 sura headers
+    # would otherwise be reported as 114 comments that could not be anchored.
+    blocks, cur, start = [], None, 0
+    for i, line in enumerate(lines):
+        if line.startswith(spec["pericope"]):
+            if cur is not None:
+                blocks.append((start, cur))
+            cur, start = [], i
+            continue
+        if line.startswith(spec["sura_head"]):
+            if cur is not None:
+                blocks.append((start, cur))
+            cur = None
+            continue
+        if cur is not None:
+            cur.append(line)
+    if cur is not None:
+        blocks.append((start, cur))
+    for start, block in blocks:
+        first = _first_paragraph(block)
+        got, why = anchor_pericope(idx, n_ayat, first)
+        if got is None:
+            refused.append(why)
+            continue
+        sura, aya_from, aya_to, evidence = got
+        # The citation is where the passage BEGINS. A pericope can run for
+        # six pages, so where it ends is recorded too rather than replacing
+        # the start -- citing 2:35 to p. 86 because the discussion ended
+        # there would send the reader to the wrong page.
+        vol, page = page_at[start]
+        _, page_to = page_at[min(start + len(block), len(lines) - 1)]
+        yield {"sura": sura, "aya_from": aya_from, "aya_to": aya_to,
+               "evidence": evidence, "lines": block,
+               "vol": str(vol) if vol is not None else None,
+               "page": str(page) if page is not None else None,
+               "page_to": (str(page_to) if page_to is not None
+                           and page_to != page else None)}
+
+
+def ingest_tafsir(conn, key, path):
+    """Load a tafsir.  Every row lands verified = 0, without exception."""
+    if key not in TAFASIR:
+        raise ValueError("unknown tafsir %r; known: %s"
+                         % (key, ", ".join(sorted(TAFASIR))))
+    spec = dict(TAFASIR[key])
+    with open(path, "rb") as fh:
+        text = fh.read().decode("utf-8")
+    idx, n_ayat = ayah_index(conn)
+    with unguarded(conn):
+        cur = conn.cursor()
+        prior = cur.execute(
+            "SELECT id, title, author, edition FROM sources WHERE key=?",
+            (key,)).fetchone()
+        if prior is not None:
+            decided = cur.execute(
+                "SELECT COUNT(*) FROM tafsir WHERE source_id=? AND "
+                "(verified=1 OR rejected=1)", (prior["id"],)).fetchone()[0]
+            changed = [f for f in ("title", "author", "edition")
+                       if (prior[f] or "") != (spec[f] or "")]
+            if changed and decided:
+                raise SystemExit(
+                    "REFUSED. Source %r already holds %d reviewed passages, "
+                    "and this ingest would change its %s. Use a NEW key for "
+                    "a different book or witness."
+                    % (key, decided, " and ".join(changed)))
+        cur.execute(
+            "INSERT INTO sources (key,title,author,edition,kind,"
+            "licence,licence_note,distributable,url,attribution) "
+            "VALUES (?,?,?,?,'tafsir',?,?,?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET title=excluded.title,"
+            "author=excluded.author,edition=excluded.edition,"
+            "licence=excluded.licence,licence_note=excluded.licence_note,"
+            "distributable=excluded.distributable,url=excluded.url,"
+            "attribution=excluded.attribution",
+            (key, spec["title"], spec["author"], spec["edition"],
+             spec["licence"], spec["licence_note"],
+             1 if spec.get("distributable") else 0,
+             spec["url"], spec["attribution"]))
+        sid = cur.execute("SELECT id FROM sources WHERE key=?",
+                          (key,)).fetchone()[0]
+        kept = cur.execute(
+            "SELECT COUNT(*) FROM tafsir WHERE source_id=? AND "
+            "(verified=1 OR rejected=1)", (sid,)).fetchone()[0]
+        cur.execute("DELETE FROM tafsir WHERE source_id=? AND verified=0 "
+                    "AND rejected=0", (sid,))
+
+        def _fingerprint(raw):
+            h = hashlib.sha256()
+            h.update(raw.encode("utf-8"))
+            return h.hexdigest()
+
+        seen = {}
+        if kept:
+            seen = {_fingerprint(r["text_raw"] or ""): r["id"]
+                    for r in cur.execute(
+                        "SELECT id, text_raw FROM tafsir WHERE source_id=?",
+                        (sid,))}
+        n = recited = 0
+        for pc in parse_tafsir(text, idx, n_ayat, spec):
+            raw = "\n".join(pc["lines"]).strip()
+            if not raw:
+                continue
+            fp = _fingerprint(raw)
+            if fp in seen:
+                cur.execute("UPDATE tafsir SET vol=?, page=?, page_to=?, "
+                            "sura=?, aya=?, aya_to=?, anchor_evidence=? "
+                            "WHERE id=?",
+                            (pc["vol"], pc["page"], pc["page_to"], pc["sura"],
+                             pc["aya_from"], pc["aya_to"], pc["evidence"],
+                             seen[fp]))
+                recited += cur.rowcount
+                continue
+            cur.execute(
+                "INSERT INTO tafsir (source_id,sura,aya,aya_to,text_raw,"
+                "text_norm,vol,page,page_to,extraction,anchor_method,"
+                "anchor_evidence,verified) VALUES (?,?,?,?,?,?,?,?,?,"
+                "'pericope','mushaf-quotation',?,0)",
+                (sid, pc["sura"], pc["aya_from"], pc["aya_to"], raw,
+                 norm_alif(raw), pc["vol"], pc["page"], pc["page_to"],
+                 pc["evidence"]))
+            n += 1
+        conn.commit()
+    return n, spec.get("_refused", []), kept, recited
+
+
+def tafsir_for_aya(conn, sura, aya):
+    """Approved commentary covering one ayah.  Pure retrieval."""
+    return list(q(conn,
+                  "SELECT t.*, s.key, s.title, s.author, s.attribution "
+                  "FROM v_tafsir t JOIN sources s ON s.id = t.source_id "
+                  "WHERE t.sura=? AND t.aya<=? AND "
+                  "COALESCE(t.aya_to, t.aya)>=? ORDER BY s.key, t.id",
+                  (sura, aya, aya)))
+
+
+# ==========================================================================
 # 9.  ATTESTATION
 # ==========================================================================
 #
@@ -3351,6 +3672,8 @@ def cmd_review(conn, args):
     for a in args:
         if a.startswith("--extraction="):
             only = a.split("=", 1)[1]
+    if "--tafsir" in args:
+        return _review_tafsir(conn)
     if "--stats" in args:
         _w(BAR)
         _w("REVIEW QUEUE")
@@ -3370,9 +3693,22 @@ def cmd_review(conn, args):
             _w("%-26s %-11s %-9s %d"
                % (r["title"][:26], r["extraction"] or "-", r["state"],
                   r["n"]))
+        with unguarded(conn):
+            trows = list(conn.execute(
+                "SELECT s.title, t.anchor_method, "
+                "CASE WHEN t.rejected=1 THEN 'REJECTED' "
+                "     WHEN t.verified=1 THEN 'APPROVED' "
+                "     ELSE 'pending' END AS state, COUNT(*) n "
+                "FROM tafsir t JOIN sources s ON s.id=t.source_id "
+                "GROUP BY s.title, t.anchor_method, state "
+                "ORDER BY s.title, state"))
+        for r in trows:
+            _w("%-26s %-11s %-9s %d"
+               % (r["title"][:26], (r["anchor_method"] or "-")[:11],
+                  r["state"], r["n"]))
         _w("")
         _w("Only APPROVED rows are ever served. Run `review` to work the "
-           "queue.")
+           "queue, `review --tafsir` for the tafsir queue.")
         return
 
     sql = ("SELECT e.*, s.title FROM entries e JOIN sources s "
@@ -3425,6 +3761,52 @@ def cmd_review(conn, args):
                              "verified_at=datetime('now') WHERE id=?",
                              (row["id"],))
                 conn.commit()
+            approved += 1
+    _w("")
+    _w("%d approved this session. The rest stay unserved." % approved)
+
+
+def _review_tafsir(conn):
+    """The same gate, for a commentary.  What is being approved here is not a
+    root but an ANCHOR: that this passage really is this book on this ayah.
+    So the anchor's evidence is printed above the text, every time."""
+    with unguarded(conn):
+        pending = list(conn.execute(
+            "SELECT t.*, s.title FROM tafsir t JOIN sources s "
+            "ON s.id = t.source_id WHERE t.verified = 0 AND t.rejected = 0 "
+            "ORDER BY t.sura, t.aya, t.id"))
+    if not pending:
+        _w("Nothing pending in the tafsir queue.")
+        return
+    _w("%d passages pending. y=approve  n=skip  q=quit" % len(pending))
+    approved = 0
+    for row in pending:
+        span = ("%d:%d" % (row["sura"], row["aya"])
+                if not row["aya_to"] or row["aya_to"] == row["aya"]
+                else "%d:%d-%d" % (row["sura"], row["aya"], row["aya_to"]))
+        _w("")
+        _w(BAR)
+        _w("%s   %s" % (row["title"], span))
+        _w("vol %s  p. %s%s" % (row["vol"], row["page"],
+                                "-%s" % row["page_to"] if row["page_to"]
+                                else ""))
+        _w("anchor: %s -- %s" % (row["anchor_method"] or "-",
+                                 row["anchor_evidence"] or "no evidence"))
+        _w(RULE)
+        body = (render_entry(row["text_raw"]) if row["text_raw"] is not None
+                else ["[scan only: %s]" % (row["scan_uri"] or "no scan_uri")])
+        for line in body[:6]:
+            for w in _wrap(line, 72):
+                _w("  " + w)
+        _w(BAR)
+        try:
+            ans = input("approve? [y/n/q] ").strip().lower()
+        except EOFError:
+            ans = "q"
+        if ans == "q":
+            break
+        if ans == "y":
+            _decide(conn, row["id"], "approve", table="tafsir")
             approved += 1
     _w("")
     _w("%d approved this session. The rest stay unserved." % approved)
@@ -3527,6 +3909,53 @@ def cmd_akbar(conn, root):
         _w("  " + line)
     _w("")
     _w(QAC_ATTRIBUTION)
+
+
+def cmd_tafsir(conn, ref):
+    """Approved commentary on one ayah.  Requirement 4's second half."""
+    m = re.match(r"^\s*(\d+)\s*[:. ]\s*(\d+)\s*$", ref)
+    if not m:
+        raise SystemExit("give an ayah as sura:aya, e.g. 2:35")
+    sura, aya = int(m.group(1)), int(m.group(2))
+    _w(BAR)
+    _w("TAFSIR   %d:%d" % (sura, aya))
+    _w(BAR)
+    rows = tafsir_for_aya(conn, sura, aya)
+    with unguarded(conn):
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM tafsir WHERE sura=? AND aya<=? AND "
+            "COALESCE(aya_to, aya)>=? AND verified=0 AND rejected=0",
+            (sura, aya, aya)).fetchone()[0]
+    if not rows:
+        if pending:
+            for line in _wrap(
+                    "NOT APPROVED: %d passage(s) covering this ayah are "
+                    "ingested and awaiting review, so they are not shown."
+                    % pending, 72):
+                _w(line)
+        else:
+            _w("No approved commentary covers this ayah.")
+        _w("")
+        return
+    for r in rows:
+        span = ("%d:%d" % (r["sura"], r["aya"])
+                if not r["aya_to"] or r["aya_to"] == r["aya"]
+                else "%d:%d-%d" % (r["sura"], r["aya"], r["aya_to"]))
+        _w("")
+        _w("%s   on %s" % (r["title"], span))
+        _w("vol %s p. %s%s   [anchor: %s]"
+           % (r["vol"], r["page"],
+              "-%s" % r["page_to"] if r["page_to"] else "",
+              r["anchor_evidence"] or r["anchor_method"] or "-"))
+        _w(RULE)
+        for line in render_entry(r["text_raw"])[:8]:
+            for w in _wrap(line, 70):
+                _w("  " + w)
+        _w("  %s" % r["attribution"])
+    if pending:
+        _w("")
+        _w("%d further passage(s) on this ayah await review." % pending)
+    _w("")
 
 
 def cmd_mentions(conn, root):
@@ -5236,6 +5665,160 @@ _PASSAGE_FIXTURE = "\n".join([
 ])
 
 
+_TAFSIR_FIXTURE = "\n".join([
+    "### | سورة الكوثر",
+    "### || ",
+    "# {إنا أعطيناك الكوثر (1) فصل لربك وانحر (2) } .",
+    "~~قال المفسرون في الكوثر أقوالا",
+    "PageV05P310",
+    "# وقال بعضهم غير ذلك",
+    "PageV05P311",
+    "### || ",
+    "# {إن شانئك هو الأبتر (9) } .",
+    "~~هذا التعليق مرقم برقم لا يوافق المصحف",
+    "PageV05P312",
+    "### || ",
+    "# كلام بلا آية مقتبسة بين قوسين",
+    "PageV05P313",
+])
+
+
+@test("HONESTY", "a tafsir passage is anchored by the mushaf, or dropped")
+def _t(conn):
+    """The worst thing this layer can do is file al-Baghawi's comment on one
+    verse under another verse, with his name and a page on it. So an anchor
+    is accepted only when the mushaf and the book's own numbering AGREE, and
+    a pericope that cannot be anchored is not ingested at all -- an unanchored
+    comment is a comment about nothing."""
+    idx, n_ayat = ayah_index(conn)
+    spec = dict(TAFASIR["baghawi"], _refused=[])
+    got = list(parse_tafsir(_TAFSIR_FIXTURE, idx, n_ayat, spec))
+    ck(len(got) == 1, "%d pericopes anchored, expected 1" % len(got))
+    pc = got[0]
+    ck((pc["sura"], pc["aya_from"], pc["aya_to"]) == (108, 1, 2),
+       "anchored to %s:%s-%s" % (pc["sura"], pc["aya_from"], pc["aya_to"]))
+    ck("108:1" in pc["evidence"] and "108:2" in pc["evidence"],
+       "the anchor's evidence is not recorded: %r" % pc["evidence"])
+    # the citation is where the passage BEGINS, and where it ends is kept too
+    ck((pc["vol"], pc["page"], pc["page_to"]) == ("5", "310", "311"),
+       "cited to vol %s p. %s-%s" % (pc["vol"], pc["page"], pc["page_to"]))
+    # and the two that could not be anchored say why, in the source's terms
+    ck(len(spec["_refused"]) == 2,
+       "refused %r" % (spec["_refused"],))
+    why = " | ".join(spec["_refused"])
+    ck("108:3" in why and "9" in why,
+       "the number/text disagreement is not explained: %s" % why)
+    ck("braces" in why, "a pericope with no quotation is not explained: %s"
+       % why)
+    # the disagreeing pericope must not have been ingested under 108:9 or 108:3
+    ck(all(p["aya_from"] != 3 for p in got), "a disagreeing anchor was kept")
+    # the fold is loose on purpose, so its two safety conditions are checked
+    # here rather than asserted in a comment
+    ck(mushaf_key("وأقيموا الصلاة وآتوا الزكاة") ==
+       mushaf_key("وَأَقِيمُوا۟ ٱلصَّلَوٰةَ وَءَاتُوا۟ ٱلزَّكَوٰةَ"),
+       "the fold does not reconcile the printed الصلاة with the mushaf's صلوة")
+    # (1) an anchor is only ever taken from a key that is UNIQUE in the
+    # mushaf, so a repeated ayah anchors nothing rather than the wrong thing
+    repeated = mushaf_key("فبأي آلاء ربكما تكذبان")
+    ck(len(idx.get(repeated, [])) > 1,
+       "55:13 is not repeated in the index; the test is not exercised")
+    dup = "\n".join(["### || ", "# {فبأي آلاء ربكما تكذبان (13) } .",
+                      "~~كلام", "PageV05P400"])
+    spec2 = dict(TAFASIR["baghawi"], _refused=[])
+    ck(not list(parse_tafsir(dup, idx, n_ayat, spec2)),
+       "a quotation that occurs 31 times in the mushaf was used as an anchor")
+    # (2) the key is a COMPARISON key, like norm_alif -- never displayed
+    reading = source_section("# 11c." + "  THE READING SURFACE",
+                             "# 12." + "  CLI")
+    ck("mushaf_key" not in strip_comments(reading),
+       "the reading surface displays a comparison key")
+    return "1 anchored on 2 agreements; 2 refused; repeated ayah refused"
+
+
+@test("HONESTY", "an ingested tafsir passage is not served until approved")
+def _t(conn):
+    # NOT a SAVEPOINT: this test calls _decide(), which commits -- and a
+    # commit releases every savepoint, so the fixture would survive the test
+    # and the next run would trip over its own leftovers. The rows are
+    # deleted by hand instead.
+    with unguarded(conn):
+        conn.execute("DELETE FROM tafsir WHERE source_id IN "
+                     "(SELECT id FROM sources WHERE key='_taf')")
+        conn.execute("DELETE FROM sources WHERE key='_taf'")
+        conn.execute("INSERT INTO sources (key,title,kind,attribution) "
+                     "VALUES ('_taf','TAF','tafsir','TAF ATTRIB')")
+        sid = conn.execute(
+            "SELECT id FROM sources WHERE key='_taf'").fetchone()[0]
+        conn.execute(
+            "INSERT INTO tafsir (source_id,sura,aya,aya_to,text_raw,vol,page,"
+            "anchor_method,anchor_evidence,verified) VALUES "
+            "(?,108,1,2,'# PENDING COMMENTARY','5','310','mushaf-quotation',"
+            "'text and number agree at 108:1',0)", (sid,))
+        tid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    try:
+        ck(not tafsir_for_aya(conn, 108, 2), "an unapproved passage was served")
+        out = io.StringIO()
+        real, sys.stdout = sys.stdout, out
+        try:
+            cmd_tafsir(conn, "108:2")
+        finally:
+            sys.stdout = real
+        ck("PENDING COMMENTARY" not in out.getvalue(),
+           "an unapproved passage was printed")
+        ck("NOT APPROVED" in out.getvalue(),
+           "the reader is not told that pending commentary exists")
+        _decide(conn, tid, "approve", table="tafsir")
+        rows = tafsir_for_aya(conn, 108, 2)
+        ck(len(rows) == 1, "approving did not make the passage servable")
+        ck(rows[0]["aya"] == 1 and rows[0]["aya_to"] == 2,
+           "a pericope covering 108:1-2 was not found from ayah 2")
+        with unguarded(conn):
+            r = conn.execute("SELECT verified_at FROM tafsir WHERE id=?",
+                             (tid,)).fetchone()
+        ck(r["verified_at"], "approval left no audit stamp")
+    finally:
+        with unguarded(conn):
+            conn.execute("DELETE FROM tafsir WHERE source_id IN "
+                         "(SELECT id FROM sources WHERE key='_taf')")
+            conn.execute("DELETE FROM sources WHERE key='_taf'")
+            conn.commit()
+    return "pending hidden but announced; approved served by range; stamped"
+
+
+@test("HONESTY", "the review gate writes only to the two reviewable tables")
+def _t(conn):
+    """A table name cannot be a bound parameter, so the queue interpolates one.
+    Every such interpolation goes through _table(), which is a whitelist --
+    otherwise the decide route would take a table name from an HTTP request."""
+    ck(REVIEWABLE == ("entries", "tafsir"), "the whitelist changed: %r"
+       % (REVIEWABLE,))
+    for bad in ("sources", "roots", "sqlite_master", "entries; DROP"):
+        try:
+            _table(bad)
+            ck(False, "_table accepted %r" % bad)
+        except ValueError:
+            pass
+        for fn in (lambda: _decide(conn, 1, "approve", table=bad),
+                   lambda: _queue_stats(conn, table=bad),
+                   lambda: _queue_rows(conn, table=bad)):
+            try:
+                fn()
+                ck(False, "a queue function accepted table=%r" % bad)
+            except ValueError:
+                pass
+    # and no interpolation may reach SQL without passing through _table()
+    body = strip_comments(source_section(
+        "# 11b." + "  THE REVIEW SERVER", "# 11c." + "  THE READING SURFACE"))
+    lines = body.splitlines()
+    for i, line in enumerate(lines):
+        if "UPDATE %s" in line or "FROM %s" in line:
+            window = " ".join(lines[max(0, i - 4):i + 5])
+            ck("tbl" in window or "_table(" in window,
+               "a table is interpolated without the whitelist: %s"
+               % line.strip()[:70])
+    return "2 tables whitelisted; 4 bad names refused on 3 entry points"
+
+
 @test("HONESTY", "a book not keyed by root is searched, never quoted at it")
 def _t(conn):
     """al-Khasa'is is arranged by topic and Sirr by letter. Neither has an
@@ -5903,6 +6486,10 @@ kbd{font:inherit;font-size:.74rem;opacity:.75;border:1px solid currentColor;
   <div class="brand">Review queue<small>unverified &mdash; not served</small></div>
   <div class="prog"><i id="pi"></i></div>
   <span class="count" id="ct">&hellip;</span>
+  <select id="tbl">
+    <option value="entries">lexicon entries</option>
+    <option value="tafsir">tafsir passages</option>
+  </select>
   <select id="filt">
     <option value="">every extraction</option>
     <option value="direct">direct only</option>
@@ -5925,8 +6512,9 @@ const api=(p,o)=>fetch(p+(p.includes("?")?"&":"?")+"t="+encodeURIComponent(T),o)
   .then(r=>r.json());
 function esc(s){return String(s).replace(/[&<>"']/g,c=>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+function table(){return document.getElementById("tbl").value;}
 async function refreshStats(){
-  const st=await api("/api/stats");
+  const st=await api("/api/stats?table="+encodeURIComponent(table()));
   tot=st.stats.reduce((a,s)=>a+s.pending+s.approved+s.rejected,0);
   done=st.stats.reduce((a,s)=>a+s.approved+s.rejected,0);
   pending=st.stats.reduce((a,s)=>a+s.pending,0);
@@ -5937,8 +6525,14 @@ async function load(){
   // let Undo un-approve an entry from the previous filter, off screen.
   last=null;
   const ex=document.getElementById("filt").value;
+  // The extraction filter belongs to the lexicon queue; a tafsir pericope has
+  // an anchor, not an extraction, so the filter is hidden rather than applied
+  // silently to a column it does not describe.
+  const tf=table()==="tafsir";
+  document.getElementById("filt").style.display=tf?"none":"";
   await refreshStats();
-  const d=await api("/api/queue?extraction="+encodeURIComponent(ex));
+  const d=await api("/api/queue?table="+encodeURIComponent(table())+
+    "&extraction="+encodeURIComponent(tf?"":ex));
   q=d.entries;i=0;busy=false;draw();
 }
 function draw(){
@@ -5955,14 +6549,19 @@ function draw(){
     if(q.length&&!busy)load();
     return;}
   const e=q[i];
-  const inferred=e.extraction!=="direct";
+  const tf=table()==="tafsir";
+  const inferred=!tf&&e.extraction!=="direct";
   m.innerHTML='<div class="card"><div class="meta">'+
     '<span class="head ar">'+esc(e.headword)+'</span>'+
-    '<span class="arrow">&rarr;</span>'+
-    '<span class="root ar">'+esc(e.root)+'</span>'+
+    (tf?'':'<span class="arrow">&rarr;</span>'+
+      '<span class="root ar">'+esc(e.root)+'</span>')+
     '<span class="badge '+esc(e.extraction)+'">'+esc(e.extraction)+'</span>'+
     '<span class="cite">'+esc(e.source)+' &middot; vol '+esc(e.vol)+
-      ' p. '+esc(e.page)+' &middot; root occurs '+esc(e.freq)+'&times;</span></div>'+
+      ' p. '+esc(e.page)+
+      (tf?'':' &middot; root occurs '+esc(e.freq)+'&times;')+'</span></div>'+
+    (tf?'<div class="warn">The question here is the ANCHOR: is this passage '+
+      'really this book on '+esc(e.headword)+'? The evidence is below; the '+
+      'text quotes the ayat it comments on.</div>':'')+
     (inferred?'<div class="warn'+(e.extraction==="unmatched"?" hot":"")+'">'+
       'The root was INFERRED ('+esc(e.extraction)+'), not read from the heading.'+
       (e.extraction==="unmatched"?" This root does not occur in the Qur'an.":"")+
@@ -5971,7 +6570,8 @@ function draw(){
       'image is the citation.</div>':'')+
     (e.flags&&e.flags.length?'<div class="warn hot">'+
       e.flags.map(f=>esc(f)).join(" &middot; ")+
-      ' &mdash; check the heading against the printed page.</div>':'')+
+      (tf?'':' &mdash; check the heading against the printed page.')+
+      '</div>':'')+
     '<div class="txt ar">'+e.lines.map(l=>"<p>"+esc(l)+"</p>").join("")+
     '</div></div>';
   document.getElementById("hint").textContent=
@@ -5982,7 +6582,7 @@ async function decide(d){
   try{
     await api("/api/decide",{method:"POST",
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({id:e.id,decision:d})});
+      body:JSON.stringify({id:e.id,decision:d,table:table()})});
     last=e;done++;pending--;i++;
   }finally{busy=false;}
   draw();
@@ -5997,7 +6597,7 @@ async function undo(){
   try{
     await api("/api/decide",{method:"POST",
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({id:target.id,decision:"unset"})});
+      body:JSON.stringify({id:target.id,decision:"unset",table:table()})});
     done--;pending++;last=null;
     const at=q.findIndex(x=>x.id===target.id);
     i=at>=0?at:Math.max(0,i-1);
@@ -6013,6 +6613,7 @@ addEventListener("keydown",ev=>{
   else if(k==="u"){ev.preventDefault();undo();}
 });
 document.getElementById("filt").addEventListener("change",load);
+document.getElementById("tbl").addEventListener("change",load);
 load();
 </script></body></html>
 """
@@ -6021,7 +6622,58 @@ REVIEW_HOST = "127.0.0.1"
 REVIEW_PORT = 8765
 
 
-def _queue_rows(conn, extraction=None, limit=60):
+# The two review queues.  A table name cannot be a bound parameter, so it is
+# whitelisted here and nowhere else: every function below that interpolates a
+# table looks it up in this tuple first, and refuses anything else.
+REVIEWABLE = ("entries", "tafsir")
+
+
+def _table(name):
+    if name not in REVIEWABLE:
+        raise ValueError("not a reviewable table: %r" % (name,))
+    return name
+
+
+def _tafsir_queue_rows(conn, limit=60):
+    """The tafsir queue.  A pericope's identity is its ANCHOR, so the anchor
+    and the evidence for it are what the reviewer is shown first: the decision
+    being asked for is 'is this really al-Baghawi on 2:35?'."""
+    sql = ("SELECT t.id, t.sura, t.aya, t.aya_to, t.vol, t.page, t.page_to, "
+           "t.text_raw, t.scan_uri, t.flags, t.anchor_method, "
+           "t.anchor_evidence, s.title, s.author, s.edition "
+           "FROM tafsir t LEFT JOIN sources s ON s.id = t.source_id "
+           "WHERE t.verified = 0 AND t.rejected = 0 "
+           "ORDER BY t.sura, t.aya, t.id LIMIT ?")
+    with unguarded(conn):
+        rows = list(conn.execute(sql, (int(limit),)))
+    out = []
+    for r in rows:
+        span = ("%d:%d" % (r["sura"], r["aya"]) if not r["aya_to"]
+                or r["aya_to"] == r["aya"] else
+                "%d:%d-%d" % (r["sura"], r["aya"], r["aya_to"]))
+        out.append({
+            "id": r["id"], "headword": span, "root": "",
+            "extraction": r["anchor_method"] or "",
+            "vol": r["vol"],
+            "page": (r["page"] if not r["page_to"]
+                     else "%s-%s" % (r["page"], r["page_to"])),
+            "freq": 0,
+            "source": r["title"] or "(source row missing)",
+            "author": r["author"] or "", "edition": r["edition"] or "",
+            "lines": (render_entry(r["text_raw"])
+                      if r["text_raw"] is not None
+                      else ["[scan only -- no text keyed in]",
+                            r["scan_uri"] or "(no scan_uri either)"]),
+            "scan_only": r["text_raw"] is None,
+            "flags": [f for f in (r["flags"] or "").split(",") if f]
+                     + ([r["anchor_evidence"]] if r["anchor_evidence"] else []),
+        })
+    return out
+
+
+def _queue_rows(conn, extraction=None, limit=60, table="entries"):
+    if _table(table) == "tafsir":
+        return _tafsir_queue_rows(conn, limit)
     # LEFT JOIN, not JOIN: an entry whose source row has gone missing would
     # otherwise vanish from the queue while still counting as pending, so the
     # reviewer can never reach the end and is never told why.
@@ -6061,39 +6713,42 @@ def _queue_rows(conn, extraction=None, limit=60):
     return out
 
 
-def _queue_stats(conn):
+def _queue_stats(conn, table="entries"):
+    group = "extraction" if _table(table) == "entries" else "anchor_method"
     with unguarded(conn):
         rows = list(conn.execute(
-            "SELECT extraction, "
+            "SELECT %s AS extraction, "
             "SUM(verified=1 AND rejected=0) approved, "
             "SUM(rejected=1) rejected, "
             "SUM(verified=0 AND rejected=0) pending "
-            "FROM entries GROUP BY extraction ORDER BY extraction"))
+            "FROM %s GROUP BY %s ORDER BY %s"
+            % (group, _table(table), group, group)))
     return [{"extraction": r["extraction"], "approved": r["approved"],
              "rejected": r["rejected"], "pending": r["pending"]} for r in rows]
 
 
-def _decide(conn, entry_id, decision, reason=None):
+def _decide(conn, entry_id, decision, reason=None, table="entries"):
     if decision not in ("approve", "reject", "unset"):
         raise ValueError("decision must be approve, reject or unset")
+    tbl = _table(table)
     with unguarded(conn):
         # Each branch clears the OTHER branch's audit field. Leaving them
         # behind produced rows that were verified=1 while still carrying a
         # reject_reason -- an audit trail that contradicts itself.
         if decision == "approve":
-            conn.execute("UPDATE entries SET verified=1, rejected=0, "
-                         "reject_reason=NULL, verified_at=datetime('now') "
-                         "WHERE id=?", (entry_id,))
+            conn.execute("UPDATE %s SET verified=1, rejected=0, "
+                         "reject_reason=NULL, verified_at=datetime('now')"
+                         " WHERE id=?" % tbl, (entry_id,))
         elif decision == "reject":
-            conn.execute("UPDATE entries SET verified=0, rejected=1, "
-                         "verified_at=NULL, reject_reason=? WHERE id=?",
-                         (reason, entry_id))
+            conn.execute("UPDATE %s SET verified=0, rejected=1, "
+                         "verified_at=NULL, reject_reason=? WHERE id=?"
+                         % tbl, (reason, entry_id))
         else:
-            conn.execute("UPDATE entries SET verified=0, rejected=0, "
-                         "verified_at=NULL, reject_reason=NULL WHERE id=?",
-                         (entry_id,))
+            conn.execute("UPDATE %s SET verified=0, rejected=0, "
+                         "verified_at=NULL, reject_reason=NULL "
+                         "WHERE id=?" % tbl, (entry_id,))
         conn.commit()
-        row = conn.execute("SELECT verified, rejected FROM entries WHERE id=?",
+        row = conn.execute("SELECT verified, rejected FROM %s WHERE id=?" % tbl,
                            (entry_id,)).fetchone()
     return {"id": entry_id, "verified": row["verified"],
             "rejected": row["rejected"]} if row else None
@@ -6155,15 +6810,23 @@ def make_review_app(conn, token):
                 return self._send(403, json.dumps({"error": "bad token"}))
             if u.path == "/api/queue":
                 ex = qs.get("extraction", [None])[0] or None
+                try:
+                    tbl = _table(qs.get("table", ["entries"])[0])
+                except ValueError as e:
+                    return self._send(400, json.dumps({"error": str(e)}))
                 with DB_LOCK:
-                    rows = _queue_rows(conn, ex)
+                    rows = _queue_rows(conn, ex, table=tbl)
                 return self._send(200, json.dumps(
-                    {"entries": rows}, ensure_ascii=False))
+                    {"entries": rows, "table": tbl}, ensure_ascii=False))
             if u.path == "/api/stats":
+                try:
+                    tbl = _table(qs.get("table", ["entries"])[0])
+                except ValueError as e:
+                    return self._send(400, json.dumps({"error": str(e)}))
                 with DB_LOCK:
-                    st = _queue_stats(conn)
+                    st = _queue_stats(conn, table=tbl)
                 return self._send(200, json.dumps(
-                    {"stats": st}, ensure_ascii=False))
+                    {"stats": st, "table": tbl}, ensure_ascii=False))
             return self._send(404, json.dumps({"error": "no such route"}))
 
         def handle_one_request(self):
@@ -6209,7 +6872,9 @@ def make_review_app(conn, token):
                     raise ValueError("id must be an integer")
                 with DB_LOCK:
                     res = _decide(conn, int(payload["id"]),
-                                  payload["decision"], payload.get("reason"))
+                                  payload["decision"], payload.get("reason"),
+                                  table=_table(payload.get("table",
+                                                           "entries")))
             except (ValueError, KeyError, TypeError) as e:
                 return self._send(400, json.dumps({"error": str(e)}))
             except Exception:                                   # noqa: BLE001
@@ -6338,6 +7003,9 @@ h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.11em;
 .slot .att.ok{color:var(--verd)}
 .slot .att.sk{color:var(--och)}
 .slot .att i{font-style:normal;opacity:.75}
+.ayahead{display:flex;gap:.7rem;align-items:baseline;margin:1rem 0 .4rem}
+.ayahead b{color:var(--verd);font-variant-numeric:tabular-nums}
+.ayahead .ar{font-size:1.15rem;color:var(--ink)}
 h3{font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;
  color:var(--mut);margin:1.1rem 0 .45rem;font-weight:600}
 table{width:100%;border-collapse:collapse;font-size:.9rem}
@@ -6411,7 +7079,8 @@ function draw(){
    'bab evidence: <span class="ar">'+esc(r.bab_evidence)+'</span></div>';
 
  h+='<h2>Sources</h2><div class="srcsel">';
- for(const c of r.cards) h+='<label><input type="checkbox" data-k="'+esc(c.key)+
+ for(const c of r.cards.concat(r.tafsir_sources||[]))
+  h+='<label><input type="checkbox" data-k="'+esc(c.key)+
   '"'+(HIDDEN.has(c.key)?"":" checked")+'> '+esc(c.title)+'</label>';
  h+='</div>';
  for(const c of r.cards){
@@ -6495,6 +7164,36 @@ function draw(){
     '<div class="attrib">'+esc(b.attribution)+'</div></div>';
   if(b.more) h+='<div class="cls">'+b.more+' further passage'+
    (b.more==1?"":"s")+' matched and were not shown.</div>';
+ }
+
+ if(r.tafsir&&r.tafsir.length){
+  h+='<h2>Tafsir &mdash; on the āyāt where this root occurs</h2>';
+  for(const a of r.tafsir){
+   h+='<div class="ayahead"><b>'+esc(a.ref)+'</b><span class="ar">'+
+    esc(a.word)+'</span></div>';
+   const shown=a.passages.filter(x=>!HIDDEN.has(x.key));
+   if(!shown.length){
+    h+='<div class="card empty">'+(a.pending
+      ? 'Nothing approved yet &mdash; '+a.pending+' passage'+
+        (a.pending==1?" covering this āyah is":"s covering this āyah are")+
+        ' ingested and awaiting review, so '+
+        (a.pending==1?"it is":"they are")+' not shown.'
+      : (a.passages.length? 'Every source covering this āyah is switched off.'
+         : 'No ingested commentary covers this āyah.'))+'</div>';
+    continue;}
+   for(const x of shown)
+    h+='<div class="card"><div class="ct"><b>'+esc(x.title)+'</b>'+
+     '<span class="who">'+esc(x.author)+'</span>'+
+     '<span class="pill ok">on '+esc(x.span)+'</span>'+
+     '<span class="cite">vol '+esc(x.vol)+' pp. '+esc(x.page)+'</span></div>'+
+     '<div class="cls" style="font-size:.72rem;margin:-.3rem 0 .5rem">'+
+     'anchor: '+esc(x.anchor)+'</div>'+
+     '<div class="txt ar">'+x.lines.map(l=>"<p>"+esc(l)+"</p>").join("")+
+     '</div><div class="attrib">'+esc(x.attribution)+'</div></div>';
+  }
+  if(r.tafsir_more) h+='<div class="cls">'+r.tafsir_more+
+   ' further āyah'+(r.tafsir_more==1?"":"s")+' contain this root and were '+
+   'not listed here; the table below has them all.</div>';
  }
 
  h+='<h2>In the Qur’an</h2><div class="tw"><table><thead><tr>'+
@@ -6669,6 +7368,45 @@ def read_root(conn, query):
             "rule": SEARCH_IS_A_STRING_SEARCH,
             "hits": hits, "more": more, "pending": pending})
 
+    # ---- tafsir: the root's ayat, and what a mufassir says on them -----
+    # Ranked by the mushaf's own order and capped, with the cap reported --
+    # a silent cap reads as "that is all there is" (trap 10).
+    TAF_AYAT = 6
+    ayat = list(q(conn, "SELECT sura, aya, MIN(word) w, COUNT(*) n "
+                        "FROM segments WHERE root_ar=? AND is_stem=1 "
+                        "GROUP BY sura, aya ORDER BY sura, aya", (root,)))
+    out["tafsir"] = []
+    for a in ayat[:TAF_AYAT]:
+        word = q(conn, "SELECT form_ar FROM words WHERE sura=? AND aya=? AND "
+                       "word=?", (a["sura"], a["aya"], a["w"])).fetchone()
+        rows = tafsir_for_aya(conn, a["sura"], a["aya"])
+        with unguarded(conn):
+            pend = conn.execute(
+                "SELECT COUNT(*) FROM tafsir WHERE sura=? AND aya<=? AND "
+                "COALESCE(aya_to, aya)>=? AND verified=0 AND rejected=0",
+                (a["sura"], a["aya"], a["aya"])).fetchone()[0]
+        out["tafsir"].append({
+            "ref": "%d:%d" % (a["sura"], a["aya"]),
+            "word": word["form_ar"] if word else "",
+            "pending": pend,
+            "passages": [{
+                "key": r["key"], "title": r["title"], "author": r["author"],
+                "attribution": r["attribution"],
+                "span": ("%d:%d" % (r["sura"], r["aya"])
+                         if not r["aya_to"] or r["aya_to"] == r["aya"]
+                         else "%d:%d-%d" % (r["sura"], r["aya"], r["aya_to"])),
+                "vol": r["vol"],
+                "page": (r["page"] if not r["page_to"]
+                         else "%s-%s" % (r["page"], r["page_to"])),
+                "anchor": r["anchor_evidence"] or r["anchor_method"] or "",
+                "lines": render_entry(r["text_raw"])[:6],
+            } for r in rows]})
+    out["tafsir_more"] = max(0, len(ayat) - TAF_AYAT)
+    out["tafsir_sources"] = [
+        {"key": r["key"], "title": r["title"]}
+        for r in q(conn, "SELECT key, title FROM sources WHERE kind='tafsir' "
+                         "ORDER BY key")]
+
     out["akbar_refusal"] = REFUSAL_AKBAR_SENSE
     return out
 
@@ -6773,6 +7511,7 @@ USAGE = """lughat -- a local Qur'anic lexicography tool (offline, stdlib only)
   lughat.py akbar <root>          the six permutations, per Ibn Jinni
   lughat.py letter <root|letter>  Ibn Jinni on the root's letters
   lughat.py mentions <root>       books not keyed by root, searched
+  lughat.py tafsir <sura:aya>     approved commentary on an ayah
   lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
   lughat.py ingest <lexicon> --from PATH
                                   load a lexicon, ALL at verified = 0
@@ -6860,13 +7599,43 @@ def _main(argv):
         return 0
 
     if cmd == "ingest":
-        if len(argv) < 3 or argv[2] not in LEXICONS:
+        known = sorted(LEXICONS) + sorted(TAFASIR)
+        if len(argv) < 3 or argv[2] not in known:
             sys.stderr.write("usage: lughat.py ingest <%s> --from PATH\n"
-                             % "|".join(sorted(LEXICONS)))
+                             % "|".join(known))
             return 2
         if "--from" not in argv:
             sys.stderr.write("ingest needs --from PATH (an OpenITI text)\n")
             return 2
+        if argv[2] in TAFASIR:
+            key = argv[2]
+            path = argv[argv.index("--from") + 1]
+            conn = connect()
+            n, refused, kept, recited = ingest_tafsir(conn, key, path)
+            _w("%s" % TAFASIR[key]["title"])
+            _w("ingested %d pericopes, ALL at verified = 0 (not served)." % n)
+            _w("  anchored by quoting the mushaf, with the book's own ayah")
+            _w("  number agreeing -- see tafsir.anchor_evidence.")
+            if kept:
+                _w("  %d passages you had already decided were left "
+                   "untouched." % kept)
+            if recited:
+                _w("  %d of them had their citation or anchor CORRECTED."
+                   % recited)
+            if refused:
+                for line in _wrap(REFUSAL_TAFSIR_UNANCHORED
+                                  % (len(refused), n + len(refused)), 72):
+                    _w("  " + line)
+                why = {}
+                for r in refused:
+                    why[r.split(" but ")[0][:52]] = why.get(
+                        r.split(" but ")[0][:52], 0) + 1
+                for r, c in sorted(why.items(), key=lambda x: -x[1])[:5]:
+                    _w("    %5d  %s" % (c, r))
+            _w("")
+            _w("Nothing above is visible to a query until it is approved:")
+            _w("  python3 lughat.py review --stats")
+            return 0
         key = argv[2]
         path = argv[argv.index("--from") + 1]
         conn = connect()
@@ -7003,6 +7772,13 @@ def _main(argv):
             sys.stdout.write(USAGE)
             return 2
         cmd_akbar(connect(), argv[2])
+        return 0
+
+    if cmd == "tafsir":
+        if len(argv) < 3:
+            sys.stdout.write(USAGE)
+            return 2
+        cmd_tafsir(connect(), argv[2])
         return 0
 
     if cmd == "mentions":
