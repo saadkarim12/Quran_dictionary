@@ -4120,6 +4120,8 @@ def cmd_review(conn, args):
             root = "".join(canonical_root(a.split("=", 1)[1]))
     if "--tafsir" in args:
         return _review_tafsir(conn)
+    if "--approve-all" in args and "--everything" in args:
+        return _approve_everything(conn)
     if "--approve-all" in args:
         where, params, bits = [], [], []
         if source:
@@ -4143,7 +4145,8 @@ def cmd_review(conn, args):
             # the gate deleting itself. A class has to be named.
             raise SystemExit(
                 "REFUSED. --approve-all needs a class to approve: at least "
-                "one of --source=, --extraction=, --root=, --contains=.\n"
+                "one of --source=, --extraction=, --root=, --contains=, or "
+                "--everything for all of it at once.\n"
                 "Approving every pending row at once would make the gate "
                 "decorative.")
         _bulk_approve(conn, " AND ".join(where), params, ", ".join(bits))
@@ -4351,6 +4354,110 @@ def _bulk_approve(conn, sql_where, params, label, sample=12):
         conn.commit()
     _w("%d approved, stamped `bulk`." % len(rows))
     return len(rows)
+
+
+def _bulk_approve_tafsir(conn, sample=6):
+    """The same, for the commentary queue.  What is accepted here is a class
+    of ANCHORS, so the sample shows the evidence for each one."""
+    with unguarded(conn):
+        rows = list(conn.execute(
+            "SELECT t.id, t.sura, t.aya, t.aya_to, t.vol, t.page, "
+            "t.anchor_evidence, t.text_raw, s.title FROM tafsir t "
+            "JOIN sources s ON s.id = t.source_id "
+            "WHERE t.verified=0 AND t.rejected=0 ORDER BY t.sura, t.aya"))
+    if not rows:
+        return 0
+    step = max(1, len(rows) // sample)
+    _w("")
+    _w("A sample of the %d tafsir passages, spread across the mushaf:"
+       % len(rows))
+    for r in rows[::step][:sample]:
+        _w("")
+        _w("  %s  on %d:%d%s  vol %s p. %s"
+           % (r["title"][:22], r["sura"], r["aya"],
+              "-%d" % r["aya_to"] if r["aya_to"] and r["aya_to"] != r["aya"]
+              else "", r["vol"], r["page"]))
+        _w("     anchor: %s" % (r["anchor_evidence"] or "-"))
+        body = render_entry(r["text_raw"] or "")
+        for line in _wrap(body[0] if body else "(no text)", 68)[:1]:
+            _w("     " + line)
+    return rows
+
+
+def _approve_everything(conn):
+    """One command, and the gate keeps its meaning because every row it
+    touches is stamped.
+
+    Refusing this while offering the same thing one class at a time would be
+    theatre: five commands reach the same place. What must not happen is the
+    distinction disappearing -- so `bulk` is recorded on every row, the
+    reading page badges it, and `review --root=` still lets any of them be
+    looked at again."""
+    with unguarded(conn):
+        ent = list(conn.execute(
+            "SELECT e.id, e.headword, e.root_ar, e.extraction, e.vol, e.page, "
+            "e.text_raw, s.title FROM entries e JOIN sources s "
+            "ON s.id = e.source_id WHERE e.verified=0 AND e.rejected=0 "
+            "AND e.extraction IS NOT 'unmatched'"))
+        unm = conn.execute(
+            "SELECT COUNT(*) FROM entries WHERE verified=0 AND rejected=0 "
+            "AND extraction='unmatched'").fetchone()[0]
+    _w(BAR)
+    _w("APPROVE EVERYTHING REACHABLE")
+    _w(BAR)
+    for line in (BULK_WARNING % len(ent)).split("\n"):
+        for w in (_wrap(line, 72) if line else [""]):
+            _w(w)
+    if unm:
+        _w("")
+        for line in _wrap(
+                "%d unmatched entries are NOT included: their headings map to "
+                "no root the Qur'an has, so approving them would change "
+                "nothing you can reach. Use --extraction=unmatched if you "
+                "want them anyway." % unm, 72):
+            _w(line)
+    step = max(1, len(ent) // 12)
+    _w("")
+    _w("A sample of %d, spread across the %d dictionary entries:"
+       % (min(12, len(ent)), len(ent)))
+    for r in ent[::step][:12]:
+        _w("")
+        _w("  %s  %s -> %s  [%s]  vol %s p. %s"
+           % (r["title"][:22], r["headword"], r["root_ar"] or "-",
+              r["extraction"], r["vol"], r["page"]))
+        body = render_entry(r["text_raw"] or "")
+        for line in _wrap(body[0] if body else "(no text)", 68)[:2]:
+            _w("     " + line)
+    tafrows = _bulk_approve_tafsir(conn)
+    n_taf = len(tafrows) if tafrows else 0
+    _w("")
+    _w(RULE)
+    try:
+        ans = input("approve %d entries and %d tafsir passages? "
+                    "type yes to confirm: " % (len(ent), n_taf)).strip()
+    except EOFError:
+        ans = ""
+    if ans.lower() != "yes":
+        _w("nothing approved.")
+        return 0
+    with unguarded(conn):
+        conn.executemany(
+            "UPDATE entries SET verified=1, rejected=0, reject_reason=NULL, "
+            "verified_at=datetime('now'), verified_by='bulk' WHERE id=?",
+            [(r["id"],) for r in ent])
+        if tafrows:
+            conn.executemany(
+                "UPDATE tafsir SET verified=1, rejected=0, "
+                "reject_reason=NULL, verified_at=datetime('now'), "
+                "verified_by='bulk' WHERE id=?",
+                [(r["id"],) for r in tafrows])
+        conn.commit()
+    _w("%d entries and %d tafsir passages approved, every one stamped `bulk`."
+       % (len(ent), n_taf))
+    _w("")
+    _w("The reading page badges them. To look at any of them again:")
+    _w("  python3 lughat.py review --root=<root>")
+    return len(ent) + n_taf
 
 
 def _review_tafsir(conn):
@@ -5766,8 +5873,8 @@ def _t(conn):
     to" are different claims about the same text."""
     src = strip_comments(own_source())
     # the bulk path must stamp, and must be the only thing that stamps 'bulk'
-    stamps = re.findall(r"verified_by *= *'([a-z]+)'", src)
-    ck(stamps == ["bulk"], "verified_by is written as %s" % stamps)
+    stamps = set(re.findall(r"verified_by *= *'([a-z]+)'", src))
+    ck(stamps == {"bulk"}, "verified_by is written as %s" % sorted(stamps))
     ck("--approve-all" in src, "the bulk path has gone")
     # it must refuse to approve everything at once -- called, not grepped
     out = io.StringIO()

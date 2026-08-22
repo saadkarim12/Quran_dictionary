@@ -660,6 +660,11 @@ hidden shortcut:
   the class this belongs to* are different claims about the same text, and
   the reader is told which one they are looking at.
 
+`--approve-all --everything` does the whole of it — both queues, in one
+command. Refusing that while offering the same thing one class at a time
+would have been theatre: five commands reach the same place. What must not
+happen is the DISTINCTION disappearing, and it does not.
+
 The stamp is what makes the shortcut honest rather than a quiet weakening.
 A test asserts the stamp is written, that the badge reaches the page, and —
 by calling it, not by grepping for the word — that a class must be named.
@@ -783,6 +788,7 @@ Single file, stdlib only, offline after `setup`.
     lughat.py review --root=<root>  approve one root's entries now
     lughat.py review --approve-all --source=K   approve a class,
                                     after a sample; stamped `bulk`
+    lughat.py review --approve-all --everything  both queues at once
     lughat.py review --tafsir       the same gate, for commentary
     lughat.py read [--port=N]       the reading surface: approved sources only
 
