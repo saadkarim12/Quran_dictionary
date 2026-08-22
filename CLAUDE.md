@@ -562,8 +562,28 @@ Single file, stdlib only, offline after `setup`.
     lughat.py letter <root>         Ibn Jinnī on the root's letters
     lughat.py ingest <lexicon> --from PATH
                                     maqayis | mufradat | lisan | sirr | khasais
-    lughat.py serve                 the approval gate as a local page
+    lughat.py serve [--port=N]      the approval gate as a local page
     lughat.py review [--stats]      the approval gate
+    lughat.py read [--port=N]       the reading surface: approved sources only
+
+## Two servers, and why they are two
+
+`serve` is the **build path**: it shows `verified = 0` text, because showing
+it is the whole point of a review gate. `read` is the **query path**: a
+separate process, a separate port, a **guarded** connection, no `do_POST`,
+and no INSERT/UPDATE/DELETE anywhere in its section. One process serving both
+would put a single `unguarded(conn)` call between the reader and a
+fabrication. Its one unguarded query is a `COUNT(*)` of pending rows — a
+number, never text — so an empty card can say *why* it is empty.
+
+Both bind `127.0.0.1`. There is no link to give anyone: the tool is offline by
+architecture, and a "share" would mean serving unreviewed lexicon text.
+
+The page shows, for one root: every source as a card (**including the empty
+ones** — hiding a silent source would imply an agreement that never happened),
+the ṣarf table in full with its refusals, and for every generated string the
+corpus's own verdict — EXACT hits as attestation, SKELETON hits labelled *NOT
+attestation* and shown with the corpus's grammatical tag, per trap 4.
 
 ## Attribution (required by the licences)
 

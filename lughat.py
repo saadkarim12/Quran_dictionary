@@ -45,9 +45,11 @@ Usage:
                                   lexicons: maqayis, mufradat, lisan
   lughat.py review [--stats]      the approval gate, in the terminal
   lughat.py serve [--port=N]      the same gate as a local page (127.0.0.1)
+  lughat.py read [--port=N]       the READING surface: approved sources only
 """
 
 import contextlib
+import inspect
 import hashlib
 import io
 import json
@@ -4503,7 +4505,8 @@ def _t(conn):
     ck(REVIEW_HOST == "127.0.0.1", "the review server binds beyond localhost")
     # Sliced by section banner via source_section(), which handles the
     # self-reference trap described there.
-    body = source_section("# 11b." + "  THE REVIEW SERVER", "# 12." + "  CLI")
+    body = source_section("# 11b." + "  THE REVIEW SERVER",
+                          "# 11c." + "  THE READING SURFACE")
     ck(len(body) > 2000, "the review section slice is empty (%d)" % len(body))
     ck("0.0.0.0" not in body, "the handler can bind to a public interface")
     # the routes it exposes are the queue, the stats and the decision. No
@@ -5330,6 +5333,125 @@ def _t(conn):
         ILAL_NOT_VALIDATED["mithal"])
 
 
+@test("HONESTY", "the reading surface can only read, and only what is approved")
+def _t(conn):
+    """A separate server on a separate port with a GUARDED connection. The
+    review gate exists to show unverified text; this exists to show only what
+    a person has approved. One process serving both would put a single
+    `unguarded` call between the reader and a fabrication."""
+    body = source_section("# 11c." + "  THE READING SURFACE", "# 12." + "  CLI")
+    ck(len(body) > 2000, "the reading section slice is empty (%d)" % len(body))
+    code = strip_comments(body)
+    routes = set(re.findall(r'u\.path [!=]= "([^"]+)"', code))
+    ck(routes == {"/", "/api/read"},
+       "the reading surface exposes %s" % sorted(routes))
+    ck("do_POST" not in code, "the reading surface accepts POST")
+    for w in ("INSERT", "UPDATE", "DELETE", "_decide", "DROP"):
+        ck(w not in code, "the reading surface can write: found %r" % w)
+    ck("0.0.0.0" not in code, "the reading surface can bind publicly")
+    # the ONE unguarded use must be a scalar count of PENDING rows, never text
+    for stmt in re.findall(r"with unguarded\(conn\):(.{0,320})", code,
+                           re.S):
+        ck("text_raw" not in stmt and "scan_uri" not in stmt,
+           "the reading surface reads entry TEXT through unguarded(): %s"
+           % " ".join(stmt.split())[:120])
+    return "2 routes, no writes, 127.0.0.1, unverified text unreachable"
+
+
+@test("HONESTY", "an empty source shows an empty card, never a hidden one")
+def _t(conn):
+    """Hiding a source with nothing to say would imply agreement among sources
+    that never spoke -- the governing rule applied to layout rather than to
+    text."""
+    data = read_root(conn, "سكن")
+    ck(data.get("cards"), "no cards at all")
+    keys = {c["key"] for c in data["cards"]}
+    with unguarded(conn):
+        want = {r[0] for r in conn.execute(
+            "SELECT key FROM sources WHERE kind IN ('lexicon','tafsir')")}
+    ck(keys == want, "cards %s but sources %s" % (sorted(keys), sorted(want)))
+    empty = [c for c in data["cards"] if not c["entries"]]
+    ck(empty, "every source happens to have an entry; test is not exercised")
+    for c in empty:
+        ck("pending" in c, "an empty card does not say whether text is waiting")
+    # and nothing unapproved may appear in the payload
+    blob = json.dumps(data, ensure_ascii=False)
+    with unguarded(conn):
+        rows = conn.execute(
+            "SELECT text_raw FROM entries WHERE root_ar='سكن' AND verified=0 "
+            "AND text_raw IS NOT NULL LIMIT 5").fetchall()
+    for (raw,) in rows:
+        snippet = "".join(render_entry(raw)[:1])[:40]
+        if snippet:
+            ck(snippet not in blob,
+               "unapproved text reached the reading payload")
+    return "%d cards, %d of them explicitly empty" % (
+        len(data["cards"]), len(empty))
+
+
+@test("HONESTY", "the page keeps skeleton hits out of the attested column")
+def _t(conn):
+    """Trap 4 on the reading surface. A skeleton hit is a DIFFERENT WORD; the
+    page may show it, but never in the same breath as evidence, and never
+    without the corpus's own grammatical tag."""
+    data = read_root(conn, "سكن")
+    forms = [f for sec in data["sarf"] for f in sec["forms"]
+             if not f.get("refused")]
+    ck(forms, "no generated forms in the payload")
+    exact = {x["form"] for f in forms for x in f["exact"]}
+    skel = {x["form"] for f in forms for x in f["skeleton"]}
+    ck(exact and skel, "the test is not exercised: %d exact, %d skeleton"
+       % (len(exact), len(skel)))
+    for f in forms:
+        for x in f["exact"]:
+            ck(stem_core(x["form"]) == stem_core(f["text"]),
+               "%s listed as attesting %s" % (x["form"], f["text"]))
+        for x in f["skeleton"]:
+            ck(stem_core(x["form"]) != stem_core(f["text"]),
+               "%s filed as a skeleton hit for its own word" % x["form"])
+        for x in f["exact"] + f["skeleton"]:
+            ck(x["tag"], "a corpus hit is shown without its tag")
+    # and the page must say what a skeleton hit is NOT
+    js = READ_HTML[READ_HTML.index("function att("):]
+    js = js[:js.index("function draw(")]
+    ck("NOT " + "attestation" in js and "skeleton" in js,
+       "the page does not mark skeleton hits as non-evidence")
+    return "%d forms; %d exact and %d skeleton hits, kept apart" % (
+        len(forms), len(exact), len(skel))
+
+
+@test("HONESTY", "the page reads the payload the builder actually writes")
+def _t(conn):
+    """The letter cards were once assigned to out["letters"], overwriting the
+    list of radicals that the heading joins -- so the root printed as three
+    `[object Object]`s.  Neither side was wrong on its own; they disagreed.
+    That is trap 8 (the loader and the query path must canonicalise
+    identically) wearing a different hat, so it gets the same kind of guard:
+    every key the page touches must exist, and no key may be written twice."""
+    src = inspect.getsource(read_root)
+    written = re.findall(r'out\[("[a-z_]+")\] *=[^=]', src)
+    dupes = sorted({k for k in written if written.count(k) > 1})
+    ck(not dupes, "read_root writes %s more than once" % ", ".join(dupes))
+    data = read_root(conn, "سكن")
+    ck(not data.get("absent"), "no payload to check")
+    # a key may come from a full payload, from the absent one, or from the
+    # handler's own error object -- read all three off the code, not memory
+    have = set(data) | set(read_root(conn, "ققق"))
+    have |= set(re.findall(r'json\.dumps\(\{"(\w+)"', source_section(
+        "# 11c." + "  THE READING SURFACE", "# 12." + "  CLI")))
+    read = set(re.findall(r"\br\.([A-Za-z_]+)", READ_HTML))
+    missing = sorted(k for k in read if k not in have)
+    ck(not missing, "the page reads %s, which no payload has"
+       % ", ".join(missing))
+    # the heading joins letters; they must be letters, not objects
+    ck(data["letters"] == list("سكن"),
+       "the heading would print %r" % (data["letters"],))
+    for c in data["letter_cards"]:
+        ck(isinstance(c, dict) and "letter" in c, "letter card is %r" % (c,))
+    return ("%d payload keys read by the page, all present; "
+            "no key written twice" % len(read))
+
+
 @test("HONESTY", "refusals are refusals, not empty strings")
 def _t(conn):
     res = generate("سكن")
@@ -5827,6 +5949,465 @@ def cmd_serve(conn, args):
 
 
 # ==========================================================================
+# 11c.  THE READING SURFACE  --  query path, and nothing else
+# ==========================================================================
+#
+# Requirement 4: a word opens a stack of CARDS, one per source, each showing
+# that source's exact text with its citation, and a control to choose which
+# sources appear.
+#
+# It is a SEPARATE server from the review gate, on a separate port, with a
+# GUARDED connection. The review gate exists to show unverified text; this
+# exists to show only what a person has approved. Running them in one process
+# would put one `unguarded` call between the reader and a fabrication.
+#
+# A source with nothing on this root gets an EXPLICIT EMPTY CARD. Hiding it
+# would imply agreement among sources that never spoke -- the governing rule
+# applied to layout rather than to text.
+
+READ_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lughat</title>
+<style>
+:root{--bg:#EFF1EF;--surf:#F8F9F7;--ink:#14181A;--body:#2C3436;--mut:#5B6663;
+ --faint:#7F8A86;--rule:#D6DBD7;--soft:#E3E7E3;--mad:#9C3B2E;--madbg:#F0E2DE;
+ --verd:#3D6A57;--verdbg:#DEEAE3;--och:#8E6A1F;--ochbg:#F0E7D3;}
+@media (prefers-color-scheme:dark){:root{--bg:#101413;--surf:#171C1A;
+ --ink:#E9ECE7;--body:#C7CEC9;--mut:#94A09B;--faint:#78837E;--rule:#2A322F;
+ --soft:#222A27;--mad:#D8796A;--madbg:#33211E;--verd:#7CBBA0;--verdbg:#1A2A24;
+ --och:#CFA75B;--ochbg:#2A2418;}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--body);
+ font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
+.ar{font-family:"SBL BibLit","Traditional Arabic","Amiri","Geeza Pro",serif;
+ direction:rtl;unicode-bidi:isolate}
+header{position:sticky;top:0;z-index:5;background:var(--surf);
+ border-bottom:1px solid var(--rule);padding:.7rem 1.1rem}
+.bar{max-width:940px;margin:0 auto;display:flex;gap:.8rem;align-items:center;
+ flex-wrap:wrap}
+.brand{font-weight:600;color:var(--ink);letter-spacing:-.01em;white-space:nowrap}
+.brand small{display:block;font-size:.68rem;font-weight:400;color:var(--verd);
+ text-transform:uppercase;letter-spacing:.05em}
+input[type=search]{flex:1;min-width:170px;font:inherit;font-size:1.05rem;
+ padding:.42rem .6rem;border:1px solid var(--rule);border-radius:3px;
+ background:var(--bg);color:var(--ink)}
+input:focus-visible{outline:2px solid var(--verd);outline-offset:1px}
+main{max-width:940px;margin:0 auto;padding:1.5rem 1.1rem 5rem}
+.head{display:flex;gap:1rem;align-items:baseline;flex-wrap:wrap;
+ padding-bottom:.7rem;border-bottom:1px solid var(--rule);margin-bottom:1rem}
+.head h1{margin:0;font-size:2rem;color:var(--ink);font-weight:600}
+.cls{font-size:.84rem;color:var(--mut)}
+.pill{font-size:.68rem;text-transform:uppercase;letter-spacing:.05em;
+ padding:.16rem .45rem;border-radius:2px;background:var(--soft);color:var(--mut)}
+.pill.ok{background:var(--verdbg);color:var(--verd)}
+.pill.no{background:var(--madbg);color:var(--mad)}
+h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.11em;
+ color:var(--faint);margin:1.8rem 0 .6rem;font-weight:600}
+.card{background:var(--surf);border:1px solid var(--rule);border-radius:4px;
+ padding:1rem 1.15rem;margin-bottom:.7rem}
+.card.empty{background:transparent;border-style:dashed;color:var(--faint)}
+.ct{display:flex;gap:.6rem;align-items:baseline;flex-wrap:wrap;
+ margin-bottom:.55rem}
+.ct b{color:var(--ink);font-size:1rem}
+.ct .who{color:var(--mut);font-size:.86rem}
+.cite{margin-left:auto;font-size:.78rem;color:var(--faint);
+ font-variant-numeric:tabular-nums}
+.txt p{margin:0 0 .55rem;font-size:1.1rem;line-height:1.95;color:var(--ink)}
+.txt p:last-child{margin:0}
+.attrib{margin-top:.6rem;padding-top:.5rem;border-top:1px solid var(--soft);
+ font-size:.7rem;color:var(--faint)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));
+ gap:.4rem}
+.slot{background:var(--surf);border:1px solid var(--rule);border-radius:3px;
+ padding:.5rem .65rem}
+.slot .k{font-size:.68rem;text-transform:uppercase;letter-spacing:.05em;
+ color:var(--faint)}
+.slot .v{font-size:1.25rem;color:var(--ink)}
+.slot.unv{border-color:var(--och)}
+.slot.unv .v{color:var(--och)}
+.slot.ref{border-color:var(--mad);border-style:dashed}
+.slot .why{font-size:.74rem;color:var(--mad);margin-top:.25rem}
+.slot .note{font-size:.74rem;color:var(--mut);margin-top:.25rem}
+.slot .att{font-size:.68rem;color:var(--faint);margin-top:.3rem;
+ padding-top:.3rem;border-top:1px solid var(--soft);line-height:1.5}
+.slot .att.ok{color:var(--verd)}
+.slot .att.sk{color:var(--och)}
+.slot .att i{font-style:normal;opacity:.75}
+h3{font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;
+ color:var(--mut);margin:1.1rem 0 .45rem;font-weight:600}
+table{width:100%;border-collapse:collapse;font-size:.9rem}
+.tw{overflow-x:auto;border:1px solid var(--rule);border-radius:4px}
+th,td{text-align:left;padding:.4rem .7rem;border-bottom:1px solid var(--soft)}
+th{font-size:.66rem;text-transform:uppercase;letter-spacing:.08em;
+ color:var(--faint);background:var(--surf)}
+tr:last-child td{border:none}
+.srcsel{display:flex;gap:.5rem;flex-wrap:wrap;margin:.2rem 0 1rem}
+.srcsel label{font-size:.8rem;color:var(--mut);display:flex;gap:.28rem;
+ align-items:center;background:var(--surf);border:1px solid var(--rule);
+ border-radius:3px;padding:.2rem .5rem;cursor:pointer}
+.msg{padding:3rem 1rem;text-align:center;color:var(--mut)}
+.msg b{display:block;font-size:1.15rem;color:var(--ink);margin-bottom:.4rem}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style></head><body>
+<header><div class="bar">
+ <div class="brand">Lughat<small>approved sources only</small></div>
+ <input type="search" id="q" placeholder="a word or a root &mdash; سكن, مساكين, qwl"
+        autocomplete="off" autofocus>
+</div></header>
+<main id="m"><div class="msg">Type a Qur'anic word or a root.</div></main>
+<script>
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>
+ ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+let HIDDEN=new Set();
+try{HIDDEN=new Set(JSON.parse(localStorage.getItem("lughat.hidden")||"[]"));}
+catch(e){}
+function saveHidden(){try{localStorage.setItem("lughat.hidden",
+ JSON.stringify([...HIDDEN]));}catch(e){}}
+let DATA=null;
+async function go(){
+ const t=document.getElementById("q").value.trim();
+ const m=document.getElementById("m");
+ if(!t){m.innerHTML='<div class="msg">Type a Qur\'anic word or a root.</div>';return;}
+ m.innerHTML='<div class="msg">looking&hellip;</div>';
+ const r=await fetch("/api/read?q="+encodeURIComponent(t)).then(x=>x.json());
+ DATA=r;draw();
+}
+function att(f){
+ // EXACT is attestation; SKELETON is a DIFFERENT WORD and is labelled so.
+ let o='';
+ if(f.exact&&f.exact.length){
+  o+='<div class="att ok">attested: '+f.exact.map(x=>'<span class="ar">'+
+   esc(x.form)+'</span> '+esc(x.ref)+' <i>'+esc(x.tag)+'</i>').join(" &middot; ")
+   +'</div>';}
+ else if(f.exact) o+='<div class="att">not found in the corpus</div>';
+ if(f.skeleton&&f.skeleton.length)
+  o+='<div class="att sk">'+
+   'same skeleton, different vowels &mdash; NOT attestation: '+f.skeleton.map(x=>'<span class="ar">'+esc(x.form)+
+   '</span> '+esc(x.ref)+' <i>'+esc(x.tag)+'</i>').join(" &middot; ")+'</div>';
+ if(f.n_dropped) o+='<div class="att">+'+f.n_dropped+' more not shown ('+
+  f.n_dropped_exact+' of them exact)</div>';
+ return o;}
+
+function draw(){
+ const r=DATA,m=document.getElementById("m");
+ if(!r) return;
+ if(r.error){m.innerHTML='<div class="msg"><b>'+esc(r.error)+'</b></div>';return;}
+ if(r.absent){m.innerHTML='<div class="msg"><b class="ar">'+esc(r.query)+
+  '</b>This root does not occur in the Quranic Arabic Corpus. That is a fact '+
+  'about the corpus, not about Arabic, and this tool will not supply the '+
+  'difference.</div>';return;}
+ let h='<div class="head"><h1 class="ar">'+esc(r.letters.join(" "))+'</h1>'+
+  '<span class="cls">'+esc(r.classification)+' &middot; '+r.n_segments+
+  ' segments &middot; '+r.n_lemmas+' lemmas</span>';
+ h+= r.bab ? '<span class="pill ok">bab '+r.bab+' &middot; sourced</span>'
+           : '<span class="pill no">bab unsourced</span>';
+ h+='</div>';
+ if(r.bab_evidence) h+='<div class="cls" style="margin:-.5rem 0 1rem">'+
+   'bab evidence: <span class="ar">'+esc(r.bab_evidence)+'</span></div>';
+
+ h+='<h2>Sources</h2><div class="srcsel">';
+ for(const c of r.cards) h+='<label><input type="checkbox" data-k="'+esc(c.key)+
+  '"'+(HIDDEN.has(c.key)?"":" checked")+'> '+esc(c.title)+'</label>';
+ h+='</div>';
+ for(const c of r.cards){
+  if(HIDDEN.has(c.key)) continue;
+  if(!c.entries.length){
+   h+='<div class="card empty"><div class="ct"><b>'+esc(c.title)+'</b>'+
+    '<span class="who">'+esc(c.author)+'</span></div>'+
+    (c.pending? 'Nothing approved yet &mdash; '+c.pending+
+       ' entr'+(c.pending==1?"y":"ies")+' for this root are ingested and '+
+       'awaiting review, so they are not shown.'
+     : 'This source has no entry for this root.')+'</div>';
+   continue;}
+  for(const e of c.entries){
+   h+='<div class="card"><div class="ct"><b>'+esc(c.title)+'</b>'+
+    '<span class="who">'+esc(c.author)+'</span>'+
+    (e.extraction&&e.extraction!=="direct"
+      ? '<span class="pill no">root inferred: '+esc(e.extraction)+'</span>':'')+
+    '<span class="cite">vol '+esc(e.vol)+' p. '+esc(e.page)+'</span></div>'+
+    '<div class="txt ar">'+e.lines.map(l=>"<p>"+esc(l)+"</p>").join("")+'</div>'+
+    '<div class="attrib">'+esc(c.attribution)+'</div></div>';}
+ }
+
+ h+='<h2>The letters &mdash; Ibn Jinnī</h2>';
+ for(const L of r.letter_cards){
+  if(!L.entries.length){
+   h+='<div class="card empty"><div class="ct"><b class="ar">'+esc(L.letter)+
+    '</b><span class="who">'+esc(L.name)+'</span></div>'+
+    'Not approved, or absent from this witness.</div>';continue;}
+  for(const e of L.entries)
+   h+='<div class="card"><div class="ct"><b class="ar">'+esc(L.letter)+'</b>'+
+    '<span class="who">'+esc(e.title)+'</span>'+
+    '<span class="cite">vol '+esc(e.vol)+' p. '+esc(e.page)+'</span></div>'+
+    '<div class="txt ar">'+e.lines.map(l=>"<p>"+esc(l)+"</p>").join("")+'</div>'+
+    '<div class="attrib">'+esc(e.attribution)+'</div></div>';
+ }
+
+ h+='<h2>Ishtiqāq ṣaghīr</h2>';
+ for(const sec of r.sarf){
+  h+='<h3>'+esc(sec.title)+(sec.hypothetical
+    ? ' <span class="pill no">hypothetical &mdash; the bab is not sourced</span>'
+    : '')+'</h3>';
+  if(sec.condition) h+='<div class="cls">'+esc(sec.condition)+'</div>';
+  h+='<div class="grid">';
+  for(const f of sec.forms){
+   if(f.refused){h+='<div class="slot ref"><div class="k">'+esc(f.slot)+
+    '</div><div class="why">'+esc(f.refused)+'</div></div>';continue;}
+   h+='<div class="slot'+(f.verified?"":" unv")+'"><div class="k">'+esc(f.slot)+
+    (f.verified?"":" &mdash; unverified")+'</div><div class="v ar">'+
+    esc(f.text)+'</div>'+
+    (f.caveats||[]).map(c=>'<div class="why">! '+esc(c)+'</div>').join("")+
+    (f.notes||[]).map(c=>'<div class="note">? '+esc(c)+'</div>').join("")+
+    att(f)+'</div>';}
+  h+='</div>';
+ }
+
+ if(r.akbar&&r.akbar.length){
+  h+='<h2>Ishtiqāq akbar &mdash; the six permutations</h2><div class="grid">';
+  for(const p of r.akbar)
+   h+='<div class="slot"><div class="k">'+(p.self?"this root":"permutation")+
+    '</div><div class="v ar">'+esc(p.root)+'</div><div class="note">'+
+    (p.n? p.n+(p.n==1?" segment":" segments")+" in the Qur’an"
+      :"does not occur")+'</div></div>';
+  h+='</div>';}
+
+ h+='<h2>In the Qur’an</h2><div class="tw"><table><thead><tr>'+
+  '<th>lemma</th><th>pos</th><th>count</th><th>first</th></tr></thead><tbody>';
+ for(const l of r.lemmas)
+  h+='<tr><td class="ar">'+esc(l.lemma)+'</td><td>'+esc(l.pos)+'</td><td>'+
+   l.n+'</td><td class="ar">'+esc(l.form)+'</td></tr>';
+ h+='</tbody></table></div>';
+ m.innerHTML=h;
+ m.querySelectorAll("input[type=checkbox]").forEach(cb=>{
+  cb.addEventListener("change",()=>{
+   const k=cb.dataset.k;
+   if(cb.checked)HIDDEN.delete(k);else HIDDEN.add(k);
+   saveHidden();draw();});});
+}
+let t=null;
+const box=document.getElementById("q");
+box.addEventListener("input",()=>{clearTimeout(t);t=setTimeout(()=>{
+ const v=box.value.trim();
+ // keep the URL in step so a lookup can be bookmarked or linked
+ try{history.replaceState(null,"",v?"?q="+encodeURIComponent(v):"/");}catch(e){}
+ go();},220);});
+const q0=new URLSearchParams(location.search).get("q");
+if(q0){box.value=q0;go();}
+</script></body></html>
+"""
+
+READ_PORT = 8766
+
+
+def read_root(conn, query):
+    """Everything the reader gets for one word or root. Pure retrieval."""
+    letters = canonical_root(query)
+    root = "".join(letters)
+    rc = RootClass(letters)
+    out = {"root": root, "letters": letters, "classification": rc.label(),
+           "reasons": rc.reasons, "query": query}
+
+    row = q(conn, "SELECT n_segments, n_lemmas, bab, bab_verified, "
+                  "bab_method, bab_evidence FROM roots WHERE root_ar=?",
+            (root,)).fetchone()
+    if row is None:
+        # the word may not be a root -- try it as a word first
+        keys = query_keys(query)
+        hit = q(conn, "SELECT root_ar FROM segments WHERE (norm_alif IN (%s) "
+                      "OR norm_drop IN (%s)) AND root_ar IS NOT NULL LIMIT 1"
+                % (",".join("?" * len(keys)), ",".join("?" * len(keys))),
+                keys + keys).fetchone()
+        if hit:
+            return read_root(conn, hit["root_ar"])
+        out["absent"] = True
+        return out
+    out["n_segments"] = row["n_segments"]
+    out["n_lemmas"] = row["n_lemmas"]
+    out["bab"] = row["bab"] if row["bab_verified"] else None
+    out["bab_method"] = row["bab_method"]
+    out["bab_evidence"] = row["bab_evidence"]
+
+    # the corpus's own occurrences
+    out["lemmas"] = [
+        {"lemma": r["lemma_ar"] or "-", "pos": r["pos"] or "-",
+         "n": r["n"], "form": r["form_ar"],
+         "ref": "%d:%d:%d:%d" % (r["sura"], r["aya"], r["word"], r["seg"])}
+        for r in q(conn,
+                   "SELECT lemma_ar, pos, COUNT(*) n, "
+                   "  MIN(sura) sura, MIN(aya) aya, MIN(word) word, "
+                   "  MIN(seg) seg, MIN(form_ar) form_ar "
+                   "FROM segments WHERE root_ar=? AND is_stem=1 "
+                   "GROUP BY lemma_bw, pos ORDER BY n DESC LIMIT 14", (root,))]
+
+    # the sarf table, with whatever refusals apply
+    res = generate(root, bab=out["bab"],
+                   bab_source=("mushaf" if out["bab"] else None))
+    def _form(f):
+        if f.is_refusal:
+            return {"slot": f.slot, "refused": f.reason}
+        d = {"slot": f.slot, "text": f.text, "verified": f.verified,
+             "caveats": list(f.caveats), "notes": list(f.notes)}
+        # attestation, ranked before it is capped, and what was capped said
+        a = attest(conn, f.text, root)
+        d["exact"] = [{"ref": x.ref, "form": x.form_ar, "tag": x.grammar()}
+                      for x in a if x.is_attestation][:3]
+        d["skeleton"] = [{"ref": x.ref, "form": x.form_ar, "tag": x.grammar()}
+                         for x in a if not x.is_attestation][:2]
+        d["n_dropped"] = a.n_dropped
+        d["n_dropped_exact"] = a.n_dropped_exact
+        return d
+
+    out["sarf"] = []
+    for sec in res["mujarrad"]:
+        out["sarf"].append({
+            "title": "bab %d \u2014 %s" % (sec["bab"], sec["name"]),
+            "hypothetical": sec["hypothetical"], "condition": sec["condition"],
+            "forms": [_form(f) for f in sec["forms"]]})
+    if res["mujarrad_derived"]:
+        out["sarf"].append({
+            "title": "derived from the mujarrad", "hypothetical": False,
+            "condition": None,
+            "forms": [_form(f) for f in res["mujarrad_derived"]]})
+    for sec in res["mazid"]:
+        out["sarf"].append({
+            "title": "form %s \u2014 %s" % (sec["roman"], sec["name"]),
+            "hypothetical": False, "condition": None,
+            "forms": [_form(f) for f in sec["forms"]]})
+
+    # ishtiqaq akbar
+    out["akbar"] = []
+    if len(letters) == 3:
+        for perm in ishtiqaq_akbar(conn, root):
+            out["akbar"].append({"root": perm.root, "n": perm.n_segments,
+                                 "self": perm.is_original})
+
+    # ---- one card per source, EMPTY ONES INCLUDED ----------------------
+    out["cards"] = []
+    for src in q(conn, "SELECT id, key, title, author, edition, attribution "
+                       "FROM sources WHERE kind IN ('lexicon','tafsir') "
+                       "ORDER BY key"):
+        ents = list(q(conn,
+                      "SELECT text_raw, scan_uri, vol, page, extraction, "
+                      "headword FROM v_entries WHERE source_id=? AND "
+                      "root_ar=? ORDER BY id", (src["id"], root)))
+        with unguarded(conn):
+            pending = conn.execute(
+                "SELECT COUNT(*) n FROM entries WHERE source_id=? AND "
+                "root_ar=? AND verified=0 AND rejected=0",
+                (src["id"], root)).fetchone()["n"]
+        card = {"key": src["key"], "title": src["title"],
+                "author": src["author"] or "", "edition": src["edition"] or "",
+                "attribution": src["attribution"], "pending": pending,
+                "entries": []}
+        for e in ents:
+            card["entries"].append({
+                "headword": e["headword"], "vol": e["vol"], "page": e["page"],
+                "extraction": e["extraction"],
+                "lines": (render_entry(e["text_raw"])
+                          if e["text_raw"] is not None
+                          else ["[scan only]", e["scan_uri"] or ""]),
+            })
+        out["cards"].append(card)
+
+    # Ibn Jinni on each letter is a card too, keyed by letter not root
+    letter_cards = []
+    for ch in letters:
+        ents = letter_entries(conn, ch)
+        letter_cards.append({
+            "letter": ch, "name": letter_name(ch),
+            "entries": [{"lines": render_entry(e["text_raw"])[:3],
+                         "vol": e["vol"], "page": e["page"],
+                         "title": e["title"], "attribution": e["attribution"]}
+                        for e in ents]})
+    out["letter_cards"] = letter_cards
+    return out
+
+
+def make_read_app(conn):
+    import http.server
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        server_version = "lughat-read"
+
+        def log_message(self, fmt, *a):
+            pass
+
+        def _send(self, code, body, ctype="application/json; charset=utf-8"):
+            blob = body if isinstance(body, bytes) else body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(blob)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy",
+                             "default-src 'none'; style-src 'unsafe-inline'; "
+                             "script-src 'unsafe-inline'; connect-src 'self'; "
+                             "frame-ancestors 'none'; base-uri 'none'; "
+                             "form-action 'none'")
+            self.end_headers()
+            self.wfile.write(blob)
+
+        def do_GET(self):
+            import urllib.parse as up
+            u = up.urlparse(self.path)
+            if u.path == "/":
+                return self._send(200, READ_HTML, "text/html; charset=utf-8")
+            if u.path == "/api/read":
+                term = up.parse_qs(u.query).get("q", [""])[0].strip()
+                if not term:
+                    return self._send(400, json.dumps({"error": "no query"}))
+                try:
+                    with DB_LOCK:
+                        data = read_root(conn, term)
+                except (ValueError, TransliterationError) as e:
+                    return self._send(200, json.dumps(
+                        {"error": str(e)}, ensure_ascii=False))
+                return self._send(200, json.dumps(data, ensure_ascii=False))
+            return self._send(404, json.dumps({"error": "no such route"}))
+
+        def handle_one_request(self):
+            try:
+                return http.server.BaseHTTPRequestHandler.handle_one_request(
+                    self)
+            except Exception:                                   # noqa: BLE001
+                sys.stderr.write(traceback.format_exc())
+                try:
+                    self._send(500, json.dumps({"error": "server error"}))
+                except Exception:                               # noqa: BLE001
+                    pass
+
+    return Handler
+
+
+def cmd_read(conn, args):
+    import http.server
+    port = READ_PORT
+    for a in args:
+        if a.startswith("--port="):
+            port = int(a.split("=", 1)[1])
+    httpd = http.server.ThreadingHTTPServer(
+        (REVIEW_HOST, port), make_read_app(conn))
+    _w(BAR)
+    _w("READING SURFACE -- approved text only.")
+    _w(BAR)
+    _w("Everything here has been approved by a person. A source with nothing")
+    _w("to say shows an EMPTY card: the absence is information.")
+    _w("")
+    _w("  http://%s:%d/" % (REVIEW_HOST, port))
+    _w("")
+    _w("Bound to %s only. Offline; no network at query time." % REVIEW_HOST)
+    _w("Ctrl-C to stop.")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        _w("")
+        _w("stopped.")
+    finally:
+        httpd.server_close()
+    return 0
+
+
+# ==========================================================================
 # 12.  CLI
 # ==========================================================================
 
@@ -5848,6 +6429,7 @@ USAGE = """lughat -- a local Qur'anic lexicography tool (offline, stdlib only)
                                   lexicons: maqayis, mufradat, lisan
   lughat.py review [--stats]      the approval gate, in the terminal
   lughat.py serve [--port=N]      the same gate as a local page (127.0.0.1)
+  lughat.py read [--port=N]       the READING surface: approved sources only
 
 Roots and words may be typed in Arabic (سكن) or Buckwalter (skn).
 """
@@ -5961,6 +6543,9 @@ def _main(argv):
         _w("  python3 lughat.py serve")
         _w(LEXICONS[key]["attribution"])
         return 0
+
+    if cmd == "read":
+        return cmd_read(connect(threadsafe=True), argv[2:])
 
     if cmd == "serve":
         return cmd_serve(connect(threadsafe=True), argv[2:])
