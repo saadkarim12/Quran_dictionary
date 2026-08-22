@@ -6917,7 +6917,7 @@ def _t(conn):
     ck(len(body) > 2000, "the reading section slice is empty (%d)" % len(body))
     code = strip_comments(body)
     routes = set(re.findall(r'u\.path [!=]= "([^"]+)"', code))
-    ck(routes == {"/", "/api/read", "/api/roots"},
+    ck(routes == {"/", "/api/read", "/api/roots", "/api/jinni"},
        "the reading surface exposes %s" % sorted(routes))
     ck("do_POST" not in code, "the reading surface accepts POST")
     for w in ("INSERT", "UPDATE", "DELETE", "_decide", "DROP"):
@@ -7803,6 +7803,14 @@ h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.11em;
 .ayahead{display:flex;gap:.7rem;align-items:baseline;margin:1rem 0 .4rem}
 .ayahead b{color:var(--verd);font-variant-numeric:tabular-nums}
 .ayahead .ar{font-size:1.15rem;color:var(--ink)}
+.tocbk{margin:.7rem 0 .3rem;color:var(--mut);font-size:.8rem}
+.tocbk b{color:var(--ink)}
+.toclist{display:flex;flex-wrap:wrap;gap:.3rem}
+.toclist a{font-size:.95rem;text-decoration:none;color:var(--ink);background:var(--surf);border:1px solid var(--rule);border-radius:3px;padding:.15rem .45rem;direction:rtl}
+.toclist a small{color:var(--faint);font-size:.62rem;direction:ltr;margin-inline-start:.35rem}
+.tabs{display:flex;gap:.3rem;margin:0 0 1.2rem;border-bottom:1px solid var(--rule)}
+.tabs button{font:inherit;font-size:.82rem;padding:.45rem .8rem;border:0;border-bottom:2px solid transparent;background:none;color:var(--mut);cursor:pointer}
+.tabs button.on{color:var(--ink);border-bottom-color:var(--verd);font-weight:600}
 .pk{max-width:940px;margin:0 auto;display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;padding:.6rem 1.1rem .2rem}
 .pk .lbl{font-size:.68rem;text-transform:uppercase;letter-spacing:.07em;color:var(--faint)}
 .pk select{font-size:1.2rem;font-family:inherit;padding:.15rem .3rem;border:1px solid var(--rule);border-radius:3px;background:var(--bg);color:var(--ink);min-width:3.4rem;text-align:center}
@@ -7928,6 +7936,50 @@ document.getElementById("pick").addEventListener("click",async()=>{
  if(!box.hidden) await pkInit();
 });
 
+// ---- Ibn Jinni's own table of contents ---------------------------------
+let TOC=null;
+async function tocOpen(){
+ const body=document.getElementById("tocbody");
+ if(!TOC) TOC=(await fetch("/api/jinni").then(x=>x.json())).books;
+ let o='<input id="tocq" type="search" placeholder="filter his chapter '+
+  'titles" style="width:100%;max-width:22rem;margin:.4rem 0">';
+ for(const bk of TOC){
+  o+='<div class="tocbk"><b>'+esc(bk.title)+'</b> &mdash; keyed by '+
+    esc(bk.keyed_by)+'</div>';
+  if(!bk.chapters.length){
+   o+='<div class="card empty">'+(bk.pending
+     ? 'Nothing approved yet &mdash; '+bk.pending+' chapter'+
+       (bk.pending==1?" is":"s are")+' ingested and awaiting review.'+
+       '<div class="how">To decide them now:<code>python3 lughat.py '+
+       'review --source='+esc(bk.key)+'</code></div>'
+     : 'No chapter of this book is ingested.')+'</div>';
+   continue;}
+  o+='<div class="toclist">'+bk.chapters.map(c=>
+    '<a href="#" data-id="'+c.id+'" class="ar">'+esc(c.head)+
+    '<small>'+esc(c.vol)+'/'+esc(c.page)+'</small></a>').join("")+'</div>';
+ }
+ o+='<div id="tocone"></div>';
+ body.innerHTML=o;
+ const filt=document.getElementById("tocq");
+ filt.addEventListener("input",()=>{
+  const v=filt.value.trim();
+  body.querySelectorAll(".toclist a").forEach(a=>{
+   a.style.display=(!v||a.textContent.includes(v))?"":"none";});});
+ body.querySelectorAll(".toclist a").forEach(a=>
+  a.addEventListener("click",async ev=>{
+   ev.preventDefault();
+   const d=await fetch("/api/jinni?id="+encodeURIComponent(a.dataset.id))
+     .then(x=>x.json());
+   const c=d.chapter;
+   document.getElementById("tocone").innerHTML=c
+    ? '<div class="card"><div class="ct"><b>'+esc(c.title)+'</b>'+
+      '<span class="who ar">'+esc(c.head)+'</span>'+
+      '<span class="cite">vol '+esc(c.vol)+' p. '+esc(c.page)+'</span></div>'+
+      '<div class="txt ar">'+c.lines.map(l=>"<p>"+esc(l)+"</p>").join("")+
+      '</div><div class="attrib">'+esc(c.attribution)+'</div></div>'
+    : '<div class="card empty">'+esc(d.error||"not available")+'</div>';}));
+}
+
 function att(f){
  // EXACT is attestation; SKELETON is a DIFFERENT WORD and is labelled so.
  let o='';
@@ -7943,6 +7995,21 @@ function att(f){
  if(f.n_dropped) o+='<div class="att">+'+f.n_dropped+' more not shown ('+
   f.n_dropped_exact+' of them exact)</div>';
  return o;}
+
+const VIEWS=[["dict","Dictionary"],["jinni","Ishtiqāq — Ibn Jinnī"],
+              ["quran","Qur’an"]];
+let VIEW=(()=>{try{return localStorage.getItem("lughat.view")||"dict";}
+              catch(e){return "dict";}})();
+const TABBAR='<nav class="tabs">'+VIEWS.map(v=>
+  '<button data-v="'+v[0]+'">'+v[1]+'</button>').join("")+'</nav>';
+function showView(v){
+ VIEW=v;
+ try{localStorage.setItem("lughat.view",v);}catch(e){}
+ document.querySelectorAll("[data-view]").forEach(
+   s=>{s.hidden=s.dataset.view!==v;});
+ document.querySelectorAll(".tabs button").forEach(
+   b=>b.classList.toggle("on",b.dataset.v===v));
+}
 
 function draw(){
  const r=DATA,m=document.getElementById("m");
@@ -7961,6 +8028,10 @@ function draw(){
  if(r.bab_evidence) h+='<div class="cls" style="margin:-.5rem 0 1rem">'+
    'bab evidence: <span class="ar">'+esc(r.bab_evidence)+'</span></div>';
 
+ // ---- three views, because the three questions are different and the
+ // books answering them are keyed differently: a dictionary by ROOT, Ibn
+ // Jinni by LETTER and by TOPIC, the mushaf by AYAH.
+ h+='<section data-view="dict">';
  h+='<h2>Dictionaries</h2><div class="srcsel">';
  for(const c of r.cards.concat(r.tafsir_sources||[], r.translations||[]))
   h+='<label><input type="checkbox" data-k="'+esc(c.key)+
@@ -8030,7 +8101,13 @@ function draw(){
 
 // Ibn Jinni: the letters of the root, then its permutations,
  // then the books that only mention it.
- h+='<h2>Ibn Jinnī</h2>';
+ h+='</section><section data-view="jinni">';
+ h+='<h2>Ishtiqāq &mdash; Ibn Jinnī</h2>';
+ // His books are not keyed by root, so they are also enterable the way he
+ // wrote them: Sirr by LETTER, al-Khasa'is by TOPIC.
+ h+='<details class="fold" id="toc"><summary>Browse his chapters &mdash; '+
+  'by letter (Sirr) and by topic (al-Khaṣāʾiṣ)</summary>'+
+  '<div id="tocbody" class="cls">loading&hellip;</div></details>';
  h+='<h3>The letters of the root</h3>';
  for(const L of r.letter_cards){
   if(!L.entries.length){
@@ -8099,6 +8176,7 @@ function draw(){
  }
 
  h+='</details>';
+ h+='</section><section data-view="quran">';
  h+='<h2>Tafsir</h2><div class="cls" style="margin:-.3rem 0 .6rem">'+
   'on the āyāt where this root occurs</div>';
   for(const a of r.tafsir){
@@ -8142,8 +8220,13 @@ function draw(){
  for(const l of r.lemmas)
   h+='<tr><td class="ar">'+esc(l.lemma)+'</td><td>'+esc(l.pos)+'</td><td>'+
    l.n+'</td><td class="ar">'+esc(l.form)+'</td></tr>';
- h+='</tbody></table></div>';
- m.innerHTML=h;
+ h+='</tbody></table></div></section>';
+ m.innerHTML=TABBAR+h;
+ showView(VIEW);
+ const toc=document.getElementById("toc");
+ if(toc) toc.addEventListener("toggle",()=>{if(toc.open)tocOpen();});
+ m.querySelectorAll(".tabs button").forEach(b=>
+  b.addEventListener("click",()=>showView(b.dataset.v)));
  m.querySelectorAll("input[type=checkbox]").forEach(cb=>{
   cb.addEventListener("change",()=>{
    const k=cb.dataset.k;
@@ -8163,6 +8246,44 @@ if(q0){box.value=q0;go();}
 """
 
 READ_PORT = 8766
+
+
+def jinni_chapters(conn):
+    """Ibn Jinni's own table of contents, for the chapters a person has
+    approved.  He is not keyed by root, so this is how his books are
+    actually entered: by LETTER in Sirr, by TOPIC in al-Khasa'is."""
+    out = []
+    for key in ("sirr", "khasais"):
+        src = q(conn, "SELECT id, title FROM sources WHERE key=?",
+                (key,)).fetchone()
+        if src is None:
+            continue
+        rows = [{"id": e["id"], "head": chapter_label(e["headword"] or ""),
+                 "vol": e["vol"], "page": e["page"]}
+                for e in q(conn, "SELECT id, headword, vol, page FROM "
+                                 "v_entries WHERE source_id=? ORDER BY id",
+                           (src["id"],))]
+        with unguarded(conn):
+            pending = conn.execute(
+                "SELECT COUNT(*) FROM entries WHERE source_id=? AND "
+                "verified=0 AND rejected=0", (src["id"],)).fetchone()[0]
+        out.append({"key": key, "title": src["title"],
+                    "keyed_by": KEYED_BY_WORD[LEXICONS[key]["keyed_by"]],
+                    "chapters": rows, "pending": pending})
+    return out
+
+
+def jinni_chapter(conn, entry_id):
+    """One approved chapter of his, whole."""
+    e = q(conn, "SELECT e.*, s.title, s.author, s.attribution FROM v_entries e "
+                "JOIN sources s ON s.id = e.source_id WHERE e.id=?",
+          (int(entry_id),)).fetchone()
+    if e is None:
+        return None
+    return {"head": chapter_label(e["headword"] or ""), "vol": e["vol"],
+            "page": e["page"], "title": e["title"], "author": e["author"],
+            "attribution": e["attribution"],
+            "lines": render_entry(e["text_raw"] or "")}
 
 
 def root_inventory(conn):
@@ -8423,6 +8544,18 @@ def make_read_app(conn):
                 with DB_LOCK:
                     return self._send(200, json.dumps(
                         {"roots": root_inventory(conn)}, ensure_ascii=False))
+            if u.path == "/api/jinni":
+                cid = up.parse_qs(u.query).get("id", [""])[0].strip()
+                with DB_LOCK:
+                    if cid.isdigit():
+                        got = jinni_chapter(conn, cid)
+                        if got is None:
+                            return self._send(404, json.dumps(
+                                {"error": "not an approved chapter"}))
+                        return self._send(200, json.dumps(
+                            {"chapter": got}, ensure_ascii=False))
+                    return self._send(200, json.dumps(
+                        {"books": jinni_chapters(conn)}, ensure_ascii=False))
             if u.path == "/api/read":
                 term = up.parse_qs(u.query).get("q", [""])[0].strip()
                 if not term:

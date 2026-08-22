@@ -773,6 +773,26 @@ number, never text — so an empty card can say *why* it is empty.
 Both bind `127.0.0.1`. There is no link to give anyone: the tool is offline by
 architecture, and a "share" would mean serving unreviewed lexicon text.
 
+The page has **three views**, because the three questions are different and
+the books answering them are keyed differently — a dictionary by **root**, Ibn
+Jinnī by **letter** and by **topic**, the muṣḥaf by **āyah**. Putting them on
+one screen made the ṣarf grid the first thing a reader met and buried the
+dictionaries under it.
+
+    Dictionary          the three root-keyed lexicons, then al-ʿAskarī on
+                        near-synonyms and the sentences stating an opposition
+    Ishtiqāq — Ibn Jinnī the six permutations, his chapter on each radical,
+                        al-Khaṣāʾiṣ searched, and his own table of contents
+    Qurʾān              the tafsir on each āyah, and every occurrence
+
+Because his books cannot be *asked* about a root, the Ibn Jinnī view also
+lets them be entered the way he wrote them: a list of his chapter titles,
+filterable, **approved ones only** — with the count of what is still waiting
+and the command that decides it.
+
+The ishtiqāq ṣaghīr table is folded shut. It was asked for, and then found to
+crowd out the dictionaries; one click opens it and nothing was deleted.
+
 The page shows, for one root: every source as a card (**including the empty
 ones** — hiding a silent source would imply an agreement that never happened),
 the ṣarf table in full with its refusals, and for every generated string the
