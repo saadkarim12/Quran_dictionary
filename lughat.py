@@ -35,6 +35,7 @@ Usage:
     lughat.py sarf <root> [bab]     ishtiqaq saghir, with refusals
     lughat.py root <root>           corpus occurrences of a root
     lughat.py word <word>           search the mushaf text
+  lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
 """
 
 import io
@@ -1485,6 +1486,42 @@ def cmd_root(conn, root):
     _w(QAC_ATTRIBUTION)
 
 
+def cmd_aya(conn, ref):
+    """Print an ayah as the corpus holds it, so it can be checked against a
+    printed mushaf by eye.  Pure retrieval: the text is the concatenation of
+    the corpus's own segment forms, in order, and nothing else."""
+    m = re.match(r"^\s*(\d+)\s*[:. ]\s*(\d+)\s*$", ref)
+    if not m:
+        raise SystemExit("give an ayah as sura:aya, e.g. 2:35")
+    sura, aya = int(m.group(1)), int(m.group(2))
+    rows = list(q(conn, "SELECT word, form_ar FROM words WHERE sura=? AND "
+                        "aya=? ORDER BY word", (sura, aya)))
+    if not rows:
+        _w("%d:%d is not in the corpus." % (sura, aya))
+        n = q(conn, "SELECT MAX(aya) n FROM segments WHERE sura=?",
+              (sura,)).fetchone()["n"]
+        if n:
+            _w("Sura %d has %d ayat." % (sura, n))
+        return
+    _w(BAR)
+    _w("%d:%d   (%d words)" % (sura, aya, len(rows)))
+    _w(BAR)
+    _w(" ".join(r["form_ar"] for r in rows))
+    _w("")
+    _w("word-by-word:")
+    for r in rows:
+        segs = list(q(conn, "SELECT form_ar, tag, root_ar, features FROM "
+                            "segments WHERE sura=? AND aya=? AND word=? "
+                            "ORDER BY seg", (sura, aya, r["word"])))
+        roots = sorted({x["root_ar"] for x in segs if x["root_ar"]})
+        _w("  %3d  %-22s %-10s %s"
+           % (r["word"], r["form_ar"], "/".join(roots) or "-",
+              " + ".join(x["tag"] for x in segs)))
+    _w("")
+    _w(QAC_ATTRIBUTION)
+    _w(TANZIL_ATTRIBUTION)
+
+
 def cmd_word(conn, word):
     keys = query_keys(word)
     _w(BAR)
@@ -1673,6 +1710,30 @@ def _t(conn):
                   "word=w.word ORDER BY seg) s)").fetchone()["n"]
     ck(bad == 0, "%d words mismatch their segments" % bad)
     return "1:1:3 = %s, all %d words consistent" % (want, EXPECT_WORDS)
+
+
+@test("INTEGRITY", "an ayah reconstructs to the corpus's own text")
+def _t(conn):
+    out = io.StringIO()
+    real, sys.stdout = sys.stdout, out
+    try:
+        cmd_aya(conn, "112:1")
+    finally:
+        sys.stdout = real
+    body = out.getvalue()
+    want = " ".join(
+        to_arabic(x) for x in ("qulo", "huwa", "{ll~ahu", ">aHadN"))
+    ck(want in body, "112:1 did not render as the corpus holds it")
+    # the ayah line is the corpus's own segment forms joined in order, with
+    # nothing inserted, removed or reordered
+    line = [l for l in body.splitlines() if want in l][0]
+    ck(line == want, "the ayah line carries extra text: %r" % line)
+    segs = [r["form_ar"] for r in q(
+        conn, "SELECT form_ar FROM segments WHERE sura=112 AND aya=1 "
+              "ORDER BY word, seg")]
+    ck(line.replace(" ", "") == "".join(segs),
+       "the rendered ayah is not the concatenation of its segments")
+    return "112:1 -> %s" % want
 
 
 @test("INTEGRITY", "wazn substitution survives roots containing ف ع or ل")
@@ -2080,12 +2141,23 @@ USAGE = """lughat -- a local Qur'anic lexicography tool (offline, stdlib only)
   lughat.py sarf <root> [bab]     ishtiqaq saghir, with refusals
   lughat.py root <root>           corpus occurrences of a root
   lughat.py word <word>           search the mushaf text
+  lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
 
 Roots and words may be typed in Arabic (سكن) or Buckwalter (skn).
 """
 
 
 def main(argv):
+    try:
+        return _main(argv)
+    except (ValueError, TransliterationError) as e:
+        # A malformed root or an untransliterable character is the user's
+        # input being rejected, not a crash.  Say what was wrong and stop.
+        sys.stderr.write("%s\n" % e)
+        return 2
+
+
+def _main(argv):
     if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
         sys.stdout.write(USAGE)
         return 0
@@ -2130,16 +2202,30 @@ def main(argv):
         if len(argv) < 3:
             sys.stdout.write(USAGE)
             return 2
-        bab = int(argv[3]) if len(argv) > 3 else None
+        bab = None
+        if len(argv) > 3:
+            if not argv[3].isdigit() or not 1 <= int(argv[3]) <= 6:
+                sys.stderr.write(
+                    "bab must be 1..6 (the six abwab of the thulathi "
+                    "mujarrad); got %r\n" % argv[3])
+                return 2
+            bab = int(argv[3])
         conn = connect() if os.path.exists(DB_PATH) else None
         cmd_sarf(conn, argv[2], bab)
         return 0
 
-    if cmd == "root":
+    if cmd == "root":  # noqa: E501
         if len(argv) < 3:
             sys.stdout.write(USAGE)
             return 2
         cmd_root(connect(), argv[2])
+        return 0
+
+    if cmd == "aya":
+        if len(argv) < 3:
+            sys.stdout.write(USAGE)
+            return 2
+        cmd_aya(connect(), argv[2])
         return 0
 
     if cmd == "word":
@@ -2155,4 +2241,13 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    try:
+        sys.exit(main(sys.argv))
+    except BrokenPipeError:
+        # `lughat.py aya 2:35 | head` closes the pipe early; that is not an
+        # error.  Redirect fd 1 to devnull so the interpreter's own flush at
+        # exit does not print a second traceback.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)
