@@ -6895,7 +6895,7 @@ def _t(conn):
     ck(len(body) > 2000, "the reading section slice is empty (%d)" % len(body))
     code = strip_comments(body)
     routes = set(re.findall(r'u\.path [!=]= "([^"]+)"', code))
-    ck(routes == {"/", "/api/read"},
+    ck(routes == {"/", "/api/read", "/api/roots"},
        "the reading surface exposes %s" % sorted(routes))
     ck("do_POST" not in code, "the reading surface accepts POST")
     for w in ("INSERT", "UPDATE", "DELETE", "_decide", "DROP"):
@@ -6908,6 +6908,30 @@ def _t(conn):
            "the reading surface reads entry TEXT through unguarded(): %s"
            % " ".join(stmt.split())[:120])
     return "2 routes, no writes, 127.0.0.1, unverified text unreachable"
+
+
+@test("INTEGRITY", "the radical picker offers only roots that exist")
+def _t(conn):
+    """Building the picker from the alphabet would let a reader assemble
+    ط ظ ء and land on 'this root does not occur in the corpus' -- true, and
+    useless. It is built from the corpus's own index instead, so every letter
+    it offers leads somewhere."""
+    inv = root_inventory(conn)
+    with unguarded(conn):
+        want = {r[0] for r in conn.execute("SELECT root_ar FROM roots")}
+    ck({x["r"] for x in inv} == want,
+       "the picker's inventory is not the corpus's root list")
+    ck(len(inv) == 1642, "%d roots in the inventory" % len(inv))
+    ck(all(isinstance(x["n"], int) for x in inv),
+       "a root is offered without its occurrence count")
+    # and the page must build the picker from that list, not from a literal
+    js = READ_HTML[READ_HTML.index("const PK="):]
+    js = js[:js.index("function att(")]
+    ck("/api/roots" in READ_HTML and "ROOTS" in js,
+       "the picker is not built from the corpus inventory")
+    ck("ابتثجح" not in READ_HTML and "أبجد" not in READ_HTML,
+       "the picker carries a hardcoded alphabet")
+    return "1,642 roots offered, none of them hypothetical"
 
 
 @test("HONESTY", "an empty source shows an empty card, never a hidden one")
@@ -7740,6 +7764,16 @@ h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.11em;
 .ayahead{display:flex;gap:.7rem;align-items:baseline;margin:1rem 0 .4rem}
 .ayahead b{color:var(--verd);font-variant-numeric:tabular-nums}
 .ayahead .ar{font-size:1.15rem;color:var(--ink)}
+.pk{max-width:940px;margin:0 auto;display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;padding:.6rem 1.1rem .2rem}
+.pk .lbl{font-size:.68rem;text-transform:uppercase;letter-spacing:.07em;color:var(--faint)}
+.pk select{font-size:1.2rem;font-family:inherit;padding:.15rem .3rem;border:1px solid var(--rule);border-radius:3px;background:var(--bg);color:var(--ink);min-width:3.4rem;text-align:center}
+.pk button{font:inherit;font-size:.8rem;padding:.25rem .6rem;border-radius:3px;border:1px solid var(--rule);background:var(--surf);color:var(--ink);cursor:pointer}
+.pk button:disabled{opacity:.4;cursor:default}
+.pk .pkn{font-size:.74rem;color:var(--mut);margin-inline-start:.3rem}
+.pklist{max-width:940px;margin:0 auto;padding:.2rem 1.1rem .6rem;display:flex;gap:.35rem;flex-wrap:wrap}
+.pklist a{font-size:1.05rem;text-decoration:none;color:var(--ink);background:var(--surf);border:1px solid var(--rule);border-radius:3px;padding:.1rem .45rem;direction:rtl}
+.pklist a small{color:var(--faint);font-size:.66rem;direction:ltr;margin-inline-start:.3rem}
+#pick{font:inherit;font-size:.95rem;padding:.3rem .55rem;border-radius:3px;border:1px solid var(--rule);background:var(--surf);color:var(--ink);cursor:pointer;direction:rtl}
 details.fold{margin:1.6rem 0 .6rem;border-top:1px solid var(--rule);padding-top:.7rem}
 details.fold>summary{cursor:pointer;font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:var(--faint);font-weight:600;list-style:none}
 details.fold>summary::-webkit-details-marker{display:none}
@@ -7765,7 +7799,16 @@ tr:last-child td{border:none}
  <div class="brand">Lughat<small>approved sources only</small></div>
  <input type="search" id="q" placeholder="a word or a root &mdash; سكن, مساكين, qwl"
         autocomplete="off" autofocus>
+  <button id="pick" type="button" title="choose the radicals">ف ع ل</button>
 </div></header>
+<div id="picker" hidden><div class="pk">
+  <span class="lbl">root letters</span>
+  <select id="r1"></select><select id="r2"></select><select id="r3"></select>
+  <select id="r4"></select>
+  <span class="pkn" id="pkn"></span>
+  <button id="pkgo" type="button" disabled>open</button>
+  <button id="pkclr" type="button">clear</button>
+</div><div class="pklist" id="pklist"></div></div>
 <main id="m"><div class="msg">Type a Qur'anic word or a root.</div></main>
 <script>
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>
@@ -7784,6 +7827,68 @@ async function go(){
  const r=await fetch("/api/read?q="+encodeURIComponent(t)).then(x=>x.json());
  DATA=r;draw();
 }
+// ---- the radical picker -------------------------------------------------
+// Built from the corpus's own root list, so every letter it offers leads to
+// a root that exists. Offering the alphabet would let you build ط ظ ء and
+// land on "this root does not occur" -- true, and useless.
+let ROOTS=null;
+const PK=["r1","r2","r3","r4"];
+function pkSel(){return PK.map(id=>document.getElementById(id).value);}
+function pkMatch(){
+ const v=pkSel();
+ return (ROOTS||[]).filter(x=>{
+  const L=[...x.r];
+  if(v[3] && L.length!==4) return false;
+  for(let i=0;i<4;i++) if(v[i] && L[i]!==v[i]) return false;
+  return true;});
+}
+function pkFill(){
+ const v=pkSel();
+ for(let i=0;i<4;i++){
+  const sel=document.getElementById(PK[i]);
+  // the options for slot i are the letters that actually occur there among
+  // the roots still matching every OTHER slot
+  const kept=(ROOTS||[]).filter(x=>{
+   const L=[...x.r];
+   if(v[3] && L.length!==4 && i!==3) return false;
+   for(let j=0;j<4;j++) if(j!==i && v[j] && L[j]!==v[j]) return false;
+   return true;});
+  const letters=[...new Set(kept.map(x=>[...x.r][i]).filter(Boolean))].sort();
+  const cur=v[i];
+  sel.innerHTML='<option value="">'+(i===3?"—":"?")+'</option>'+
+   letters.map(l=>'<option value="'+l+'"'+(l===cur?" selected":"")+'>'+l+
+     '</option>').join("");
+  if(cur&&!letters.includes(cur)) sel.value="";
+ }
+ const m=pkMatch(), chosen=pkSel().filter(Boolean).length;
+ document.getElementById("pkn").textContent=
+   chosen? m.length+(m.length===1?" root":" roots"):"1642 roots";
+ document.getElementById("pkgo").disabled=!(m.length===1||chosen>=3);
+ const list=document.getElementById("pklist");
+ list.innerHTML=(chosen&&m.length<=60)
+  ? m.map(x=>'<a href="?q='+encodeURIComponent(x.r)+'">'+esc(x.r)+
+      '<small>'+x.n+'</small></a>').join("")
+  : "";
+}
+async function pkInit(){
+ if(ROOTS) return;
+ ROOTS=(await fetch("/api/roots").then(x=>x.json())).roots;
+ for(const id of PK)
+  document.getElementById(id).addEventListener("change",pkFill);
+ document.getElementById("pkgo").addEventListener("click",()=>{
+  const m=pkMatch();
+  if(m.length) location.search="?q="+encodeURIComponent(m[0].r);});
+ document.getElementById("pkclr").addEventListener("click",()=>{
+  for(const id of PK) document.getElementById(id).value="";
+  pkFill();});
+ pkFill();
+}
+document.getElementById("pick").addEventListener("click",async()=>{
+ const box=document.getElementById("picker");
+ box.hidden=!box.hidden;
+ if(!box.hidden) await pkInit();
+});
+
 function att(f){
  // EXACT is attestation; SKELETON is a DIFFERENT WORD and is labelled so.
  let o='';
@@ -8019,6 +8124,18 @@ if(q0){box.value=q0;go();}
 """
 
 READ_PORT = 8766
+
+
+def root_inventory(conn):
+    """Every root the corpus has, with how often it occurs.
+
+    The picker is built from THIS, not from the alphabet: offering ط ظ ء as a
+    third radical when no such root exists would send the reader to a page
+    that says the root does not occur -- true, and useless. What the muṣḥaf
+    contains is a fact; what it could contain is not this tool's business."""
+    return [{"r": r["root_ar"], "n": r["n_segments"]}
+            for r in q(conn, "SELECT root_ar, n_segments FROM roots "
+                             "ORDER BY root_ar")]
 
 
 def read_root(conn, query):
@@ -8261,6 +8378,12 @@ def make_read_app(conn):
             u = up.urlparse(self.path)
             if u.path == "/":
                 return self._send(200, READ_HTML, "text/html; charset=utf-8")
+            if u.path == "/api/roots":
+                # read-only, and not sourced prose: the root list is the
+                # corpus's own index, which the picker needs whole
+                with DB_LOCK:
+                    return self._send(200, json.dumps(
+                        {"roots": root_inventory(conn)}, ensure_ascii=False))
             if u.path == "/api/read":
                 term = up.parse_qs(u.query).get("q", [""])[0].strip()
                 if not term:
