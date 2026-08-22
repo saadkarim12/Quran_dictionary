@@ -593,6 +593,20 @@ it **closes what is in progress and opens nothing**. Treating it as a pericope
 reported 114 sūra preambles as 114 comments that could not be anchored — a
 refusal count that overstated the gap by more than a third.
 
+### The gate has to be reachable from the word you are reading
+
+The queue is 15,768 entries in frequency order. That is the right default and
+useless when you are looking at **one** word in the reader and want its
+articles decided now — so the queue takes a root, on the CLI
+(`review --root=سكن`) and in a box on the review page, and the reader's empty
+card prints the exact command that fills it. A gate nobody can reach from
+where they are standing is a gate nobody uses.
+
+A tafsir is keyed by āyah, so it gets **no root card at all** — an empty card
+saying "no entry for this root" would be a claim about its contents when the
+truth is about its organisation, and it also listed al-Baghawī twice in the
+source selector.
+
 ### Two queues, one gate
 
 `review --tafsir` works the tafsir queue, and `serve` has a second tab for it.
@@ -694,6 +708,7 @@ Single file, stdlib only, offline after `setup`.
                                     khasais | baghawi
     lughat.py serve [--port=N]      the approval gate as a local page
     lughat.py review [--stats]      the approval gate
+    lughat.py review --root=<root>  approve one root's entries now
     lughat.py review --tafsir       the same gate, for commentary
     lughat.py read [--port=N]       the reading surface: approved sources only
 

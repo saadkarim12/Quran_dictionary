@@ -46,6 +46,7 @@ Usage:
                                   load a lexicon, ALL at verified = 0
                                   lexicons: maqayis, mufradat, lisan
   lughat.py review [--stats]      the approval gate, in the terminal
+  lughat.py review --root=<root>  decide one root's entries now
   lughat.py serve [--port=N]      the same gate as a local page (127.0.0.1)
   lughat.py read [--port=N]       the READING surface: approved sources only
 """
@@ -1773,6 +1774,9 @@ _SECTION_HDR_RE = re.compile(r"^\[.*\]\s*$")
 
 _BARE_HDR_RE = re.compile(r"^[؀-ۿ]{2,8}$")
 
+_QUOTE_MARK_RE = re.compile(r"@Q[BE]@")
+
+
 _HDR_NOISE_RE = re.compile(r"(?:PageV\d+P\d+|\bms\d+\b|[\[\]])")
 
 
@@ -2186,6 +2190,12 @@ def render_entry(raw):
     for line in raw.splitlines():
         line = _PAGE_RE.sub("", line)
         line = _MS_RE.sub("", line)
+        # JK's Lisan brackets every Qur'anic quotation with @QB@ ... @QE@
+        # (6,136 of them). They are the digitisation's annotation, so they
+        # come off here with the rest of the markup. They are NOT replaced
+        # with quotation marks: the punctuation would be ours, not the
+        # book's, and the stored text keeps them either way.
+        line = _QUOTE_MARK_RE.sub("", line)
         h = _HDR_RE.match(line)
         if h:
             # an artifact header: its content is the first half of a word (or
@@ -3680,10 +3690,15 @@ def cmd_review(conn, args):
 
     Entries are offered most-useful-first (by how many times the root occurs
     in the Qur'an), because the gate is only honoured if it is bearable."""
-    only = None
+    only = root = None
     for a in args:
         if a.startswith("--extraction="):
             only = a.split("=", 1)[1]
+        elif a.startswith("--root="):
+            # The queue is 15,768 entries deep. Anyone reading ONE word wants
+            # that word's articles decided now, not in frequency order three
+            # thousand entries from here.
+            root = "".join(canonical_root(a.split("=", 1)[1]))
     if "--tafsir" in args:
         return _review_tafsir(conn)
     if "--stats" in args:
@@ -3729,12 +3744,20 @@ def cmd_review(conn, args):
     if only:
         sql += " AND e.extraction = ?"
         params.append(only)
+    if root:
+        sql += " AND e.root_ar = ?"
+        params.append(root)
     sql += (" ORDER BY COALESCE((SELECT n_segments FROM roots r "
             "WHERE r.root_ar = e.root_ar), 0) DESC, e.id")
     with unguarded(conn):
         pending = list(conn.execute(sql, params))
     if not pending:
-        _w("Nothing pending%s." % (" for extraction=%s" % only if only else ""))
+        why = []
+        if only:
+            why.append("extraction=%s" % only)
+        if root:
+            why.append("root %s" % root)
+        _w("Nothing pending%s." % (" for " + " and ".join(why) if why else ""))
         return
     _w("%d entries pending. y=approve  n=skip  q=quit" % len(pending))
     approved = 0
@@ -5060,6 +5083,14 @@ def _t(conn):
     ck(not any("~~" in l or l.startswith("# ") for l in shown),
        "display leaked mARkdown markup")
     ck("PageV" not in " ".join(shown), "display leaked a page marker")
+    # the same rule, on the marks a different digitisation uses: JK's Lisan
+    # brackets 6,136 Qur'anic quotations with @QB@ ... @QE@
+    marked = "# قوله تعالى @QB@ وله ما سكن @QE@ قال ابن الأعرابي"
+    got = " ".join(render_entry(marked))
+    ck("@Q" not in got, "display leaked a quotation marker: %r" % got)
+    ck("وله ما سكن" in got, "stripping the marker ate the quotation")
+    ck('"' not in got and "\u00ab" not in got,
+       "the renderer invented punctuation the book does not have: %r" % got)
     ck("خلاف الاضطراب والحركة" in " ".join(shown), "the text itself was lost")
     return "stored verbatim (%d chars), rendered clean" % len(raw)
 
@@ -6298,18 +6329,28 @@ def _t(conn):
     text."""
     data = read_root(conn, "سكن")
     ck(data.get("cards"), "no cards at all")
-    keys = {c["key"] for c in data["cards"]}
+    keys = [c["key"] for c in data["cards"]]
     with unguarded(conn):
         have = {r[0] for r in conn.execute(
-            "SELECT key FROM sources WHERE kind IN ('lexicon','tafsir')")}
-    # every source is accounted for: a book keyed by root gets a card, and a
-    # book that is not gets a search. Neither may simply vanish.
+            "SELECT key FROM sources WHERE kind = 'lexicon'")}
+        tafsirs = {r[0] for r in conn.execute(
+            "SELECT key FROM sources WHERE kind = 'tafsir'")}
+    # every source is accounted for EXACTLY ONCE: a lexicon keyed by root
+    # gets a card, one that is not gets a search, and a tafsir gets neither
+    # -- it is keyed by ayah and appears in its own section.
     want = {k for k in have if root_keyed(k)}
-    ck(keys == want, "cards %s but root-keyed sources %s"
+    ck(set(keys) == want, "cards %s but root-keyed lexicons %s"
        % (sorted(keys), sorted(want)))
+    ck(len(keys) == len(set(keys)), "a source is carded twice: %s" % keys)
     searched = {b["key"] for b in data["passages"]}
     ck(searched == have - want, "unkeyed books %s but searched %s"
        % (sorted(have - want), sorted(searched)))
+    shown = keys + [b["key"] for b in data["passages"]] + \
+        [t["key"] for t in data["tafsir_sources"]]
+    ck(len(shown) == len(set(shown)),
+       "the source selector lists a source twice: %s" % shown)
+    ck(set(t["key"] for t in data["tafsir_sources"]) == tafsirs,
+       "a tafsir is missing from its own section")
     for b in data["passages"]:
         ck(b["refusal"].startswith("REFUSED"),
            "%s does not say it has no article to quote" % b["key"])
@@ -6503,6 +6544,7 @@ header{position:sticky;top:0;background:var(--surface);
   overflow:hidden}
 .prog i{display:block;height:100%;background:var(--verd);width:0;transition:width .2s}
 .count{font-variant-numeric:tabular-nums;font-size:.85rem;color:var(--muted)}
+#root{font:inherit;padding:.3rem .5rem;border:1px solid var(--rule);border-radius:3px;background:var(--bg);color:var(--ink);direction:rtl}
 select{font:inherit;font-size:.85rem;padding:.25rem .4rem;background:var(--bg);
   color:var(--body);border:1px solid var(--rule);border-radius:3px}
 main{max-width:900px;margin:0 auto;padding:1.6rem 1.1rem 7rem}
@@ -6550,6 +6592,7 @@ kbd{font:inherit;font-size:.74rem;opacity:.75;border:1px solid currentColor;
     <option value="entries">lexicon entries</option>
     <option value="tafsir">tafsir passages</option>
   </select>
+  <input id="root" type="search" placeholder="one root, e.g. سكن" size="14">
   <select id="filt">
     <option value="">every extraction</option>
     <option value="direct">direct only</option>
@@ -6591,8 +6634,15 @@ async function load(){
   const tf=table()==="tafsir";
   document.getElementById("filt").style.display=tf?"none":"";
   await refreshStats();
+  const rt=document.getElementById("root").value.trim();
+  document.getElementById("root").style.display=tf?"none":"";
   const d=await api("/api/queue?table="+encodeURIComponent(table())+
+    "&root="+encodeURIComponent(tf?"":rt)+
     "&extraction="+encodeURIComponent(tf?"":ex));
+  if(d.error){
+   document.getElementById("main").innerHTML=
+     '<div class="done"><b>'+esc(d.error)+'</b>The queue is unchanged.</div>';
+   busy=false;return;}
   q=d.entries;i=0;busy=false;draw();
 }
 function draw(){
@@ -6674,6 +6724,12 @@ addEventListener("keydown",ev=>{
 });
 document.getElementById("filt").addEventListener("change",load);
 document.getElementById("tbl").addEventListener("change",load);
+document.getElementById("root").addEventListener("change",load);
+// the counter is the WHOLE queue; when a root is filtering it, the batch
+// count below is the honest number for what is on screen
+document.getElementById("root").addEventListener("keydown",ev=>{
+  ev.stopPropagation();
+  if(ev.key==="Enter")load();});
 load();
 </script></body></html>
 """
@@ -6731,7 +6787,7 @@ def _tafsir_queue_rows(conn, limit=60):
     return out
 
 
-def _queue_rows(conn, extraction=None, limit=60, table="entries"):
+def _queue_rows(conn, extraction=None, limit=60, table="entries", root=None):
     if _table(table) == "tafsir":
         return _tafsir_queue_rows(conn, limit)
     # LEFT JOIN, not JOIN: an entry whose source row has gone missing would
@@ -6747,6 +6803,14 @@ def _queue_rows(conn, extraction=None, limit=60, table="entries"):
     if extraction:
         sql += " AND e.extraction = ?"
         params.append(extraction)
+    if root:
+        # The queue is 15,768 entries in frequency order, which is the right
+        # default and useless when you are looking at ONE word in the reader
+        # and want its articles approved now. The root is canonicalised by
+        # the same function the loader used, so a root typed the ordinary way
+        # (رمى) finds what the corpus stored (رمي).
+        sql += " AND e.root_ar = ?"
+        params.append("".join(canonical_root(root)))
     sql += " ORDER BY freq DESC, e.id LIMIT ?"
     params.append(int(limit))
     with unguarded(conn):
@@ -6874,8 +6938,15 @@ def make_review_app(conn, token):
                     tbl = _table(qs.get("table", ["entries"])[0])
                 except ValueError as e:
                     return self._send(400, json.dumps({"error": str(e)}))
-                with DB_LOCK:
-                    rows = _queue_rows(conn, ex, table=tbl)
+                root = (qs.get("root", [""])[0] or "").strip()
+                try:
+                    with DB_LOCK:
+                        rows = _queue_rows(conn, ex, table=tbl, root=root)
+                except ValueError as e:
+                    # a root that is not a root is the reviewer's typo, not a
+                    # server error: say so and leave the queue as it was
+                    return self._send(400, json.dumps(
+                        {"error": str(e)}, ensure_ascii=False))
                 return self._send(200, json.dumps(
                     {"entries": rows, "table": tbl}, ensure_ascii=False))
             if u.path == "/api/stats":
@@ -7034,6 +7105,8 @@ h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.11em;
 .card{background:var(--surf);border:1px solid var(--rule);border-radius:4px;
  padding:1rem 1.15rem;margin-bottom:.7rem}
 .card.empty{background:transparent;border-style:dashed;color:var(--faint)}
+.card.empty .how{margin-top:.5rem;font-size:.76rem;color:var(--mut)}
+.card.empty .how code{display:block;margin:.3rem 0;padding:.3rem .5rem;background:var(--soft);border-radius:3px;color:var(--ink);font-size:.8rem;direction:ltr;unicode-bidi:isolate}
 .card.empty.ref{color:var(--mad);border-color:var(--mad);
  font-size:.82rem;line-height:1.6}
 .ct{display:flex;gap:.6rem;align-items:baseline;flex-wrap:wrap;
@@ -7149,8 +7222,12 @@ function draw(){
    h+='<div class="card empty"><div class="ct"><b>'+esc(c.title)+'</b>'+
     '<span class="who">'+esc(c.author)+'</span></div>'+
     (c.pending? 'Nothing approved yet &mdash; '+c.pending+
-       ' entr'+(c.pending==1?"y":"ies")+' for this root are ingested and '+
-       'awaiting review, so they are not shown.'
+       ' entr'+(c.pending==1?"y":"ies")+' for this root '+
+       (c.pending==1?"is":"are")+' ingested and awaiting review, so '+
+       (c.pending==1?"it is":"they are")+' not shown.'+
+       '<div class="how">To decide them now:<code>python3 lughat.py '+
+       'review --root='+esc(r.root)+'</code>or open the review page and '+
+       'type the root into its filter box.</div>'
      : 'This source has no entry for this root.')+'</div>';
    continue;}
   for(const e of c.entries){
@@ -7212,8 +7289,11 @@ function draw(){
   if(!b.hits.length){
    h+='<div class="card empty">'+(b.pending
      ? 'Nothing approved yet &mdash; '+b.pending+' chapter'+
-       (b.pending==1?"":"s")+' of this book are ingested and awaiting '+
-       'review, so they were not searched.'
+       (b.pending==1?" of this book is":"s of this book are")+
+       ' ingested and awaiting review, so '+
+       (b.pending==1?"it was":"they were")+' not searched.'+
+       '<div class="how">To decide them now:<code>python3 lughat.py '+
+       'review</code>and use the review page\'s filter.</div>'
      : 'No passage in the approved text matches this root.')+'</div>';
    continue;}
   for(const x of b.hits)
@@ -7237,7 +7317,9 @@ function draw(){
       ? 'Nothing approved yet &mdash; '+a.pending+' passage'+
         (a.pending==1?" covering this āyah is":"s covering this āyah are")+
         ' ingested and awaiting review, so '+
-        (a.pending==1?"it is":"they are")+' not shown.'
+        (a.pending==1?"it is":"they are")+' not shown.'+
+        '<div class="how">To decide them now:<code>python3 lughat.py '+
+        'review --tafsir</code></div>'
       : (a.passages.length? 'Every source covering this āyah is switched off.'
          : 'No ingested commentary covers this āyah.'))+'</div>';
     continue;}
@@ -7368,9 +7450,13 @@ def read_root(conn, query):
 
     # ---- one card per source, EMPTY ONES INCLUDED ----------------------
     out["cards"] = []
+    # kind='lexicon' only. A tafsir is keyed by AYAH: it has no article on a
+    # root, so an empty card reading "no entry for this root" would be a
+    # statement about its contents when the truth is about its organisation
+    # -- the same mistake as al-Khasa'is, and it also listed al-Baghawi twice
+    # in the source selector, once as a card and once as a tafsir.
     for src in q(conn, "SELECT id, key, title, author, edition, attribution "
-                       "FROM sources WHERE kind IN ('lexicon','tafsir') "
-                       "ORDER BY key"):
+                       "FROM sources WHERE kind = 'lexicon' ORDER BY key"):
         # A book not keyed by root gets a SEARCH below, not a card here.  An
         # empty card would say "no entry for this root", which reads as a
         # statement about the book's contents when it is a statement about
@@ -7577,6 +7663,7 @@ USAGE = """lughat -- a local Qur'anic lexicography tool (offline, stdlib only)
                                   load a lexicon, ALL at verified = 0
                                   lexicons: maqayis, mufradat, lisan
   lughat.py review [--stats]      the approval gate, in the terminal
+  lughat.py review --root=<root>  decide one root's entries now
   lughat.py serve [--port=N]      the same gate as a local page (127.0.0.1)
   lughat.py read [--port=N]       the READING surface: approved sources only
 
