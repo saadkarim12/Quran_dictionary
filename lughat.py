@@ -5797,6 +5797,25 @@ def _t(conn):
     return "pending hidden but announced; approved served by range; stamped"
 
 
+@test("INTEGRITY", "no HTML entity is written into a text node")
+def _t(conn):
+    """textContent does not decode entities, so `&middot;` set that way
+    reaches the reader as five literal characters. It did, in the review
+    footer, and no API test could see it -- the payload was correct and the
+    page was wrong."""
+    bad = []
+    for page in ("REVIEW_HTML", "READ_HTML"):
+        html = globals()[page]
+        for m in re.finditer(r"textContent\s*=([^;]*);", html, re.S):
+            if "&" in m.group(1) and ";" in m.group(1).replace("\\;", ""):
+                if re.search(r"&[a-zA-Z]+;|&#\d+;", m.group(1)):
+                    bad.append((page, " ".join(m.group(1).split())[:60]))
+    ck(not bad, "an HTML entity is assigned to textContent: %s" % bad)
+    return "%d text-node assignments, none carrying an entity" % sum(
+        len(re.findall(r"textContent\s*=", globals()[p]))
+        for p in ("REVIEW_HTML", "READ_HTML"))
+
+
 @test("INTEGRITY", "the guard is dropped by a callback, never by None")
 def _t(conn):
     """set_authorizer(None) removes the authorizer on Python 3.11+ and does
@@ -6617,7 +6636,7 @@ function draw(){
     '<div class="txt ar">'+e.lines.map(l=>"<p>"+esc(l)+"</p>").join("")+
     '</div></div>';
   document.getElementById("hint").textContent=
-    (q.length-i)+" in this batch &middot; "+pending+" pending";
+    (q.length-i)+" in this batch \u00b7 "+pending+" pending";
 }
 async function decide(d){
   if(i>=q.length||busy)return;const e=q[i];busy=true;
