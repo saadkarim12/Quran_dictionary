@@ -529,6 +529,53 @@ it cannot see.
 And when a letter has no chapter, the tool says the gap belongs to *this
 digitisation*, not to Ibn Jinnī, who treated all 29.
 
+## Synonyms and opposites: quoted, never computed
+
+**Synonyms.** al-ʿAskarī heads every article `الفرق بين X و Y`, so the pair is
+his own data, read off his title. What the tool reports is that he *wrote a
+chapter separating those two words* — not that they are synonyms, which is his
+judgement and not a fact in the letters. A root matches when one of the
+heading's terms contains its radicals by the same written-down rule (and with
+the same stated costs) as the `mentions` search. He is keyed by a **pair**,
+so like al-Khaṣāʾiṣ he gets no root card.
+
+**Opposites.** There is no dictionary of Arabic antonyms loaded here, and an
+opposite the tool worked out itself would be a fabrication like any other. So
+it **refuses** — and then shows the sentences where a lexicographer states an
+opposition in his own words (`ضد`, `نقيض`, `خلاف`, `عكس`), whole and cited.
+Ibn Fāris: *يدل على خلاف الاضطراب والحركة* (3/88). Ibn Manẓūr: *السكون ضد
+الحركة* (13/211). Reading that as "the antonym is حركة" is the reader's
+inference on the scholar's sentence, not the program's on the reader's behalf
+— and no field of the payload names the opposite, because naming it would mean
+parsing what a lexicographer meant.
+
+The JK Lisān carries **no sentence punctuation at all**, so "the sentence" is
+the whole 8,000-character article. Where there is nothing to split on, a
+window is taken around the matched word — still one contiguous run of the
+source's own characters, marked with an ellipsis so it is visibly an excerpt.
+Taking those offsets from a *different* string than the match was found in
+turned `السكون ضد الحركة` into `ضد لحركة`: a word of Ibn Manẓūr's corrupted by
+one character, in a card carrying his name. Trap 8 again.
+
+## Urdu beside the Arabic
+
+A translation shown next to a scholar's words is where generated prose would
+be least visible, so **the tool refuses to translate** and installs a
+published translator's own lines instead. Eight are installable and **none by
+default**: these translators belong to different schools, and choosing one
+silently is a judgement this program has no business making.
+
+These rows are **not gated**, and the distinction matters. `entries` and
+`tafsir` are reviewed because their key is *derived* — a parser decided which
+root, which āyah — and a parser can be wrong in a way that looks perfectly
+sourced. A translation file states `sura|aya|text`: the parser splits on a
+pipe and infers nothing, so these rows sit with `words` and `segments`. What
+is checked instead is the **numbering**: the file's āyah set must equal the
+corpus's 6,236 exactly, or the whole file is refused. Some editions count the
+basmala as an āyah, and a single offset would put one verse's words under
+another — invisible, because every line would still look like a translation
+of something.
+
 ## Tafsir: the anchor is the product, not the text
 
 A commentary is keyed by **āyah**, and no digitisation carries a
@@ -702,10 +749,11 @@ Single file, stdlib only, offline after `setup`.
     lughat.py akbar <root>          the six permutations, per Ibn Jinnī
     lughat.py letter <root>         Ibn Jinnī on the root's letters
     lughat.py mentions <root>       search the books not keyed by root
+    lughat.py translation [--add=K] a translation beside the Arabic
     lughat.py tafsir <sura:aya>     approved commentary on an ayah
     lughat.py ingest <source> --from PATH
                                     maqayis | mufradat | lisan | sirr |
-                                    khasais | baghawi
+                                    khasais | furuq | baghawi
     lughat.py serve [--port=N]      the approval gate as a local page
     lughat.py review [--stats]      the approval gate
     lughat.py review --root=<root>  approve one root's entries now
@@ -742,6 +790,11 @@ attestation* and shown with the corpus's grammatical tag, per trap 4.
   <https://github.com/OpenITI>
 - Ibn Jinnī, *Sirr Ṣināʿat al-Iʿrāb* and *al-Khaṣāʾiṣ*. OpenITI,
   CC BY-NC-SA. <https://github.com/OpenITI>
+- Abū Hilāl al-ʿAskarī, *al-Furūq al-Lughawiyya*, ed. Muḥammad Ibrāhīm
+  Salīm (Cairo: Dār al-ʿIlm wa-l-Thaqāfa). Digital text: OpenITI,
+  CC BY-NC-SA. <https://github.com/OpenITI>
+- Qurʾān translations from Tanzil.net, non-commercial use only; copyright
+  remains with each translator or publisher. <https://tanzil.net>
 - al-Baghawī, *Maʿālim al-Tanzīl fī Tafsīr al-Qurʾān*, ed. al-Nimr,
   Ḍamīriyya and al-Ḥarsh (Dār Ṭayba, 1417/1997), 8 vols. Digital text:
   OpenITI, CC BY-NC-SA. <https://github.com/OpenITI>

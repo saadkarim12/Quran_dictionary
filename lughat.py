@@ -1879,6 +1879,11 @@ SIRR_ATTRIBUTION = (
     "Ibn Jinni, Sirr Sina'at al-I'rab. Digital text: OpenITI, CC BY-NC-SA. "
     "https://github.com/OpenITI")
 
+FURUQ_ATTRIBUTION = (
+    "Abu Hilal al-'Askari, al-Furuq al-Lughawiyya, ed. Muhammad Ibrahim "
+    "Salim (Cairo: Dar al-'Ilm wa-l-Thaqafa). Digital text: OpenITI, "
+    "CC BY-NC-SA. https://github.com/OpenITI")
+
 KHASAIS_ATTRIBUTION = (
     "Ibn Jinni, al-Khasa'is. Digital text: OpenITI, CC BY-NC-SA. "
     "https://github.com/OpenITI")
@@ -1987,6 +1992,36 @@ def detect_lisan(lines, i):
     return ("__SECTION__", None, 1)
 
 
+FARQ_PREFIX = "الفرق بين"
+
+
+def heading_farq(head):
+    """al-'Askari heads every article `الفرق بين X و Y`.
+
+    The pair is DATA -- the author put both words in his own title -- so it
+    is read off the heading rather than guessed from the article. What is
+    NOT claimed is that X and Y are synonyms: that a difference was worth a
+    chapter is al-'Askari's judgement, and the tool reports the chapter, not
+    the judgement."""
+    head = clean_heading(head)
+    if not head.startswith(FARQ_PREFIX):
+        return None
+    rest = head[len(FARQ_PREFIX):].strip(" :،.")
+    terms = [t.strip(" :،.") for t in re.split(r"\s+و", rest) if t.strip()]
+    return terms if len(terms) >= 2 else None
+
+
+def detect_farq(lines, i, spec):
+    """A heading is `### | الفرق بين ...`. Any other level-1 marker CLOSES
+    the article in progress and opens nothing -- the same rule as a
+    [باب ...] title in Maqayis, for the same reason (trap 16)."""
+    m = _HDR_RE.match(lines[i])
+    if not m:
+        return None
+    return ((m.group(1).strip(), "__NOROOT__", 1)
+            if heading_farq(m.group(1)) else ("__SECTION__", None, 1))
+
+
 # Everything a lexicon needs to be ingested.  Adding one is data, not code.
 LEXICONS = {
     "maqayis": {
@@ -2058,6 +2093,25 @@ LEXICONS = {
         "keyed_by": "letter",       # NOT by root: this book is about letters
         "ordered_by": "first",
         "order_depth": 0,           # the letter order is the book's own
+    },
+    "furuq": {
+        "title": "al-Furuq al-Lughawiyya",
+        "author": "Abu Hilal al-'Askari (d. c. 395 AH)",
+        "edition": "ed. Muhammad Ibrahim Salim, Dar al-'Ilm wa-l-Thaqafa, "
+                   "Cairo (OpenITI, Shamela 0010414)",
+        "licence": "CC BY-NC-SA",
+        "licence_note": "OpenITI digital text; non-commercial, share-alike, "
+                        "attribution required. Personal study use.",
+        "url": "https://github.com/OpenITI",
+        "distributable": True,
+        "attribution": FURUQ_ATTRIBUTION,
+        "heading": None,
+        "detect": detect_farq,
+        # Keyed by a PAIR OF WORDS, not by a root: there is no root to look
+        # up, so it is searched like al-Khasa'is and gets no root card.
+        "keyed_by": "pair",
+        "ordered_by": "first",
+        "order_depth": 0,
     },
     "khasais": {
         "title": "al-Khasa'is",
@@ -2172,10 +2226,11 @@ def parse_lexicon(text, corpus_roots, spec):
                 continue
             if cur:
                 yield cur
-            if spec.get("keyed_by") in ("letter", "chapter"):
-                # Not root-keyed. Ibn Jinni's Sirr is about the LETTERS and
-                # al-Khasa'is is about topics; inventing a root for either
-                # would be filing text under something the book never said.
+            if not root_keyed(spec.get("key", "")):
+                # Not root-keyed. Ibn Jinni's Sirr is about the LETTERS,
+                # al-Khasa'is about topics, al-'Askari's Furuq about PAIRS of
+                # words; inventing a root for any of them would be filing
+                # text under something the book never said.
                 root, how = None, spec["keyed_by"]
             elif hr == "__NOROOT__":
                 root, how = None, "unparsed"
@@ -2338,7 +2393,7 @@ def ingest_lexicon(conn, key, path):
         cur.execute("DELETE FROM entries WHERE source_id=? AND verified=0 "
                     "AND rejected=0", (sid,))
         corpus = {r[0] for r in cur.execute("SELECT root_ar FROM roots")}
-        spec = dict(spec, _unassigned=[0])
+        spec = dict(spec, key=key, _unassigned=[0])
         # Keyed on the whole entry, not the headword. Headwords repeat --
         # al-Raghib has two separate articles headed أب -- so skipping by
         # headword deleted the undecided sibling of every decided row and
@@ -2996,7 +3051,8 @@ def _blocks_with_pages(raw):
     return out
 
 
-KEYED_BY_WORD = {"chapter": "topic", "letter": "the letters themselves"}
+KEYED_BY_WORD = {"chapter": "topic", "letter": "the letters themselves",
+                 "pair": "pairs of words"}
 
 
 def root_keyed(source_key):
@@ -3353,6 +3409,122 @@ def tafsir_for_aya(conn, sura, aya):
                   "WHERE t.sura=? AND t.aya<=? AND "
                   "COALESCE(t.aya_to, t.aya)>=? ORDER BY s.key, t.id",
                   (sura, aya, aya)))
+
+
+# ==========================================================================
+# 8f2.  SYNONYMS AND OPPOSITES  --  quoted, never computed
+# ==========================================================================
+#
+# SYNONYMS.  al-'Askari heads every article `الفرق بين X و Y`, so the pair is
+# the author's own data, read off his title.  What the tool reports is that
+# he wrote a chapter separating those two words -- not that they ARE
+# synonyms, which is his judgement and not a fact in the letters.  A root
+# matches an article when one of the heading's terms contains its radicals by
+# the same written-down rule the `mentions` search uses, with the same stated
+# costs.
+#
+# OPPOSITES.  There is no dictionary of Arabic antonym pairs to quote here,
+# and an opposite the tool worked out for itself would be a fabrication like
+# any other.  But the lexicographers state oppositions constantly, in their
+# own words -- Ibn Manzur opens سكن with `السكون ضد الحركة` -- so the tool
+# finds the SENTENCE and shows it whole, with its citation, and names the
+# word that made it a match.  Reading `ضد الحركة` as "the antonym is حركة" is
+# the reader's inference, made on the lexicographer's sentence, not the
+# program's on the reader's behalf.
+
+REFUSAL_ANTONYM = (
+    "REFUSED. This tool does not work out opposites. No source loaded here "
+    "is a dictionary of antonyms, and an opposite it derived itself would be "
+    "a fabrication like any other. What it can do is show you the sentences "
+    "in which a lexicographer states an opposition in his own words -- the "
+    "words ضد, نقيض, خلاف, عكس -- with the page they are on.")
+
+# The four words a lexicographer uses to state an opposition. Matched as
+# whole words, with the ordinary prefixes (و ف ب ك ال) allowed in front.
+OPPOSITION_WORDS = ("ضد", "نقيض", "خلاف", "عكس")
+_OPP_RE = re.compile(r"(?:^|\s)(?:[وفبكل]*(?:ال)?)(?:%s)(?:\s|$)"
+                     % "|".join(OPPOSITION_WORDS))
+_SENTENCE_SPLIT = re.compile(r"(?<=[.؟!])\s+")
+
+
+def furuq_articles(conn, root, limit=8):
+    """al-'Askari's chapters whose heading names a word of this root."""
+    rx = root_search_re(root)
+    src = q(conn, "SELECT id, title, author, attribution FROM sources "
+                  "WHERE key='furuq'").fetchone()
+    if src is None:
+        return [], 0, 0
+    hits = []
+    for e in q(conn, "SELECT headword, vol, page, text_raw FROM v_entries "
+                     "WHERE source_id=? ORDER BY id", (src["id"],)):
+        terms = heading_farq(e["headword"] or "") or []
+        matched = [t for t in terms if rx.search(norm_alif(t))]
+        if not matched:
+            continue
+        hits.append({"heading": clean_heading(e["headword"] or ""),
+                     "terms": terms, "matched": matched,
+                     "vol": e["vol"], "page": e["page"],
+                     "lines": render_entry(e["text_raw"] or "")[:6],
+                     "title": src["title"], "author": src["author"],
+                     "attribution": src["attribution"]})
+    with unguarded(conn):
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM entries WHERE source_id=? AND verified=0 "
+            "AND rejected=0", (src["id"],)).fetchone()[0]
+    return hits[:limit], max(0, len(hits) - limit), pending
+
+
+# The JK digitisation of Lisan carries NO sentence punctuation at all, so
+# "the sentence" is the whole article -- 8,000 characters of it. Where there
+# is nothing to split on, a window is taken around the matched word instead:
+# still one contiguous run of the source's own characters, marked with an
+# ellipsis so it is visibly an excerpt and not the whole of what he said.
+OPPOSITION_WINDOW = (8, 14)          # words before, words after
+
+
+def _opposition_window(padded, m):
+    """`padded` must be the SAME string the match was found in.
+
+    It was not, once: the caller searched `" " + sent + " "` and this
+    function sliced `sent`, so every offset was one character out and
+    `السكون ضد الحركة` came back as `ضد لحركة` -- a word of the source
+    silently corrupted. Trap 8 again: two functions politely disagreeing."""
+    sent = padded.strip()
+    if len(sent) <= 240:
+        return sent
+    before, after = padded[:m.start()].split(), padded[m.end():].split()
+    lead, tail = OPPOSITION_WINDOW
+    head = " ".join(before[-lead:])
+    rest = " ".join(after[:tail])
+    out = " ".join(x for x in (head, m.group(0).strip(), rest) if x)
+    return ("\u2026 " if len(before) > lead else "") + out + (
+        " \u2026" if len(after) > tail else "")
+
+
+def opposition_statements(conn, root, limit=6):
+    """Sentences in the APPROVED lexicons where an opposition is stated.
+
+    The sentence is quoted whole and cited. Which word is the opposite is
+    left to the reader: naming it would mean parsing the sentence, and a
+    parser that decides what a lexicographer meant is the inference this
+    program exists to refuse."""
+    out = []
+    for e in q(conn, "SELECT e.text_raw, e.vol, e.page, s.title, s.author, "
+                     "s.attribution FROM v_entries e JOIN sources s "
+                     "ON s.id = e.source_id WHERE e.root_ar = ? ORDER BY e.id",
+               ("".join(canonical_root(root)),)):
+        for para in render_entry(e["text_raw"] or ""):
+            for sent in _SENTENCE_SPLIT.split(para):
+                padded = " " + sent + " "
+                m = _OPP_RE.search(padded)
+                if not m:
+                    continue
+                out.append({"text": _opposition_window(padded, m),
+                            "word": m.group(0).strip(),
+                            "title": e["title"], "author": e["author"],
+                            "vol": e["vol"], "page": e["page"],
+                            "attribution": e["attribution"]})
+    return out[:limit], max(0, len(out) - limit)
 
 
 # ==========================================================================
@@ -6026,6 +6198,63 @@ _TAFSIR_FIXTURE = "\n".join([
 ])
 
 
+@test("HONESTY", "an opposite is quoted from a lexicographer, never derived")
+def _t(conn):
+    """No source loaded here is a dictionary of antonyms, so the tool states
+    that and shows the SENTENCE in which a lexicographer states an opposition
+    -- `يدل على خلاف الاضطراب والحركة` -- with its page. Which word is the
+    opposite is the reader's inference on the scholar's sentence, not the
+    program's on the reader's behalf."""
+    ck(REFUSAL_ANTONYM.startswith("REFUSED"),
+       "the tool does not refuse to derive an opposite")
+    # An excerpt must be one contiguous run of the source's own characters.
+    # Slicing with offsets taken from a DIFFERENT string turned
+    # `السكون ضد الحركة` into `ضد لحركة` -- a word of Ibn Manzur's, corrupted
+    # by one character, in a card carrying his name.
+    long_sent = ("سكن السكون ضد الحركة " + "و" * 0 +
+                 " ".join("كلمة%d" % i for i in range(60)))
+    padded = " " + long_sent + " "
+    m = _OPP_RE.search(padded)
+    ck(m is not None, "the opposition rule does not match ضد")
+    got = _opposition_window(padded, m)
+    core = got.strip("\u2026 ").strip()
+    ck(core in long_sent, "the excerpt is not a run of the source: %r" % core)
+    ck("ضد الحركة" in core, "the excerpt dropped a letter: %r" % core[:60])
+    ck(got != long_sent and got.endswith("\u2026"),
+       "a long article was quoted whole instead of excerpted")
+    data = read_root(conn, "سكن")
+    opp = data["opposites"]
+    ck(opp["refusal"] is REFUSAL_ANTONYM or
+       opp["refusal"] == REFUSAL_ANTONYM, "the page drops the refusal")
+    for hit in opp["hits"]:
+        # every hit is a substring of the source's OWN rendered text
+        with unguarded(conn):
+            rows = conn.execute(
+                "SELECT text_raw FROM entries WHERE root_ar='سكن' AND "
+                "verified=1").fetchall()
+        blob = " ".join(" ".join(render_entry(r[0] or "")) for r in rows)
+        ck(hit["text"] in blob,
+           "an 'opposition' sentence is not in any approved article: %r"
+           % hit["text"][:60])
+        ck(hit["word"] in OPPOSITION_WORDS or
+           any(w in hit["word"] for w in OPPOSITION_WORDS),
+           "matched on %r, which is not an opposition word" % hit["word"])
+        ck(hit["vol"] and hit["page"], "an opposition sentence is uncited")
+        # and no field names the opposite: that would be the tool parsing
+        # what a lexicographer meant
+        ck(set(hit) == {"text", "word", "title", "author", "vol", "page",
+                        "attribution"},
+           "the payload grew a field beyond the quoted sentence: %s"
+           % sorted(hit))
+    # al-'Askari is reported as a chapter he WROTE, not as a synonym claim
+    blob = json.dumps(data["furuq"], ensure_ascii=False)
+    for claim in ("synonym", "means the same", "equivalent"):
+        ck(claim not in blob.lower(),
+           "the payload asserts synonymy: %r" % claim)
+    return "%d opposition sentences, each quoted whole and cited" % len(
+        opp["hits"])
+
+
 @test("HONESTY", "a translation is a translator's, and never this tool's")
 def _t(conn):
     """The one place generated prose would be least visible is beside a
@@ -6701,11 +6930,20 @@ def _t(conn):
     ck(set(keys) == want, "cards %s but root-keyed lexicons %s"
        % (sorted(keys), sorted(want)))
     ck(len(keys) == len(set(keys)), "a source is carded twice: %s" % keys)
-    searched = {b["key"] for b in data["passages"]}
+    # al-'Askari is not root-keyed and is not searched by string either: his
+    # headings name the pair, so he has a section of his own. Every book is
+    # still accounted for in exactly one place.
+    searched = {b["key"] for b in data["passages"]} | (
+        {"furuq"} if "furuq" in have else set())
     ck(searched == have - want, "unkeyed books %s but searched %s"
        % (sorted(have - want), sorted(searched)))
+    ck("furuq" not in {b["key"] for b in data["passages"]},
+       "al-'Askari is being string-searched as well as paired")
+    ck("hits" in data["furuq"] and data["opposites"]["refusal"],
+       "the synonyms/opposites section is missing from the payload")
     shown = keys + [b["key"] for b in data["passages"]] + \
-        [t["key"] for t in data["tafsir_sources"]]
+        [t["key"] for t in data["tafsir_sources"]] + \
+        [t["key"] for t in data["translations"]]
     ck(len(shown) == len(set(shown)),
        "the source selector lists a source twice: %s" % shown)
     ck(set(t["key"] for t in data["tafsir_sources"]) == tafsirs,
@@ -7502,6 +7740,11 @@ h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.11em;
 .ayahead{display:flex;gap:.7rem;align-items:baseline;margin:1rem 0 .4rem}
 .ayahead b{color:var(--verd);font-variant-numeric:tabular-nums}
 .ayahead .ar{font-size:1.15rem;color:var(--ink)}
+details.fold{margin:1.6rem 0 .6rem;border-top:1px solid var(--rule);padding-top:.7rem}
+details.fold>summary{cursor:pointer;font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:var(--faint);font-weight:600;list-style:none}
+details.fold>summary::-webkit-details-marker{display:none}
+details.fold>summary::before{content:'\25b8  ';color:var(--verd)}
+details.fold[open]>summary::before{content:'\25be  '}
 h3{font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;
  color:var(--mut);margin:1.1rem 0 .45rem;font-weight:600}
 table{width:100%;border-collapse:collapse;font-size:.9rem}
@@ -7574,7 +7817,7 @@ function draw(){
  if(r.bab_evidence) h+='<div class="cls" style="margin:-.5rem 0 1rem">'+
    'bab evidence: <span class="ar">'+esc(r.bab_evidence)+'</span></div>';
 
- h+='<h2>Sources</h2><div class="srcsel">';
+ h+='<h2>Dictionaries</h2><div class="srcsel">';
  for(const c of r.cards.concat(r.tafsir_sources||[], r.translations||[]))
   h+='<label><input type="checkbox" data-k="'+esc(c.key)+
   '"'+(HIDDEN.has(c.key)?"":" checked")+'> '+esc(c.title)+'</label>';
@@ -7603,7 +7846,48 @@ function draw(){
     '<div class="attrib">'+esc(c.attribution)+'</div></div>';}
  }
 
- h+='<h2>The letters &mdash; Ibn Jinnī</h2>';
+ h+='<h2>Synonyms and opposites</h2>';
+ h+='<h3>What separates two near-synonyms &mdash; al-‘Askarī</h3>';
+ if(!r.furuq.hits.length){
+  h+='<div class="card empty">'+(r.furuq.pending
+    ? 'Nothing approved yet &mdash; '+r.furuq.pending+' of al-‘Askarī’s '+
+      'chapters are ingested and awaiting review, so they were not '+
+      'searched.<div class="how">To decide them now:<code>python3 '+
+      'lughat.py review</code></div>'
+    : 'No chapter of al-‘Askarī names a word of this root.')+'</div>';}
+ else{
+  h+='<div class="cls" style="margin:0 0 .6rem">'+esc(r.furuq.rule)+'</div>';
+  for(const x of r.furuq.hits)
+   h+='<div class="card"><div class="ct"><b>'+esc(x.title)+'</b>'+
+    '<span class="who">'+esc(x.author)+'</span>'+
+    '<span class="cite">vol '+esc(x.vol)+' p. '+esc(x.page)+'</span></div>'+
+    '<div class="ar" style="font-size:1.1rem;margin-bottom:.4rem">'+
+    esc(x.heading)+'</div>'+
+    '<div class="txt ar">'+x.lines.map(l=>"<p>"+esc(l)+"</p>").join("")+
+    '</div><div class="attrib">'+esc(x.attribution)+'</div></div>';
+  if(r.furuq.more) h+='<div class="cls">'+r.furuq.more+' further chapter'+
+   (r.furuq.more==1?"":"s")+' matched and were not shown.</div>';
+ }
+
+ h+='<h3>Where a lexicographer states an opposition</h3>';
+ h+='<div class="card empty ref">'+esc(r.opposites.refusal)+'</div>';
+ if(!r.opposites.hits.length)
+  h+='<div class="card empty">No approved article on this root contains '+
+   esc(r.opposites.words.join(", "))+'.</div>';
+ for(const x of r.opposites.hits)
+  h+='<div class="card"><div class="ct"><b>'+esc(x.title)+'</b>'+
+   '<span class="who">'+esc(x.author)+'</span>'+
+   '<span class="pill ok">'+esc(x.word)+'</span>'+
+   '<span class="cite">vol '+esc(x.vol)+' p. '+esc(x.page)+'</span></div>'+
+   '<div class="txt ar"><p>'+esc(x.text)+'</p></div>'+
+   '<div class="attrib">'+esc(x.attribution)+'</div></div>';
+ if(r.opposites.more) h+='<div class="cls">'+r.opposites.more+
+  ' further sentence'+(r.opposites.more==1?"":"s")+' matched.</div>';
+
+// Ibn Jinni: the letters of the root, then its permutations,
+ // then the books that only mention it.
+ h+='<h2>Ibn Jinnī</h2>';
+ h+='<h3>The letters of the root</h3>';
  for(const L of r.letter_cards){
   if(!L.entries.length){
    h+='<div class="card empty"><div class="ct"><b class="ar">'+esc(L.letter)+
@@ -7617,27 +7901,9 @@ function draw(){
     '<div class="attrib">'+esc(e.attribution)+'</div></div>';
  }
 
- h+='<h2>Ishtiqāq ṣaghīr</h2>';
- for(const sec of r.sarf){
-  h+='<h3>'+esc(sec.title)+(sec.hypothetical
-    ? ' <span class="pill no">hypothetical &mdash; the bab is not sourced</span>'
-    : '')+'</h3>';
-  if(sec.condition) h+='<div class="cls">'+esc(sec.condition)+'</div>';
-  h+='<div class="grid">';
-  for(const f of sec.forms){
-   if(f.refused){h+='<div class="slot ref"><div class="k">'+esc(f.slot)+
-    '</div><div class="why">'+esc(f.refused)+'</div></div>';continue;}
-   h+='<div class="slot'+(f.verified?"":" unv")+'"><div class="k">'+esc(f.slot)+
-    (f.verified?"":" &mdash; unverified")+'</div><div class="v ar">'+
-    esc(f.text)+'</div>'+
-    (f.caveats||[]).map(c=>'<div class="why">! '+esc(c)+'</div>').join("")+
-    (f.notes||[]).map(c=>'<div class="note">? '+esc(c)+'</div>').join("")+
-    att(f)+'</div>';}
-  h+='</div>';
- }
-
- if(r.akbar&&r.akbar.length){
-  h+='<h2>Ishtiqāq akbar &mdash; the six permutations</h2><div class="grid">';
+ if(r.tafsir&&r.tafsir.length){
+  if(r.akbar&&r.akbar.length){
+  h+='<h3>Ishtiqāq akbar &mdash; the six permutations</h3><div class="grid">';
   for(const p of r.akbar)
    h+='<div class="slot"><div class="k">'+(p.self?"this root":"permutation")+
     '</div><div class="v ar">'+esc(p.root)+'</div><div class="note">'+
@@ -7646,7 +7912,7 @@ function draw(){
   h+='</div><div class="card empty ref">'+esc(r.akbar_refusal)+'</div>';}
 
  for(const b of r.passages||[]){
-  h+='<h2>'+esc(b.title)+' &mdash; search, not an article</h2>';
+  h+='<h3>'+esc(b.title)+' &mdash; search, not an article</h3>';
   h+='<div class="card empty ref">'+esc(b.refusal)+'</div>';
   h+='<div class="cls" style="margin:.5rem 0 .7rem">'+esc(b.rule)+'</div>';
   if(!b.hits.length){
@@ -7669,8 +7935,28 @@ function draw(){
    (b.more==1?"":"s")+' matched and were not shown.</div>';
  }
 
- if(r.tafsir&&r.tafsir.length){
-  h+='<h2>Tafsir &mdash; on the āyāt where this root occurs</h2>';
+ h+='<details class="fold"><summary>Ishtiqāq ṣaghīr &mdash; the derived forms, with their refusals</summary>';
+ for(const sec of r.sarf){
+  h+='<h3>'+esc(sec.title)+(sec.hypothetical
+    ? ' <span class="pill no">hypothetical &mdash; the bab is not sourced</span>'
+    : '')+'</h3>';
+  if(sec.condition) h+='<div class="cls">'+esc(sec.condition)+'</div>';
+  h+='<div class="grid">';
+  for(const f of sec.forms){
+   if(f.refused){h+='<div class="slot ref"><div class="k">'+esc(f.slot)+
+    '</div><div class="why">'+esc(f.refused)+'</div></div>';continue;}
+   h+='<div class="slot'+(f.verified?"":" unv")+'"><div class="k">'+esc(f.slot)+
+    (f.verified?"":" &mdash; unverified")+'</div><div class="v ar">'+
+    esc(f.text)+'</div>'+
+    (f.caveats||[]).map(c=>'<div class="why">! '+esc(c)+'</div>').join("")+
+    (f.notes||[]).map(c=>'<div class="note">? '+esc(c)+'</div>').join("")+
+    att(f)+'</div>';}
+  h+='</div>';
+ }
+
+ h+='</details>';
+ h+='<h2>Tafsir</h2><div class="cls" style="margin:-.3rem 0 .6rem">'+
+  'on the āyāt where this root occurs</div>';
   for(const a of r.tafsir){
    h+='<div class="ayahead"><b>'+esc(a.ref)+'</b><span class="ar">'+
     esc(a.word)+'</span></div>';
@@ -7868,8 +8154,11 @@ def read_root(conn, query):
     out["letter_cards"] = letter_cards
 
     # books organised by topic or by letter: retrieval by string, labelled
+    # al-'Askari is not root-keyed either, but he is not searched like the
+    # others: his headings name the pair outright, so he gets his own section.
     out["passages"] = []
-    for key in sorted(k for k in LEXICONS if not root_keyed(k)):
+    for key in sorted(k for k in LEXICONS
+                      if not root_keyed(k) and k != "furuq"):
         src = q(conn, "SELECT title, author, attribution FROM sources "
                       "WHERE key=?", (key,)).fetchone()
         if src is None:
@@ -7930,6 +8219,15 @@ def read_root(conn, query):
         {"key": r["key"], "title": r["title"]}
         for r in q(conn, "SELECT key, title FROM sources WHERE kind='tafsir' "
                          "ORDER BY key")]
+
+    # ---- synonyms and opposites, both quoted ---------------------------
+    hits, more, pending = furuq_articles(conn, root)
+    out["furuq"] = {"hits": hits, "more": more, "pending": pending,
+                    "rule": SEARCH_IS_A_STRING_SEARCH}
+    opp, opp_more = opposition_statements(conn, root)
+    out["opposites"] = {"hits": opp, "more": opp_more,
+                        "refusal": REFUSAL_ANTONYM,
+                        "words": list(OPPOSITION_WORDS)}
 
     out["akbar_refusal"] = REFUSAL_AKBAR_SENSE
     return out

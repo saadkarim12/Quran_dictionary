@@ -16,8 +16,8 @@ phase at all, and one was never addressed. Corrected here.
 | 1b | Ishtiqāq from Ibn Jinnī — *al-Khaṣāʾiṣ*, ishtiqāq akbar | **Done** — `lughat.py akbar`; `lughat.py mentions` searches the books not keyed by root, refusing first and stating the rule. Waiting only on approval |
 | 1c | Ishtiqāq ṣaghīr table | **Done** |
 | 2 | How the word forms from the letters | **Half.** Ṣarf mechanics done; the word-centred view and the sourced aṣl are pending |
-| 3 | Synonyms | Phase 7, with the furūq |
-| 3 | **Opposites (aḍdād)** | **Was never addressed.** Now Phase 7, and needs a source |
+| 3 | Synonyms | **Done** — al-ʿAskarī's *Furūq*, 833 chapters, matched by the pair he names in his own heading |
+| 3 | **Opposites (aḍdād)** | **Done as far as it honestly can be** — the tool refuses to derive an opposite and quotes the sentences where a lexicographer states one (ضد / نقيض / خلاف / عكس), cited |
 | 4 | Dictionary + tafsir cards, exact text, selectable | **Done** — `lughat.py read` serves selectable cards, empty ones included; al-Baghawī anchored to 5,463 āyāt and shown on the root's own verses. More tafāsīr are more of the same work |
 | 5 | Same root elsewhere in the Qurʾān | **Done** |
 | 5 | Same root in ḥadīth | Phase 9 |
