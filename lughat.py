@@ -4188,6 +4188,13 @@ def cmd_review(conn, args):
     sql = ("SELECT e.*, s.title FROM entries e JOIN sources s "
            "ON s.id = e.source_id WHERE e.verified = 0 AND e.rejected = 0")
     params = []
+    if not only and "--all" not in args:
+        # `unmatched` means the heading maps to no root the Qur'an has. The
+        # reading page can only be entered by a root the CORPUS knows, so
+        # approving one of these changes nothing a reader can ever see. They
+        # are still counted in --stats, and still reachable with
+        # --extraction=unmatched; they are just not the default work.
+        sql += " AND e.extraction IS NOT 'unmatched'"
     if only:
         sql += " AND e.extraction = ?"
         params.append(only)
@@ -4216,6 +4223,19 @@ def cmd_review(conn, args):
             why.append("text containing %s" % contains)
         _w("Nothing pending%s." % (" for " + " and ".join(why) if why else ""))
         return
+    with unguarded(conn):
+        hidden = conn.execute(
+            "SELECT COUNT(*) FROM entries WHERE verified=0 AND rejected=0 "
+            "AND extraction='unmatched'").fetchone()[0]
+    if hidden and not only and "--all" not in args:
+        for line in _wrap(
+                "%d further entries are pending whose heading maps to no root "
+                "the Qur'an has. The reading page can only be entered by a "
+                "root the corpus knows, so approving them changes nothing a "
+                "reader can see, and they are not offered here. Use "
+                "--extraction=unmatched to work them anyway." % hidden, 72):
+            _w(line)
+        _w("")
     _w("%d entries pending. y=approve  n=skip  q=quit" % len(pending))
     approved = 0
     for row in pending:
@@ -5691,6 +5711,37 @@ def _t(conn):
        "the renderer invented punctuation the book does not have: %r" % got)
     ck("خلاف الاضطراب والحركة" in " ".join(shown), "the text itself was lost")
     return "stored verbatim (%d chars), rendered clean" % len(raw)
+
+
+@test("HONESTY", "the queue offers work that can change what a reader sees")
+def _t(conn):
+    """An `unmatched` entry's heading maps to no root the Qur'an has, and the
+    reading page can only be entered by a root the CORPUS knows -- so
+    approving one changes nothing anybody can see. Leading the queue with
+    11,043 of them is how a gate becomes unfinishable. They are counted in
+    --stats and reachable with --extraction=unmatched; they are not the
+    default work, and the reviewer is told the number and the reason."""
+    with unguarded(conn):
+        row = conn.execute(
+            "SELECT root_ar FROM entries WHERE extraction='unmatched' AND "
+            "root_ar IS NOT NULL LIMIT 1").fetchone()
+    if row is None:
+        raise Skip("no unmatched entries ingested")
+    # the premise: such a root really is unreachable from the reader
+    ck(read_root(conn, row[0]).get("absent"),
+       "%s is reachable after all; the queue is hiding useful work" % row[0])
+    default = {r["extraction"] for r in _queue_rows(conn, limit=400)}
+    ck("unmatched" not in default,
+       "the default queue leads with work no reader can see")
+    asked = _queue_rows(conn, extraction="unmatched", limit=5)
+    ck(asked and all(r["extraction"] == "unmatched" for r in asked),
+       "asking for unmatched does not return them")
+    # and the count is not swallowed
+    src = strip_comments(own_source())
+    ck("further entries are pending whose heading maps to no root" in src,
+       "the reviewer is not told what was left out, or why")
+    return "default queue holds %s; unmatched offered only on request" % (
+        ", ".join(sorted(default)) or "nothing")
 
 
 @test("HONESTY", "a row waved through in bulk says so, forever")
@@ -7388,11 +7439,11 @@ kbd{font:inherit;font-size:.74rem;opacity:.75;border:1px solid currentColor;
     <option value="khasais">Khaṣāʾiṣ (Ibn Jinnī)</option>
   </select>
   <select id="filt">
-    <option value="">every extraction</option>
+    <option value="">every reachable extraction</option>
     <option value="direct">direct only</option>
     <option value="geminate">geminate bridge</option>
     <option value="weak_final">weak-final bridge</option>
-    <option value="unmatched">unmatched</option>
+    <option value="unmatched">unmatched (no such root in the Qur’an)</option>
   </select>
 </div></header>
 <main id="main"><div class="done">loading&hellip;</div></main>
@@ -7600,6 +7651,10 @@ def _queue_rows(conn, extraction=None, limit=60, table="entries", root=None,
     if extraction:
         sql += " AND e.extraction = ?"
         params.append(extraction)
+    else:
+        # see cmd_review: an unmatched root is unreachable from the reader,
+        # so it is not the default work
+        sql += " AND e.extraction IS NOT 'unmatched'"
     if source:
         sql += " AND e.source_id = (SELECT id FROM sources WHERE key = ?)"
         params.append(source)
