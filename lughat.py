@@ -36,6 +36,7 @@ Usage:
     lughat.py root <root>           corpus occurrences of a root
     lughat.py word <word>           search the mushaf text
   lughat.py bab [<root>|--derive] the bab, read off the Qur'an's vowelling
+  lughat.py ilal --check          check the i'lal rules against the Qur'an
   lughat.py akbar <root>          the six permutations, per Ibn Jinni
   lughat.py letter <root|letter>  Ibn Jinni on the root's letters
   lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
@@ -247,6 +248,7 @@ def is_arabic(s):
 
 DAGGER_ALIF = "ٰ"
 ALIF = "ا"
+SHADDA = "ّ"
 
 # Everything removed by normalisation *except* the dagger alif, which is
 # handled first and separately because it is linguistically a letter.
@@ -267,8 +269,21 @@ _FOLD = {
 }
 
 
+MADDAH = "ٓ"          # U+0653, a prosodic lengthening mark
+ALIF_MAKSURA = "ى"
+
+
+def _fold_maksura_dagger(s):
+    """A dagger alif sitting ON an alif maksura is a reading aid, not a second
+    letter: عَلَىٰ is 'alaa, spelled with the maksura as its carrier. Promoting
+    it to a full alif produced علىا, which no one types and which split رَمَىٰ
+    from every other spelling of the same word."""
+    return s.replace(ALIF_MAKSURA + DAGGER_ALIF, ALIF_MAKSURA)
+
+
 def _normalise(s, dagger):
     """dagger='alif' promotes U+0670 to a full alif; dagger='drop' deletes it."""
+    s = _fold_maksura_dagger(s)
     if dagger == "alif":
         s = s.replace(DAGGER_ALIF, ALIF)
     elif dagger == "drop":
@@ -359,7 +374,21 @@ def _canon_marks(s):
     a template does (يَنزِلُ / يَنْزِلُ, أَنزَلَ / أَنْزَلَ) and its absence marks
     no vowel, so it carries no contrast that could distinguish two words --
     while a real vowel is untouched and still does."""
+    # The maddah goes too. It marks prosodic lengthening before a following
+    # hamza -- دَعَآ and دَعَا are one word written twice -- and carries no
+    # contrast that could separate two words.
+    s = _fold_maksura_dagger(s).replace(MADDAH, "")
     return unicodedata.normalize("NFC", s).replace(SUKUN, "")
+
+
+ALIF_OTIOSE_MARK = "۟"      # U+06DF, the small high rounded zero
+
+
+def _drop_otiose_alif(s):
+    """يَعْفُوا۟ ends in an alif the mushaf marks as SILENT. Stripping the mark
+    first (it is an annotation) left the alif behind and split the word from
+    every spelling without it."""
+    return re.sub(ALIF + ALIF_OTIOSE_MARK, "", s)
 
 
 def stem_core(s):
@@ -369,14 +398,41 @@ def stem_core(s):
     compare equal.  Removes only: Uthmani annotation marks, tatweel, the
     dagger alif's *encoding* (promoted to a real alif, since it IS an alif),
     and the final iʿrab / tanwin, which is inflection rather than the stem."""
+    # BEFORE any dagger promotion: a dagger on an alif maksura is a reading
+    # aid on its carrier, not a second letter. And before annotations are
+    # stripped, because the otiose alif is identified BY its annotation.
+    s = _drop_otiose_alif(_fold_maksura_dagger(s))
     s = "".join(ch for ch in s if ch not in _ANNOTATION)
     s = strip_wasl(s)                 # BEFORE folding: see strip_wasl
     s = s.replace(WASLA, ALIF)
     s = s.replace(DAGGER_ALIF, ALIF)  # the dagger alif IS an alif
     s = strip_tanwin_alif(s)
+    # A word never begins with a shadda on its own; in the Uthmani text a
+    # leading one is assimilation with the PRECEDING word (فَمَّاتَ), so it is
+    # not part of this word's stem.
+    while len(s) > 1 and s[1] == SHADDA:
+        s = s[0] + s[2:]
+    # Canonical mark ORDER first, then strip the final i'rab. Doing it the
+    # other way round made the result depend on how the marks were typed:
+    # مَدَّ written د+shadda+fatha lost its fatha (trailing) while the same
+    # word written د+fatha+shadda kept it (the shadda was trailing), so one
+    # word compared as two -- the very trap NFC was added to close.
+    s = _canon_marks(strip_tanwin_alif(s))
     while s and (s[-1] in _TANWIN or s[-1] in _SHORT):
         s = s[:-1]
-    return _canon_marks(strip_tanwin_alif(s))
+    # a final shadda is phonemic and stays, but the i'rab vowel NFC has just
+    # moved in front of it is still inflection
+    if s.endswith(SHADDA) and len(s) > 1 and s[-2] in _SHORT | _TANWIN:
+        s = s[:-2] + SHADDA
+    # Word-final alif maksura IS a final alif -- تَلَا and تَلَى are one word
+    # written two ways, and the mushaf uses whichever the context calls for.
+    if s.endswith(ALIF_MAKSURA):
+        # After a fatha the maksura spells a final ALIF (تَلَى = تَلَا).
+        # After a kasra it spells a final YAA written defectively
+        # (يَقْضِى = يَقْضِي). Folding both to alif merged يَرْمِي with يَرْمَا.
+        prev = s[-2] if len(s) > 1 else ""
+        s = s[:-1] + (YAA if prev == KASRA else ALIF)
+    return s
 
 
 def skeleton(s):
@@ -758,6 +814,13 @@ REFUSAL_MASDAR_MUJARRAD = (
     "the mazid fih forms below ARE qiyasi and are derived.)"
 )
 
+REFUSAL_ILAL_UNDECIDED = (
+    "REFUSED. The waaw of a mithal root drops before a kasra (وَعَدَ يَعِدُ) "
+    "and survives before a fatha (وَجِلَ يَوْجَلُ) -- except where it does "
+    "not (وَضَعَ يَضَعُ, وَهَبَ يَهَبُ). Nothing in the letters or the bab "
+    "decides which, so this form is not derivable here. Quote it."
+)
+
 REFUSAL_BAB_UNKNOWN = (
     "REFUSED. This derivation depends on the bab, and the bab of a root is "
     "not derivable from its letters -- it must be read from a lexicon. "
@@ -957,9 +1020,37 @@ def generate(root, bab=None, bab_source=None):
                     "usually has one at the 'ayn or laam, so bab 3 is "
                     "unlikely here -- but that is a tendency with named "
                     "exceptions, not a rule, and this tool does not decide it")
+        ilal = ilal_verb_forms(letters, rc, b)
+        kind = rc.primary_kind()
         for slot, key in (("madi (3MS)", "madi"),
                           ("mudari' (3MS)", "mudari"),
                           ("amr (2MS)", "amr")):
+            if key in ilal and ilal[key] is None:
+                section["forms"].append(Refusal(slot, REFUSAL_ILAL_UNDECIDED))
+                continue
+            if ilal.get(key) and kind in ILAL_VALIDATED:
+                # i'lal applied, and the rules for this class reproduce the
+                # mushaf exactly -- so the STRING is trustworthy. Whether this
+                # bab is the right one is a separate doubt, carried as a note.
+                f = Form(slot, ilal[key], verified=not bab_caveats,
+                         caveats=list(bab_caveats),
+                         notes=(["i'lal applied; the rules for a %s root "
+                                 "reproduce every %s citation form the Qur'an "
+                                 "attests (%s)" % (kind, kind,
+                                                   ILAL_VALIDATED[kind])]))
+                section["forms"].append(f)
+                continue
+            if ilal.get(key):
+                f = _mk(slot, "%s", letters, rc, bab_caveats)
+                f.text = ilal[key]
+                f.caveats = list(bab_caveats) + [
+                    "i'lal applied, but the rules for a %s root reproduce "
+                    "only %s of the citation forms the Qur'an attests, so "
+                    "this string is not trustworthy" % (
+                        kind, ILAL_NOT_VALIDATED.get(kind, "some"))]
+                f.verified = False
+                section["forms"].append(f)
+                continue
             section["forms"].append(
                 _mk(slot, spec[key], letters, rc, bab_caveats))
 
@@ -2320,6 +2411,268 @@ def ishtiqaq_akbar(conn, root):
 
 
 # ==========================================================================
+# 8c2.  I'LAL AND IDGHAM  --  refusal R2, discharged where the Qur'an proves it
+# ==========================================================================
+#
+# Naive templating on ق و ل gives the non-word قَوَلَ. The rules that turn it
+# into قَالَ are below. They are written here, in this file, so they can be
+# read -- and every one of them is checked against the Qur'an itself:
+# `lughat.py ilal --check` regenerates the citation forms of every weak root
+# the mushaf attests and compares them EXACTLY. A rule that does not reproduce
+# the Qur'an is wrong, and its forms stay UNVERIFIED.
+#
+# This does not discharge refusal R2 wholesale. It discharges it for the verb
+# citation forms of the classes below, at the measured pass rate, and for
+# nothing else.
+
+WAW, YAA = "و", "ي"
+
+
+def _vowel_letter(haraka):
+    """The long vowel a haraka lengthens to."""
+    return {DAMMA: WAW, KASRA: YAA, FATHA: ALIF}[haraka]
+
+
+def _mudari_ayn_vowel(bab):
+    return {1: DAMMA, 2: KASRA, 3: FATHA, 4: FATHA, 5: DAMMA, 6: KASRA}[bab]
+
+
+def _madi_ayn_vowel(bab):
+    return {1: FATHA, 2: FATHA, 3: FATHA, 4: KASRA, 5: DAMMA, 6: KASRA}[bab]
+
+
+def _seated(forms):
+    return {k: (seat_hamza_medial(seat_hamza(v)) if v else v)
+            for k, v in forms.items()}
+
+
+# Measured by `lughat.py ilal --check` against every weak root the Qur'an
+# attests in BOTH aspects, where one bab must reproduce both. These classes
+# reproduce the mushaf exactly, so their forms are marked verified; mithal
+# does NOT and keeps its caveat, because the waaw's fate before a fatha is not
+# determined by the bab (وَضَعَ يَضَعُ drops it, وَجِلَ يَوْجَلُ keeps it).
+ILAL_VALIDATED = {"ajwaf": "13/13", "naqis": "17/17", "mudaaf": "8/8"}
+ILAL_NOT_VALIDATED = {"mithal": "2/4"}
+
+
+def seat_hamza(text):
+    """A hamza radical is canonically ء, but Arabic WRITES it on a seat chosen
+    by the surrounding vowels: أَتَى not ءَتَى, إِنْ not ءِنْ. Only the cases
+    the citation forms need are handled -- word-initial, where the seat is
+    decided by the hamza's own haraka."""
+    if not text or text[0] != HAMZA:
+        return text
+    nxt = text[1] if len(text) > 1 else ""
+    seat = {FATHA: "أ", DAMMA: "أ", KASRA: "إ"}.get(nxt)
+    return (seat + text[1:]) if seat else text
+
+
+def seat_hamza_medial(text):
+    """A sukun-bearing hamza after a fatha sits on an alif: يَأْتِي, not
+    يَءْتِي."""
+    out = []
+    for i, ch in enumerate(text):
+        if ch == HAMZA and i and out and out[-1] == FATHA and \
+                i + 1 < len(text) and text[i + 1] == SUKUN:
+            out.append("أ")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def ilal_verb_forms(letters, rc, bab):
+    """The madi 3MS, mudari' 3MS and amr 2MS of a weak or doubled root.
+
+    Returns {slot: text} for the classes handled, or {} when the root's class
+    has no rules here -- in which case the caller keeps the raw template and
+    its UNVERIFIED banner."""
+    if bab not in ABWAB or len(letters) != 3:
+        return {}
+    # A root that is BOTH mahmuz and weak needs hamza ibdal rules that are not
+    # implemented beyond seating, so it is not claimed here.
+    if "mahmuz" in rc.kinds and rc.needs_ilal and \
+            any(x in rc.kinds for x in ("ajwaf", "naqis", "mithal")) and \
+            letters[0] != HAMZA:
+        return {}
+    F, V, L_ = letters
+    mv, dv = _madi_ayn_vowel(bab), _mudari_ayn_vowel(bab)
+    kinds = rc.kinds
+
+    # ---- ajwaf: the medial semivowel is absorbed --------------------------
+    # قَوَلَ -> قَالَ. In the madi the 'ayn becomes a long a; in the mudari'
+    # its vowel moves to the faa' and it becomes the matching long vowel;
+    # the amr is the jussive, which drops that long vowel entirely.
+    if "ajwaf" in kinds and "mudaaf" not in kinds:
+        madi = F + FATHA + ALIF + L_ + FATHA
+        mud = "ي" + FATHA + F + dv + _vowel_letter(dv) + L_ + DAMMA
+        amr = F + dv + L_ + SUKUN
+        return _seated({"madi": madi, "mudari": mud, "amr": amr})
+
+    # ---- naqis: the final semivowel ---------------------------------------
+    # رَمَىَ -> رَمَى, دَعَوَ -> دَعَا. After a fatha the final weak letter
+    # becomes alif -- written maksura when the radical is yaa -- but after a
+    # kasra (bab 4) it survives as yaa: رَضِيَ.
+    if "naqis" in kinds and "mudaaf" not in kinds:
+        if mv == FATHA:
+            tail = ALIF_MAKSURA if L_ == YAA else ALIF
+            madi = F + FATHA + V + FATHA + tail
+        else:
+            # after a kasra a final waaw becomes yaa: رَضِوَ is not a word,
+            # رَضِيَ is -- and the corpus root is رضو.
+            tail_l = YAA if L_ == WAW else L_
+            madi = F + FATHA + V + mv + tail_l + FATHA
+        mud = "ي" + FATHA + F + SUKUN + V + dv + (
+            ALIF_MAKSURA if dv == FATHA else _vowel_letter(dv))
+        amr = F + SUKUN + V + dv if False else None
+        return _seated({"madi": madi, "mudari": mud})
+
+    # ---- mithal: a waaw faa' drops before a kasra -------------------------
+    # وَعَدَ يَوْعِدُ -> يَعِدُ, and the amr loses it too: عِدْ. Before a
+    # fatha it survives (وَجِلَ يَوْجَلُ), and a yaa faa' always survives.
+    if "mithal" in kinds and "mudaaf" not in kinds:
+        madi = F + FATHA + V + mv + L_ + FATHA
+        if F == WAW and dv == KASRA:
+            mud = "ي" + FATHA + V + dv + L_ + DAMMA
+            amr = V + dv + L_ + SUKUN
+        elif F == WAW and dv == FATHA:
+            # NOT determined by the bab. وَضَعَ يَضَعُ drops the waaw and
+            # وَجِلَ يَوْجَلُ keeps it, both with a fatha, and nothing in the
+            # letters says which. Refusing beats guessing.
+            return _seated({"madi": madi, "mudari": None, "amr": None})
+        else:
+            mud = "ي" + FATHA + F + SUKUN + V + dv + L_ + DAMMA
+            amr = ALIF + (KASRA if dv != DAMMA else DAMMA) + \
+                F + SUKUN + V + dv + L_ + SUKUN
+        return _seated({"madi": madi, "mudari": mud, "amr": amr})
+
+    # ---- mudaaf: idgham of the doubled radical ---------------------------
+    # مَدَدَ -> مَدَّ, يَمْدُدُ -> يَمُدُّ.
+    if "mudaaf" in kinds and not rc.needs_ilal:
+        madi = F + FATHA + V + SHADDA + FATHA
+        mud = "ي" + FATHA + F + dv + V + SHADDA + DAMMA
+        amr = F + dv + V + SHADDA + FATHA
+        return _seated({"madi": madi, "mudari": mud, "amr": amr})
+
+    return {}
+
+
+def _looks_like_form_iv(form, letters, aspect):
+    """QAC does not mark every form IV either: أَبْقَى and أَعْمَى are tagged
+    plain PERF, and comparing a form-I template against them is comparing two
+    different verbs."""
+    core = stem_core(form)
+    if aspect != "madi":
+        return False
+    if len(core) > 2 and core[0] in ("أ", "إ", HAMZA) and letters[0] != HAMZA:
+        return True
+    # form V too: تَجَلَّى and تَمَنَّى are tagged plain PERF, and comparing a
+    # form-I template with them compares two different verbs.
+    return core.startswith("ت") and SHADDA in core and letters[0] != "ت"
+
+
+def ilal_check(conn):
+    """Regenerate weak roots' citation forms and compare with the mushaf.
+
+    HOW THIS AVOIDS BEING CIRCULAR. No weak root has a sourced bab -- the bab
+    derivation is restricted to SOUND roots, because i'lal is exactly what
+    distorts a weak root's surface vowels. So the check cannot assume a bab;
+    it asks a different question, and states which one:
+
+      strong  the root is attested in BOTH aspects, and ONE bab must
+              reproduce BOTH. For an ajwaf the madi is bab-independent
+              (قَالَ whatever the bab) but the mudari' is not, so a single
+              bab satisfying both is a real constraint. If the madi rule
+              produced قَوَلَ, no bab would satisfy it.
+      weak    the root is attested in one aspect only, so any bab that fits
+              that one slot passes. Counted and reported SEPARATELY, because
+              a pass rate that mixes the two overstates the evidence.
+    """
+    from collections import defaultdict
+    oracle = defaultdict(dict)
+    for r in q(conn, "SELECT root_ar, form_ar, features FROM segments "
+                     "WHERE is_stem=1 AND pos='V' AND root_ar IS NOT NULL"):
+        f = r["features"]
+        if _FORM_MARK_RE.search(f) or "PASS" in f or "|3MS" not in f:
+            continue
+        aspect = ("madi" if "|PERF" in f else
+                  "mudari" if "|IMPF" in f and "MOOD:" not in f else None)
+        if aspect is None:
+            continue
+        letters = canonical_root(r["root_ar"])
+        if len(letters) != 3:
+            continue
+        if _is_passive_surface(r["form_ar"], letters,
+                               "PERF" if aspect == "madi" else "IMPF"):
+            continue
+        if _looks_like_form_iv(r["form_ar"], letters, aspect):
+            continue
+        oracle[r["root_ar"]].setdefault(aspect, set()).add(
+            stem_core(r["form_ar"]))
+
+    out = {"strong": defaultdict(lambda: [0, 0, [], 0]),
+           "weak": defaultdict(lambda: [0, 0, [], 0]),
+           "unhandled": defaultdict(int)}
+    for root, slots in oracle.items():
+        letters = canonical_root(root)
+        rc = RootClass(letters)
+        kind = rc.primary_kind()
+        if kind == "salim":
+            continue
+        if not ilal_verb_forms(letters, rc, 1):
+            out["unhandled"][kind] += 1
+            continue
+        tier = "strong" if len(slots) == 2 else "weak"
+        cell = out[tier][kind]
+        cell[1] += 1
+        ok = False
+        best = None
+        for bab in sorted(ABWAB):
+            got = ilal_verb_forms(letters, rc, bab)
+            if not got:
+                continue
+            if all(got.get(slot) and stem_core(got[slot]) in attested
+                   for slot, attested in slots.items()):
+                ok = True
+                break
+            if best is None:
+                best = got
+        if ok:
+            cell[0] += 1
+        elif any(best and best.get(slot) is None for slot in slots):
+            # the rules REFUSED this slot rather than getting it wrong --
+            # a different outcome and it must not be counted as an error
+            cell[3] += 1
+        elif len(cell[2]) < 6:
+            # the slot that ACTUALLY failed, not the first one: reporting the
+            # madi while the mudari' was wrong sent me looking in the wrong
+            # place twice.
+            bad = None
+            for slot, attested in slots.items():
+                if not best or not best.get(slot) or \
+                        stem_core(best[slot]) not in attested:
+                    bad = slot
+                    break
+            bad = bad or sorted(slots)[0]
+            cell[2].append((root, bad, (best or {}).get(bad, "-"),
+                            sorted(slots[bad])[0]))
+    return out
+
+
+def _infer_bab_for_check(letters, rc, slots):
+    """For the CHECK ONLY: try each bab and see which reproduces the mushaf.
+    This is a diagnostic, never a claim -- store_babs() does not use it, and
+    nothing derived this way is served."""
+    for bab in sorted(ABWAB):
+        got = ilal_verb_forms(letters, rc, bab)
+        if not got:
+            return None
+        if all(slot not in slots or got.get(slot) is None or
+               stem_core(got[slot]) in slots[slot] for slot in slots):
+            return bab
+    return None
+
+
+# ==========================================================================
 # 8d.  THE BAB, SOURCED FROM THE MUSHAF ITSELF
 # ==========================================================================
 #
@@ -2653,14 +3006,25 @@ def cmd_sarf(conn, root, bab=None):
     for r in rc.reasons:
         _w("  - %s" % r)
 
-    if rc.needs_ilal or rc.needs_idgham or rc.needs_ibdal:
+    forms = all_generated_forms(result)
+    unverified = [f for f in forms if not f.verified]
+    if (rc.needs_ilal or rc.needs_idgham or rc.needs_ibdal) and unverified:
         _w("")
         _w("!" * 74)
-        _w("!!  THIS ROOT IS NOT SOUND.  The i'lal / ibdal / idgham rules that")
-        _w("!!  turn a template into the real word are NOT implemented here.")
-        _w("!!  Naive templating on q-w-l gives the non-word qawala, not qaala.")
-        _w("!!  Every form below is therefore RAW TEMPLATE OUTPUT and is marked")
-        _w("!!  UNVERIFIED.  Do not read it as a claim about Arabic.")
+        _w("!!  THIS ROOT IS NOT SOUND, and %d of the %d forms below are RAW"
+           % (len(unverified), len(forms)))
+        _w("!!  TEMPLATE OUTPUT, marked [UNVERIFIED]. Naive templating on")
+        _w("!!  q-w-l gives the non-word qawala, not qaala. Do not read an")
+        _w("!!  unverified line as a claim about Arabic.")
+        if len(unverified) < len(forms):
+            _w("!!")
+            _w("!!  The other %d have had i'lal/idgham applied by rules that"
+               % (len(forms) - len(unverified)))
+            _w("!!  reproduce every citation form the Qur'an attests for a")
+            _w("!!  %s root (%s). Check them yourself:"
+               % (rc.primary_kind(),
+                  ILAL_VALIDATED.get(rc.primary_kind(), "unmeasured")))
+            _w("!!      python3 lughat.py ilal --check")
         _w("!" * 74)
 
     # --- the bab is a sourced fact, and we do not have it -----------------
@@ -3384,17 +3748,35 @@ def _t(conn):
         ck(rc.needs_ilal, "%s not marked as needing i'lal" % root)
         res = generate(root)
         forms = all_generated_forms(res)
-        bad = [f for f in forms if f.verified]
-        ck(not bad, "%s emitted %d forms as VERIFIED, e.g. %r"
+        # A weak root may now carry VERIFIED forms -- but ONLY the mujarrad
+        # verb slots of a class whose rules reproduce the Qur'an. Every mazid
+        # form is still a raw template, and every form of a class the corpus
+        # does not validate still carries its caveat.
+        mazid = [f for sec in res["mazid"] for f in sec["forms"]
+                 if not f.is_refusal]
+        bad = [f for f in mazid if f.verified]
+        ck(not bad, "%s emitted %d MAZID forms as VERIFIED, e.g. %r"
            % (root, len(bad), bad[:1]))
-        ck(all(f.caveats for f in forms),
-           "%s: a form carried no reliability caveat" % root)
-    # the specific non-word must be present but marked, not hidden and not sold
+        ck(all(f.caveats for f in mazid),
+           "%s: a mazid form carried no reliability caveat" % root)
+        kind = classify_root(root).primary_kind()
+        verified = [f for f in forms if f.verified]
+        if kind in ILAL_VALIDATED:
+            ck(verified, "%s is a validated %s class but emitted nothing "
+                         "verified" % (root, kind))
+        else:
+            ck(not verified, "%s (%s) is not a validated class yet emitted "
+                             "%d verified forms" % (root, kind, len(verified)))
+    # the non-word must be GONE now that the ajwaf rules are validated
     res = generate("قول", bab=1)
     madi = res["mujarrad"][0]["forms"][0]
-    ck(madi.text == "قَوَلَ", "expected the raw template قَوَلَ, got %r" % madi.text)
-    ck(not madi.verified, "قَوَلَ was emitted as a VERIFIED form")
-    return "قول/وعد/رمي/قوي: 0 verified forms; قَوَلَ present but UNVERIFIED"
+    ck(stem_core(madi.text) == stem_core("قَالَ"),
+       "expected قَالَ from the i'lal rules, got %r" % madi.text)
+    ck(madi.verified, "قَالَ is not marked verified")
+    ck("قَوَلَ" not in [getattr(f, "text", "") for f in all_generated_forms(res)],
+       "the non-word قَوَلَ is still emitted somewhere")
+    return ("mazid forms of قول/وعد/رمي/قوي all unverified; قَوَلَ is gone, "
+            "replaced by قَالَ")
 
 
 @test("HONESTY", "sound roots still produce verified forms (no blanket flag)")
@@ -3419,11 +3801,18 @@ def _t(conn):
     ck(maful.notes and not maful.caveats,
        "transitivity is an applicability note, not a template caveat")
     ck("muta'addi" in " ".join(maful.notes), "the note lost its content")
-    weak = [f for f in generate("قول", bab=1)["mujarrad"][0]["forms"]
+    # a class the corpus does NOT validate still carries caveats everywhere
+    weak = [f for f in generate("وعد", bab=2)["mujarrad"][0]["forms"]
             if not f.is_refusal]
     ck(all(f.caveats and not f.verified for f in weak),
-       "a weak root produced a form with no reliability caveat")
-    return "salim: notes without caveats; ajwaf: caveats on every form"
+       "an unvalidated mithal form carries no reliability caveat")
+    # and a validated class's MAZID forms still do
+    mazid = [f for sec in generate("قول")["mazid"] for f in sec["forms"]
+             if not f.is_refusal]
+    ck(all(f.caveats and not f.verified for f in mazid),
+       "a mazid form of an ajwaf root is claimed as verified")
+    return ("salim: notes without caveats; unvalidated mithal and every mazid "
+            "form: caveats")
 
 
 @test("HONESTY", "a skeleton match is never sold as attestation")
@@ -3776,8 +4165,12 @@ def _t(conn):
         rc = classify_root(typed)
         ck("naqis" in rc.kinds, "%r classified %s" % (typed, rc.kinds))
         ck(rc.needs_ilal, "%r not marked as needing i'lal" % typed)
-        ck(all(not f.verified for f in all_generated_forms(generate(typed))),
-           "%r emitted a verified form" % typed)
+        # naqis IS validated now, so its mujarrad verb forms may be
+        # verified; nothing else may be.
+        mazid = [f for sec in generate(typed)["mazid"] for f in sec["forms"]
+                 if not f.is_refusal]
+        ck(all(not f.verified for f in mazid),
+           "%r emitted a verified mazid form" % typed)
     ck("".join(canonical_root("رمى")) == "".join(canonical_root("رمي")),
        "the two spellings do not canonicalise together")
     return "رمى / رمي / rmY / rmy all naqis, all unverified"
@@ -4842,6 +5235,101 @@ def _t(conn):
     return "%d sound roots derivable; every weak root still refuses" % n
 
 
+@test("HONESTY", "i'lal reproduces the Qur'an, or it is not claimed")
+def _t(conn):
+    """Refusal R2 is discharged only where the mushaf proves it. The rules are
+    regenerated against every weak root the Qur'an attests and compared
+    EXACTLY; a class that does not reproduce it keeps its caveat."""
+    known = {("قول", 1): ("قَالَ", "يَقُولُ", "قُلْ"),
+             ("بيع", 2): ("بَاعَ", "يَبِيعُ", "بِعْ"),
+             ("خوف", 4): ("خَافَ", "يَخَافُ", "خَفْ"),
+             ("مدد", 1): ("مَدَّ", "يَمُدُّ", "مُدَّ")}
+    for (root, bab), want in known.items():
+        got = ilal_verb_forms(canonical_root(root),
+                              RootClass(canonical_root(root)), bab)
+        for slot, w in zip(("madi", "mudari", "amr"), want):
+            # compared through stem_core: a hand-typed literal can differ from
+            # the generated string in combining-mark ORDER while looking
+            # identical -- the trap this file already documents
+            ck(got.get(slot) and stem_core(got[slot]) == stem_core(w),
+               "%s bab %d %s: %r, want %r" % (root, bab, slot,
+                                              got.get(slot), w))
+    for (root, bab), want in {("رمي", 2): ("رَمَى", "يَرْمِي"),
+                              ("دعو", 1): ("دَعَا", "يَدْعُو"),
+                              ("رضو", 4): ("رَضِيَ", "يَرْضَى")}.items():
+        got = ilal_verb_forms(canonical_root(root),
+                              RootClass(canonical_root(root)), bab)
+        for slot, w in zip(("madi", "mudari"), want):
+            ck(got.get(slot) and stem_core(got[slot]) == stem_core(w),
+               "%s %s: %r, want %r" % (root, slot, got.get(slot), w))
+    # Orthography, checked as an exact string. stem_core folds a final
+    # maksura to alif -- correctly, رَمَى and رَمَا are one word -- so a
+    # core comparison cannot see the difference the READER sees. A yaa
+    # radical is written ى, a waaw radical ا.
+    ck(ilal_verb_forms(canonical_root("رمي"),
+                       RootClass(canonical_root("رمي")), 2)["madi"]
+       == "رَمَى", "a yaa-final root must be written with alif maksura")
+    ck(ilal_verb_forms(canonical_root("دعو"),
+                       RootClass(canonical_root("دعو")), 1)["madi"]
+       == "دَعَا", "a waaw-final root must be written with a full alif")
+    # the non-word must be gone from a validated class
+    forms = generate("قول", bab=1)["mujarrad"][0]["forms"]
+    madi = forms[0]
+    ck(stem_core(madi.text) == stem_core("قَالَ"),
+       "madi of قول is %r" % madi.text)
+    ck(madi.verified, "قَالَ is still marked unverified")
+    ck("قَوَلَ" not in [getattr(f, "text", "") for f in forms],
+       "the non-word قَوَلَ is still being emitted")
+    return "قَالَ يَقُولُ قُلْ, بَاعَ, خَافَ, مَدَّ, رَمَى, دَعَا, رَضِيَ"
+
+
+@test("HONESTY", "the i'lal check is run against the corpus, not remembered")
+def _t(conn):
+    """Computed here and now from the mushaf. A stored pass rate would let
+    every rule be deleted with the number still printed."""
+    res = ilal_check(conn)
+    for kind, claimed in ILAL_VALIDATED.items():
+        m, n, fails, ref = res["strong"][kind]
+        ck(n > 0, "%s: nothing to check it against" % kind)
+        ck("%d/%d" % (m, n) == claimed,
+           "%s is claimed as %s but measures %d/%d -- update the claim or "
+           "fix the rule" % (kind, claimed, m, n))
+        ck(m == n, "%s is marked validated but gets %d of %d wrong"
+           % (kind, n - m, n))
+    for kind in ILAL_NOT_VALIDATED:
+        m, n, fails, ref = res["strong"][kind]
+        ck(m < n, "%s now reproduces the mushaf fully -- promote it to "
+                  "ILAL_VALIDATED rather than leaving its forms unverified"
+           % kind)
+    return "ajwaf %s, naqis %s, mudaaf %s, all measured now" % (
+        ILAL_VALIDATED["ajwaf"], ILAL_VALIDATED["naqis"],
+        ILAL_VALIDATED["mudaaf"])
+
+
+@test("HONESTY", "a class the corpus does not validate keeps its caveat")
+def _t(conn):
+    """The waaw of a mithal drops before a kasra and survives before a fatha
+    -- except where it does not (وَضَعَ يَضَعُ). Nothing in the letters
+    decides, so mithal is not claimed."""
+    ck("mithal" in ILAL_NOT_VALIDATED, "mithal was promoted without evidence")
+    forms = generate("وعد", bab=2)["mujarrad"][0]["forms"]
+    real = [f for f in forms if not f.is_refusal]
+    ck(all(not f.verified for f in real[:3]),
+       "a mithal form is marked verified: %s"
+       % [(f.slot, f.verified) for f in real[:3]])
+    ck(stem_core(real[1].text) == stem_core("يَعِدُ"),
+       "the kasra rule broke: %r" % real[1].text)
+    # and where the waaw's fate is undetermined, refuse rather than guess
+    sec = generate("وضع", bab=3)["mujarrad"][0]["forms"]
+    mud = [f for f in sec if f.slot.startswith("mudari")][0]
+    ck(mud.is_refusal, "the undetermined mithal mudari' was guessed: %r"
+       % getattr(mud, "text", None))
+    ck("وَضَعَ يَضَعُ" in mud.reason or "does not" in mud.reason,
+       "the refusal does not say why")
+    return "mithal unverified (%s); the undetermined mudari' refuses" % (
+        ILAL_NOT_VALIDATED["mithal"])
+
+
 @test("HONESTY", "refusals are refusals, not empty strings")
 def _t(conn):
     res = generate("سكن")
@@ -5351,6 +5839,7 @@ USAGE = """lughat -- a local Qur'anic lexicography tool (offline, stdlib only)
   lughat.py root <root>           corpus occurrences of a root
   lughat.py word <word>           search the mushaf text
   lughat.py bab [<root>|--derive] the bab, read off the Qur'an's vowelling
+  lughat.py ilal --check          check the i'lal rules against the Qur'an
   lughat.py akbar <root>          the six permutations, per Ibn Jinni
   lughat.py letter <root|letter>  Ibn Jinni on the root's letters
   lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
@@ -5478,6 +5967,48 @@ def _main(argv):
 
     if cmd == "review":
         cmd_review(connect(), argv[2:])
+        return 0
+
+    if cmd == "ilal":
+        conn = connect()
+        res = ilal_check(conn)
+        _w(BAR)
+        _w("I'LAL, CHECKED AGAINST THE QUR'AN")
+        _w(BAR)
+        _w("Every weak root the mushaf attests, regenerated and compared")
+        _w("EXACTLY. STRONG = attested in both aspects, so ONE bab must")
+        _w("reproduce both. WEAK = one aspect only, so any fitting bab passes.")
+        _w("")
+        _w("%-7s %-8s %8s %8s %7s %6s" %
+           ("TIER", "CLASS", "CORRECT", "REFUSED", "WRONG", "OF"))
+        _w(RULE)
+        for tier in ("strong", "weak"):
+            tot = [0, 0, 0]
+            for kind in sorted(res[tier]):
+                m, n, fails, ref = res[tier][kind]
+                wrong = n - m - ref
+                tot[0] += m
+                tot[1] += ref
+                tot[2] += wrong
+                _w("%-7s %-8s %8d %8d %7d %6d" %
+                   (tier, kind, m, ref, wrong, n))
+            _w("%-7s %-8s %8d %8d %7d %6d" %
+               (tier, "total", tot[0], tot[1], tot[2], sum(tot)))
+        _w("")
+        _w("classes with no rules here: %s"
+           % (", ".join("%s %d" % kv for kv in sorted(res["unhandled"].items()))
+              or "none"))
+        _w("")
+        _w("Where a class does not reproduce the mushaf, its forms stay")
+        _w("UNVERIFIED: %s" % ", ".join(
+            "%s %s" % kv for kv in sorted(ILAL_NOT_VALIDATED.items())))
+        for tier in ("strong", "weak"):
+            for kind in sorted(res[tier]):
+                for root, slot, gen, corpus in res[tier][kind][2][:3]:
+                    _w("  wrong: %-6s %-5s %-7s generated %-11s mushaf %s"
+                       % (kind, root, slot, gen, corpus))
+        _w("")
+        _w(TANZIL_ATTRIBUTION)
         return 0
 
     if cmd == "bab":

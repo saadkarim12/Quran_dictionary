@@ -222,6 +222,40 @@ Only the maṣādir of the **mazīd fīh** forms are qiyāsī (`تَفْعِيل
 
 ### R2 — weak roots need iʿlāl and ibdāl
 
+**Discharged for three classes, at a measured rate, and for nothing else.**
+
+The rules are in this file and are checked against the Qurʾān:
+`lughat.py ilal --check` regenerates the citation forms of every weak root the
+muṣḥaf attests and compares them **exactly**. A rule that does not reproduce
+the Qurʾān is wrong.
+
+| class | strong evidence | verdict |
+|---|---|---|
+| ajwaf | 13/13 | validated — `قَالَ / يَقُولُ / قُلْ` marked verified |
+| nāqiṣ | 17/17 | validated |
+| muḍāʿaf | 8/8 | validated |
+| **mithāl** | **2/4** | **not validated — keeps its caveat** |
+
+*Strong* means the root is attested in **both** aspects and **one** bāb must
+reproduce both. For an ajwaf the māḍī is bāb-independent (`قَالَ` whatever the
+bāb) but the muḍāriʿ is not, so a single bāb fitting both is a real
+constraint — if the māḍī rule still produced `قَوَلَ`, no bāb would satisfy
+it. Roots attested in one aspect only are counted **separately** as *weak*
+evidence, because any bāb fitting that one slot passes and mixing the two
+overstates the case.
+
+Mithāl is not claimed because the wāw's fate is **not determined**: it drops
+before a kasra (`وَعَدَ يَعِدُ`), survives before a fatḥa (`وَجِلَ يَوْجَلُ`)
+— except where it does not (`وَضَعَ يَضَعُ`, `وَهَبَ يَهَبُ`). Where the bāb
+gives a fatḥa the tool **refuses** rather than guessing.
+
+Everything else still refuses: every **mazīd** form of a weak root is a raw
+template, and lafīf, mahmūz-plus-weak, and the ism slots have no rules here.
+`sarf قول` says so with counts — *3 of 80 forms verified* — rather than a
+blanket banner that was true before and is false now.
+
+### R2, as originally stated
+
 Naive templating on ق و ل yields the non-word `قَوَلَ` instead of `قَالَ`.
 The iʿlāl rules that produce `قَالَ` are not implemented.
 
@@ -523,6 +557,7 @@ Single file, stdlib only, offline after `setup`.
     lughat.py word <word>           search the mushaf text
     lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
     lughat.py bab [<root>|--derive] the bāb, read off the Qurʾān's vowelling
+    lughat.py ilal --check          check the iʿlāl rules against the Qurʾān
     lughat.py akbar <root>          the six permutations, per Ibn Jinnī
     lughat.py letter <root>         Ibn Jinnī on the root's letters
     lughat.py ingest <lexicon> --from PATH
