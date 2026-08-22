@@ -41,6 +41,7 @@ Usage:
   lughat.py letter <root|letter>  Ibn Jinni on the root's letters
   lughat.py mentions <root>       books not keyed by root, searched
   lughat.py tafsir <sura:aya>     approved commentary on an ayah
+  lughat.py translation [--add=K] a translation beside the Arabic
   lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
   lughat.py ingest <lexicon> --from PATH
                                   load a lexicon, ALL at verified = 0
@@ -1193,7 +1194,7 @@ def all_refusals(result):
 #                    from its letters; it is read from a lexicon and carries
 #                    bab_source_id / bab_page.  NULL means unknown.
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA = r"""
 PRAGMA journal_mode = WAL;
@@ -1328,6 +1329,22 @@ CREATE VIEW IF NOT EXISTS v_entries AS
     SELECT * FROM entries WHERE verified = 1 AND rejected = 0;
 CREATE VIEW IF NOT EXISTS v_tafsir AS
     SELECT * FROM tafsir WHERE verified = 1 AND rejected = 0;
+
+-- A translation of the QUR'AN, keyed by ayah.  Not `entries`: nothing here
+-- is derived.  The file states sura|aya|text and this table copies it, so
+-- there is no inferred attribution for a reviewer to check -- the same
+-- footing as `words` and `segments`, which are also served ungated.  What IS
+-- checked, at ingest, is that the file's ayah numbering matches the mushaf's
+-- exactly; a translation numbered differently would put one verse's words
+-- under another, which is the tafsir anchoring failure by another route.
+CREATE TABLE IF NOT EXISTS translations (
+    id         INTEGER PRIMARY KEY,
+    source_id  INTEGER NOT NULL REFERENCES sources(id),
+    sura       INTEGER NOT NULL,
+    aya        INTEGER NOT NULL,
+    text       TEXT NOT NULL,      -- VERBATIM, one line of the source file
+    UNIQUE (source_id, sura, aya)
+);
 
 CREATE INDEX IF NOT EXISTS ix_entry_root ON entries(root_ar);
 CREATE INDEX IF NOT EXISTS ix_entry_ver  ON entries(verified);
@@ -1514,6 +1531,18 @@ def _extract_member(blob):
 
 # Columns added after v1.  Migrating rather than rebuilding matters: entries
 # may hold rows a person has read and approved, and that work must survive.
+_NEW_TABLES = {
+    "translations": """
+        CREATE TABLE IF NOT EXISTS translations (
+            id         INTEGER PRIMARY KEY,
+            source_id  INTEGER NOT NULL REFERENCES sources(id),
+            sura       INTEGER NOT NULL,
+            aya        INTEGER NOT NULL,
+            text       TEXT NOT NULL,
+            UNIQUE (source_id, sura, aya)
+        )""",
+}
+
 _MIGRATIONS_V2 = [
     ("sources", "licence_note", "TEXT"),
     ("sources", "distributable", "INTEGER NOT NULL DEFAULT 0"),
@@ -1556,6 +1585,14 @@ def migrate(conn):
             conn.commit()
         return 0
     done = 0
+    # A table this build added is created here too: ALTER TABLE cannot add a
+    # table, and CREATE TABLE IF NOT EXISTS in SCHEMA only runs at setup.
+    for table in _NEW_TABLES:
+        if not conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND "
+                "name=?", (table,)).fetchone()[0]:
+            conn.execute(_NEW_TABLES[table])
+            done += 1
     for table, col, decl in _MIGRATIONS_V2:
         exists = conn.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
@@ -1598,7 +1635,11 @@ def _views_current(conn):
 
 
 def schema_columns_ok(conn):
-    """True when every column this build needs actually exists."""
+    """True when every column and table this build needs actually exists."""
+    for table in _NEW_TABLES:
+        if not conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE "
+                            "type='table' AND name=?", (table,)).fetchone()[0]:
+            return False
     for table, col, _ in _MIGRATIONS_V2:
         ex = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE "
                           "type='table' AND name=?", (table,)).fetchone()[0]
@@ -3315,6 +3356,199 @@ def tafsir_for_aya(conn, sura, aya):
 
 
 # ==========================================================================
+# 8g.  TRANSLATIONS  --  a second language beside the ayah, never mine
+# ==========================================================================
+#
+# A translation shown beside the Arabic must be a NAMED TRANSLATOR'S, quoted
+# whole and attributed, exactly like a lexicon article.  This tool does not
+# translate anything.  Rendering `مساكين` as "the needy" would be language
+# model output reaching the reader with a scholar's text beside it -- the
+# governing rule's central prohibition, in the place where it would be least
+# visible.
+#
+# WHY THESE ROWS ARE NOT GATED.  `entries` and `tafsir` are reviewed because
+# their key is DERIVED: a parser decided which root an article belongs to,
+# and which ayah a pericope comments on, and a parser can be wrong in a way
+# that looks perfectly sourced.  A translation file states `sura|aya|text`.
+# The key is in the file; the parser splits on a pipe and infers nothing. So
+# these rows sit with `words` and `segments` -- ingested data, served without
+# a queue -- and not with the sourced prose that needs a person.
+#
+# WHAT IS CHECKED INSTEAD.  The one way this could still misattribute is a
+# file numbered differently from the mushaf: some editions count the basmala
+# as an ayah, and a single offset would put one verse's words under another,
+# which is the tafsir anchoring failure arriving by a different road.  So the
+# ayah set of the file must equal the corpus's 6,236 EXACTLY, or the ingest
+# refuses and prints what differed.
+
+REFUSAL_TRANSLATE_MYSELF = (
+    "REFUSED. This tool does not translate. A rendering it composed itself "
+    "would be the one thing the whole design forbids -- generated prose "
+    "sitting beside a named scholar's words, where it would look exactly "
+    "like part of the source. What it shows instead is a published "
+    "translator's own text, whole, with his name on it.")
+
+REFUSAL_TRANSLATION_NUMBERING = (
+    "REFUSED. This translation's ayah numbering does not match the mushaf "
+    "loaded here: %d ayat in the file, %d in the corpus, %d that the corpus "
+    "does not have%s. A translation numbered differently would put one "
+    "verse's words under another verse. Nothing was ingested.")
+
+TRANSLATION_TERMS = (
+    "Translations from Tanzil.net, provided for NON-COMMERCIAL use only. "
+    "Copyright remains with the translator or publisher. https://tanzil.net")
+
+# Tanzil's Urdu translations.  Which one to read is the reader's choice and
+# not this tool's: the translators belong to different schools, and picking
+# one silently would be a judgement the program has no business making.
+TRANSLATIONS = {
+    "ur.jalandhry": {
+        "title": "Qur'an, Urdu -- Jalandhry",
+        "author": "Fateh Muhammad Jalandhry (d. 1939)",
+        "lang": "ur"},
+    "ur.junagarhi": {
+        "title": "Qur'an, Urdu -- Junagarhi",
+        "author": "Muhammad Junagarhi (d. 1941)",
+        "lang": "ur"},
+    "ur.kanzuliman": {
+        "title": "Qur'an, Urdu -- Kanz al-Iman",
+        "author": "Ahmad Raza Khan (d. 1921)",
+        "lang": "ur"},
+    "ur.maududi": {
+        "title": "Qur'an, Urdu -- Tafhim al-Qur'an",
+        "author": "Abul A'la Maududi (d. 1979)",
+        "lang": "ur"},
+    "ur.qadri": {
+        "title": "Qur'an, Urdu -- Irfan al-Qur'an",
+        "author": "Muhammad Tahir ul Qadri",
+        "lang": "ur"},
+    "ur.najafi": {
+        "title": "Qur'an, Urdu -- Najafi",
+        "author": "Muhammad Hussain Najafi",
+        "lang": "ur"},
+    "ur.jawadi": {
+        "title": "Qur'an, Urdu -- Jawadi",
+        "author": "Syed Zeeshan Haider Jawadi",
+        "lang": "ur"},
+    "en.sahih": {
+        "title": "Qur'an, English -- Saheeh International",
+        "author": "Saheeh International",
+        "lang": "en"},
+}
+
+TANZIL_TRANS_URL = "https://tanzil.net/trans/%s"
+
+_TRANS_LINE_RE = re.compile(r"^(\d+)\|(\d+)\|(.*)$")
+
+
+def fetch_text(url, dest=None):
+    """Download once, to LUGHAT_HOME, and read from disk ever after.
+
+    The QUERY path never calls this: like `setup`, a translation is fetched
+    at build time and the tool is offline afterwards."""
+    if dest is None:
+        dest = os.path.join(LUGHAT_HOME, "trans",
+                            re.sub(r"[^A-Za-z0-9._-]", "_", url.rsplit("/", 1)[-1]))
+    if os.path.exists(dest):
+        with open(dest, "rb") as fh:
+            return fh.read().decode("utf-8")
+    d = os.path.dirname(dest)
+    if d and not os.path.isdir(d):
+        os.makedirs(d)
+    import urllib.request
+    sys.stderr.write("downloading %s\n" % url)
+    with urllib.request.urlopen(url) as r:
+        blob = r.read()
+    with open(dest, "wb") as fh:
+        fh.write(blob)
+    return blob.decode("utf-8")
+
+
+def parse_translation(text):
+    """Yield (sura, aya, text) from a Tanzil translation file.
+
+    The file is `sura|aya|text` per line, with a comment block at the end.
+    Nothing here is inferred: the numbers are the file's own."""
+    for line in text.replace("\r", "").split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _TRANS_LINE_RE.match(line)
+        if not m:
+            continue
+        body = m.group(3).strip()
+        if body:
+            yield int(m.group(1)), int(m.group(2)), body
+
+
+def ingest_translation(conn, key, path=None, url=None):
+    """Load one translation, after checking it is numbered like the mushaf."""
+    if key not in TRANSLATIONS:
+        raise ValueError("unknown translation %r; known: %s"
+                         % (key, ", ".join(sorted(TRANSLATIONS))))
+    spec = TRANSLATIONS[key]
+    if path:
+        with open(path, "rb") as fh:
+            text = fh.read().decode("utf-8")
+    else:
+        text = fetch_text(url or TANZIL_TRANS_URL % key)
+    rows = list(parse_translation(text))
+    with unguarded(conn):
+        have = {(r["sura"], r["aya"]) for r in conn.execute(
+            "SELECT DISTINCT sura, aya FROM words")}
+    got = {(s, a) for s, a, _ in rows}
+    if got != have:
+        extra = sorted(got - have)[:3]
+        raise SystemExit(REFUSAL_TRANSLATION_NUMBERING % (
+            len(got), len(have), len(got - have),
+            (", e.g. " + ", ".join("%d:%d" % x for x in extra))
+            if extra else ""))
+    with unguarded(conn):
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO sources (key,title,author,edition,kind,licence,"
+            "licence_note,distributable,url,attribution) "
+            "VALUES (?,?,?,NULL,'translation','non-commercial only',?,0,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET title=excluded.title,"
+            "author=excluded.author,licence=excluded.licence,"
+            "licence_note=excluded.licence_note,url=excluded.url,"
+            "attribution=excluded.attribution",
+            (key, spec["title"], spec["author"], TRANSLATION_TERMS,
+             TANZIL_TRANS_URL % key,
+             "%s, %s. Text: Tanzil.net, non-commercial use only. %s"
+             % (spec["title"], spec["author"], TANZIL_TRANS_URL % key)))
+        sid = cur.execute("SELECT id FROM sources WHERE key=?",
+                          (key,)).fetchone()[0]
+        cur.execute("DELETE FROM translations WHERE source_id=?", (sid,))
+        cur.executemany(
+            "INSERT INTO translations (source_id,sura,aya,text) "
+            "VALUES (?,?,?,?)", [(sid, s, a, t) for s, a, t in rows])
+        conn.commit()
+    return len(rows)
+
+
+def installed_translations(conn):
+    return list(q(conn, "SELECT s.key, s.title, s.author, s.attribution "
+                        "FROM sources s WHERE s.kind='translation' "
+                        "ORDER BY s.key"))
+
+
+def translations_for_aya(conn, sura, aya):
+    """Every installed translation of one ayah.  Pure retrieval."""
+    return list(q(conn,
+                  "SELECT s.key, s.title, s.author, s.attribution, t.text "
+                  "FROM translations t JOIN sources s ON s.id = t.source_id "
+                  "WHERE t.sura=? AND t.aya=? ORDER BY s.key", (sura, aya)))
+
+
+def aya_text(conn, sura, aya):
+    """The ayah as the corpus holds it: its own word forms, in order."""
+    return " ".join(r["form_ar"] for r in q(
+        conn, "SELECT form_ar FROM words WHERE sura=? AND aya=? ORDER BY word",
+        (sura, aya)))
+
+
+# ==========================================================================
 # 9.  ATTESTATION
 # ==========================================================================
 #
@@ -3946,6 +4180,53 @@ def cmd_akbar(conn, root):
     _w(QAC_ATTRIBUTION)
 
 
+def cmd_translation(conn, args):
+    """List, add or remove a translation shown beside the Arabic.
+
+    Which translator to read is the reader's choice, and the tool installs
+    none by default: these translators belong to different schools, and
+    picking one silently would be a judgement this program has no business
+    making."""
+    installed = {r["key"]: r for r in installed_translations(conn)}
+    add = [a.split("=", 1)[1] for a in args if a.startswith("--add=")]
+    drop = [a.split("=", 1)[1] for a in args if a.startswith("--remove=")]
+    src = ([a.split("=", 1)[1] for a in args if a.startswith("--from=")]
+           or [None])[0]
+    for key in drop:
+        with unguarded(conn):
+            conn.execute("DELETE FROM translations WHERE source_id IN "
+                         "(SELECT id FROM sources WHERE key=?)", (key,))
+            conn.execute("DELETE FROM sources WHERE key=? AND "
+                         "kind='translation'", (key,))
+            conn.commit()
+        _w("removed %s" % key)
+    for key in add:
+        n = ingest_translation(conn, key, path=src)
+        _w("%s: %d ayat" % (key, n))
+        _w("  numbering checked against the mushaf: all %d agree." % n)
+    if add or drop:
+        installed = {r["key"]: r for r in installed_translations(conn)}
+    _w(BAR)
+    _w("TRANSLATIONS   shown beside the Arabic, never generated here")
+    _w(BAR)
+    for line in _wrap(REFUSAL_TRANSLATE_MYSELF, 72):
+        _w(line)
+    _w("")
+    _w("%-15s %-9s %s" % ("KEY", "STATE", "TRANSLATOR"))
+    _w(RULE)
+    for key in sorted(TRANSLATIONS):
+        spec = TRANSLATIONS[key]
+        _w("%-15s %-9s %s" % (key,
+                              "installed" if key in installed else "-",
+                              spec["author"]))
+    _w("")
+    _w("  python3 lughat.py translation --add=ur.jalandhry")
+    _w("  python3 lughat.py translation --remove=ur.jalandhry")
+    _w("")
+    for line in _wrap(TRANSLATION_TERMS, 72):
+        _w(line)
+
+
 def cmd_tafsir(conn, ref):
     """Approved commentary on one ayah.  Requirement 4's second half."""
     m = re.match(r"^\s*(\d+)\s*[:. ]\s*(\d+)\s*$", ref)
@@ -4069,6 +4350,11 @@ def cmd_aya(conn, ref):
     _w("%d:%d   (%d words)" % (sura, aya, len(rows)))
     _w(BAR)
     _w(" ".join(r["form_ar"] for r in rows))
+    for t in translations_for_aya(conn, sura, aya):
+        _w("")
+        _w("%s  (%s)" % (t["title"], t["author"]))
+        for line in _wrap(t["text"], 70):
+            _w("  " + line)
     _w("")
     _w("word-by-word:")
     for r in rows:
@@ -4641,9 +4927,23 @@ def _t(conn):
     # review server uses it to read a query string; counting bare "urllib"
     # conflated the two.
     net = "import" + " urllib.request"
-    ck(src.count(net) == 1, "urllib.request imported %d times" % src.count(net))
-    ck("def fetch_corpus" in src.split(net)[0][-2000:],
-       "the urllib.request import escaped fetch_corpus")
+    # Every import of it must sit inside a named BUILD-path fetcher. Counting
+    # them was the old rule and it only worked while there was exactly one;
+    # naming the enclosing function keeps working when a second is added, and
+    # still fails the moment one appears anywhere else.
+    BUILD_FETCHERS = ("fetch_corpus", "fetch_text")
+    at, where = 0, []
+    while True:
+        i = src.find(net, at)
+        if i < 0:
+            break
+        at = i + 1
+        before = src[:i]
+        j = before.rfind("\ndef ")
+        where.append(before[j + 5:before.find("(", j)] if j >= 0 else "?")
+    ck(where, "urllib.request is not imported at all; how does setup fetch?")
+    stray = [w for w in where if w not in BUILD_FETCHERS]
+    ck(not stray, "urllib.request imported outside the build path: %s" % stray)
     # assembled, so this list does not plant its own needles in the file
     for mod in ("socket", "ssl", "ftplib", "http.client"):
         needle = "import" + " " + mod
@@ -5724,6 +6024,65 @@ _TAFSIR_FIXTURE = "\n".join([
     "# كلام بلا آية مقتبسة بين قوسين",
     "PageV05P313",
 ])
+
+
+@test("HONESTY", "a translation is a translator's, and never this tool's")
+def _t(conn):
+    """The one place generated prose would be least visible is beside a
+    scholar's text in another language. So every translated string served
+    here is one published translator's line, whole, carrying his name."""
+    ck(REFUSAL_TRANSLATE_MYSELF.startswith("REFUSED"),
+       "the tool does not refuse to translate")
+    for key, spec in TRANSLATIONS.items():
+        ck(spec["author"] and spec["title"],
+           "%s is installable without naming a translator" % key)
+    # no rendering may be composed here: the only writer of translations.text
+    # is the ingest, and it inserts the file's own line
+    src = strip_comments(own_source())
+    needle = "INSERT INTO " + "translations"
+    writes = re.findall(needle + r"[^\"]*", src)
+    ck(len(writes) == 1, "translations is written from %d places" % len(writes))
+    # and the reader is told, on the page, that the tool did not translate
+    data = read_root(conn, "سكن")
+    ck(data["translate_refusal"].startswith("REFUSED"),
+       "the page does not carry the refusal to translate")
+    return "%d translations installable, each named; the tool refuses to " \
+           "translate" % len(TRANSLATIONS)
+
+
+@test("HONESTY", "a translation numbered unlike the mushaf is refused whole")
+def _t(conn):
+    """Some editions count the basmala as an ayah. A single offset would put
+    one verse's words under another verse -- the tafsir anchoring failure
+    arriving by a different road -- and it would be invisible, because every
+    line would still look like a translation of something."""
+    import tempfile
+    good = "\n".join("%d|%d|X" % (s, a) for s, a in sorted(
+        {(r["sura"], r["aya"]) for r in q(
+            conn, "SELECT DISTINCT sura, aya FROM words")}))
+    rows = list(parse_translation(good))
+    ck(len(rows) == 6236, "the fixture has %d ayat" % len(rows))
+    ck(rows[0][:2] == (1, 1) and rows[-1][:2] == (114, 6),
+       "the fixture does not span the mushaf: %r .. %r" % (rows[0], rows[-1]))
+    for bad, why in ((good + "\n1|8|X", "an ayah the mushaf does not have"),
+                     ("\n".join(good.split("\n")[:-1]), "a missing ayah")):
+        fh = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False,
+                                         encoding="utf-8")
+        fh.write(bad)
+        fh.close()
+        try:
+            ingest_translation(conn, "ur.jalandhry", path=fh.name)
+            ck(False, "%s was ingested anyway" % why)
+        except SystemExit as e:
+            ck("REFUSED" in str(e), "%s was rejected without saying why" % why)
+        finally:
+            os.unlink(fh.name)
+    # the text itself is copied, not touched
+    line = "2|35|" + "اور ہم  نے"
+    got = list(parse_translation(line))
+    ck(got and got[0][2] == "اور ہم  نے",
+       "the translation line was altered on the way in: %r" % (got,))
+    return "6,236 required and checked; an extra or missing ayah refuses"
 
 
 @test("HONESTY", "a tafsir passage is anchored by the mushaf, or dropped")
@@ -7136,6 +7495,10 @@ h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.11em;
 .slot .att.ok{color:var(--verd)}
 .slot .att.sk{color:var(--och)}
 .slot .att i{font-style:normal;opacity:.75}
+.aya{font-size:1.2rem;line-height:2.1;color:var(--ink);margin:.2rem 0 .5rem;padding:.5rem .7rem;background:var(--surf);border-radius:4px;border:1px solid var(--rule)}
+.tr{direction:rtl;text-align:right;font-size:1rem;line-height:2;color:var(--body);margin:0 0 .6rem;padding:.5rem .7rem;border-right:2px solid var(--verd);background:var(--surf)}
+.tr.ur{font-family:"Noto Nastaliq Urdu","Jameel Noori Nastaleeq","Awami Nastaliq",serif;line-height:2.6}
+.tr .by{display:block;margin-top:.35rem;font-size:.68rem;color:var(--faint);direction:ltr;text-align:left;font-family:inherit}
 .ayahead{display:flex;gap:.7rem;align-items:baseline;margin:1rem 0 .4rem}
 .ayahead b{color:var(--verd);font-variant-numeric:tabular-nums}
 .ayahead .ar{font-size:1.15rem;color:var(--ink)}
@@ -7212,7 +7575,7 @@ function draw(){
    'bab evidence: <span class="ar">'+esc(r.bab_evidence)+'</span></div>';
 
  h+='<h2>Sources</h2><div class="srcsel">';
- for(const c of r.cards.concat(r.tafsir_sources||[]))
+ for(const c of r.cards.concat(r.tafsir_sources||[], r.translations||[]))
   h+='<label><input type="checkbox" data-k="'+esc(c.key)+
   '"'+(HIDDEN.has(c.key)?"":" checked")+'> '+esc(c.title)+'</label>';
  h+='</div>';
@@ -7311,6 +7674,12 @@ function draw(){
   for(const a of r.tafsir){
    h+='<div class="ayahead"><b>'+esc(a.ref)+'</b><span class="ar">'+
     esc(a.word)+'</span></div>';
+   if(a.aya_text) h+='<div class="aya ar">'+esc(a.aya_text)+'</div>';
+   for(const t of (a.translations||[])){
+    if(HIDDEN.has(t.key)) continue;
+    h+='<div class="tr'+(t.key.startsWith("ur")?" ur":"")+'">'+esc(t.text)+
+     '<span class="by">'+esc(t.title)+' &middot; '+esc(t.author)+'</span>'+
+     '</div>';}
    const shown=a.passages.filter(x=>!HIDDEN.has(x.key));
    if(!shown.length){
     h+='<div class="card empty">'+(a.pending
@@ -7534,6 +7903,11 @@ def read_root(conn, query):
         out["tafsir"].append({
             "ref": "%d:%d" % (a["sura"], a["aya"]),
             "word": word["form_ar"] if word else "",
+            "aya_text": aya_text(conn, a["sura"], a["aya"]),
+            "translations": [
+                {"key": t["key"], "title": t["title"], "author": t["author"],
+                 "text": t["text"], "attribution": t["attribution"]}
+                for t in translations_for_aya(conn, a["sura"], a["aya"])],
             "pending": pend,
             "passages": [{
                 "key": r["key"], "title": r["title"], "author": r["author"],
@@ -7548,6 +7922,10 @@ def read_root(conn, query):
                 "lines": render_entry(r["text_raw"])[:6],
             } for r in rows]})
     out["tafsir_more"] = max(0, len(ayat) - TAF_AYAT)
+    out["translations"] = [
+        {"key": r["key"], "title": r["title"], "author": r["author"]}
+        for r in installed_translations(conn)]
+    out["translate_refusal"] = REFUSAL_TRANSLATE_MYSELF
     out["tafsir_sources"] = [
         {"key": r["key"], "title": r["title"]}
         for r in q(conn, "SELECT key, title FROM sources WHERE kind='tafsir' "
@@ -7658,6 +8036,7 @@ USAGE = """lughat -- a local Qur'anic lexicography tool (offline, stdlib only)
   lughat.py letter <root|letter>  Ibn Jinni on the root's letters
   lughat.py mentions <root>       books not keyed by root, searched
   lughat.py tafsir <sura:aya>     approved commentary on an ayah
+  lughat.py translation [--add=K] a translation beside the Arabic
   lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
   lughat.py ingest <lexicon> --from PATH
                                   load a lexicon, ALL at verified = 0
@@ -7919,6 +8298,10 @@ def _main(argv):
             sys.stdout.write(USAGE)
             return 2
         cmd_akbar(connect(), argv[2])
+        return 0
+
+    if cmd == "translation":
+        cmd_translation(connect(), argv[2:])
         return 0
 
     if cmd == "tafsir":
