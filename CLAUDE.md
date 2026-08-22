@@ -458,6 +458,41 @@ al-Khaṣāʾiṣ is about **topics**. Inventing a root for either would file te
 under something the book never said, so `keyed_by` records what a source is
 actually organised by, and the parser refuses to resolve a root for those.
 
+### A book with no article is searched, and the reader is told which it was
+
+Because neither book can be *asked* about a root, `lughat.py mentions` (and
+the same section of the reading page) **refuses first** — "al-Khaṣāʾiṣ is
+organised by topic, not by root, so it has no article on سكن to quote" — and
+only then searches. An empty card reading *"no entry for this root"* would
+have been a claim about the book's contents when the truth is about its
+organisation, so books not keyed by root are **excluded from the dictionary
+cards entirely** and get this section instead.
+
+The matching rule is written down, printed with the results, and small enough
+to read: the radicals **in order**, separated only by the three long vowels
+`ا و ي` — the only letters a wazn puts between them — with the third radical
+optional when it repeats the second (idghām writes `مدد` as `مد`). So `س ك ن`
+finds سكن, يسكن, ساكن, مسكون, مساكين, تسكين.
+
+What it costs is printed too, and a test checks the prose against the regex:
+
+- it **misses** a form that infixes a consonant (form VIII `اجتمع` for ج م ع)
+  or replaces a radical by iʿlāl (`قال` — the wāw of ق و ل is simply not in
+  the string);
+- it **overmatches**: the separator class cannot tell a template's alif from
+  another root's radical, so `س ل م` finds `سليمان`.
+
+A stated limit the code does not actually have would be worse than no
+statement, because the reader calibrates on it. Hence the test asserts both
+failures still happen.
+
+A chapter of al-Khaṣāʾiṣ runs to 48 KB and crosses many pages, so **the
+entry's page is not the passage's page**: each passage resolves its own,
+by the same lookahead as trap 15. And OpenITI's `AUTO` marker on a header it
+generated itself is the digitisation's annotation, not a title Ibn Jinnī
+wrote, so it is stripped at display time like any other markup — the stored
+headword stays verbatim.
+
 ### Trap 17 — an unmarked chapter is not the previous chapter
 
 This witness of *Sirr* never marks `حرف النون`, and the volume divider
@@ -560,6 +595,7 @@ Single file, stdlib only, offline after `setup`.
     lughat.py ilal --check          check the iʿlāl rules against the Qurʾān
     lughat.py akbar <root>          the six permutations, per Ibn Jinnī
     lughat.py letter <root>         Ibn Jinnī on the root's letters
+    lughat.py mentions <root>       search the books not keyed by root
     lughat.py ingest <lexicon> --from PATH
                                     maqayis | mufradat | lisan | sirr | khasais
     lughat.py serve [--port=N]      the approval gate as a local page

@@ -13,12 +13,12 @@ phase at all, and one was never addressed. Corrected here.
 |---|---|---|
 | 1 | The root of the word | **Done** — deterministic, from the corpus |
 | 1a | Explanation of the root *letters* — Ibn Jinnī, *Sirr Ṣināʿat al-Iʿrāb* | **Built** — `lughat.py letter`, 28 of 29 letters in this witness |
-| 1b | Ishtiqāq from Ibn Jinnī — *al-Khaṣāʾiṣ*, ishtiqāq akbar | **Built** — `lughat.py akbar`; al-Khaṣāʾiṣ ingested, search pending |
+| 1b | Ishtiqāq from Ibn Jinnī — *al-Khaṣāʾiṣ*, ishtiqāq akbar | **Done** — `lughat.py akbar`; `lughat.py mentions` searches the books not keyed by root, refusing first and stating the rule. Waiting only on approval |
 | 1c | Ishtiqāq ṣaghīr table | **Done** |
 | 2 | How the word forms from the letters | **Half.** Ṣarf mechanics done; the word-centred view and the sourced aṣl are pending |
 | 3 | Synonyms | Phase 7, with the furūq |
 | 3 | **Opposites (aḍdād)** | **Was never addressed.** Now Phase 7, and needs a source |
-| 4 | Dictionary + tafsir cards, exact text, selectable | **Three lexicons ingested** (Maqāyīs, Mufradāt, Lisān), all gated. Card UI is Phase 3 |
+| 4 | Dictionary + tafsir cards, exact text, selectable | **Done for the lexicons** — `lughat.py read` serves selectable cards, empty ones included. Tafsir is Phase 6 |
 | 5 | Same root elsewhere in the Qurʾān | **Done** |
 | 5 | Same root in ḥadīth | Phase 9 |
 

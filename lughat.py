@@ -39,6 +39,7 @@ Usage:
   lughat.py ilal --check          check the i'lal rules against the Qur'an
   lughat.py akbar <root>          the six permutations, per Ibn Jinni
   lughat.py letter <root|letter>  Ibn Jinni on the root's letters
+  lughat.py mentions <root>       books not keyed by root, searched
   lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
   lughat.py ingest <lexicon> --from PATH
                                   load a lexicon, ALL at verified = 0
@@ -2822,6 +2823,155 @@ def store_babs(conn):
 
 
 # ==========================================================================
+# 8e.  BOOKS NOT KEYED BY ROOT  --  retrieval by string, and it says so
+# ==========================================================================
+#
+# al-Khasa'is is organised by TOPIC, and Sirr Sina'at al-I'rab by LETTER.
+# Neither has an article on س ك ن to look up.  So the only honest way in is
+# to search the text for the root's own letters -- which is retrieval, not
+# analysis, and the difference has to be stated on the page rather than
+# assumed by the reader.
+#
+# THE RULE, WRITTEN DOWN.  A hit is a word in which the radicals occur IN
+# ORDER, separated only by the letters a template can insert between them --
+# the three long vowels ا و ي.  So a search for س ك ن finds سكن, يسكن, ساكن,
+# مسكون, مساكين, تسكين.  For a mudaa'af root the doubled radical may be
+# written once (ادغام: مدد -> مد), so the last radical is optional when it
+# repeats the second.
+#
+# WHAT THE RULE COSTS, ALSO WRITTEN DOWN.  This is a string search:
+#
+#   - it MISSES a form with a consonant infixed between radicals -- form
+#     VIII's ta' (اجتمع for ج م ع), and any i'lal that replaces a radical
+#     outright (قال for ق و ل: the waw is simply not in the string);
+#   - it OVERMATCHES: the separator class cannot tell a template's alif from
+#     a different root's radical, so س ل م finds سليمان.
+#
+# Both failures are the reader's to judge, because every hit is shown as the
+# author's own sentence with its page.  What the tool must not do is present
+# the search as morphological analysis, or a hit as Ibn Jinni's opinion ON
+# this root.  He is discussing whatever he is discussing; the word merely
+# occurs there.
+
+# The only letters a wazn inserts between two radicals.  Alif maqsura is
+# folded into ya' by canonical_root(), and the dagger alif by norm_alif().
+INFIX_LETTERS = "اوي"
+
+SEARCH_IS_A_STRING_SEARCH = (
+    "This is a STRING SEARCH, not a morphological analysis: it finds words "
+    "in which the radicals occur in order, separated only by ا و ي. It "
+    "misses forms that infix a consonant (form VIII اجتمع) or replace a "
+    "radical by i'lal (قال from ق و ل), and it overmatches (س ل م finds "
+    "سليمان). Every hit below is the author's own sentence with its page; "
+    "that this book mentions the word is a fact, and what he means by it is "
+    "for you to read.")
+
+REFUSAL_NOT_KEYED_BY_ROOT = (
+    "REFUSED. %s is organised by %s, not by root, so it has no article on "
+    "%s to quote. Inventing one would file text under something the book "
+    "never said. What follows instead is a search of its text.")
+
+
+def root_search_re(root):
+    """Compile the rule above into one regex over normalised text."""
+    letters = canonical_root(root)
+    sep = "[" + INFIX_LETTERS + "]*"
+    parts = [re.escape(norm_alif(x) or x) for x in letters]
+    pat = sep.join(parts)
+    if len(letters) == 3 and letters[1] == letters[2]:
+        # idgham writes the doubled radical once
+        pat = parts[0] + sep + parts[1] + "(?:" + sep + parts[2] + ")?"
+    return re.compile(pat)
+
+
+def _blocks_with_pages(raw):
+    """Split a stored entry into its paragraphs, each with its own page.
+
+    A long chapter spans many pages, so the ENTRY's page is not the PASSAGE's
+    page.  The page is resolved by the same lookahead rule as ingestion: a
+    PageV##P### marker CLOSES the page it names, so a block sits on the page
+    named by the next marker at or after its last line (trap 15)."""
+    lines = raw.splitlines()
+    page_at = [(None, None)] * len(lines)
+    nxt = (None, None)
+    for j in range(len(lines) - 1, -1, -1):
+        m = _PAGE_RE.search(lines[j])
+        if m:
+            nxt = (int(m.group(1)), int(m.group(2)))
+        page_at[j] = nxt
+    blocks, cur, start = [], [], 0
+    for i, line in enumerate(lines):
+        if line.startswith("~~") or _HDR_RE.match(line) or not cur:
+            if not cur:
+                start = i
+            cur.append(line)
+            continue
+        blocks.append((start, cur))
+        cur, start = [line], i
+    if cur:
+        blocks.append((start, cur))
+    out = []
+    for start, block in blocks:
+        text = render_entry("\n".join(block))
+        if text:
+            # a marker line belongs to no block (it is neither a "# " head
+            # nor a "~~" continuation), so a block never spans one and the
+            # first and last line agree; the last is the one that matters if
+            # that ever stops being true.
+            out.append((" ".join(text), page_at[start + len(block) - 1]))
+    return out
+
+
+KEYED_BY_WORD = {"chapter": "topic", "letter": "the letters themselves"}
+
+
+def root_keyed(source_key):
+    """Is this book organised so that a root can be looked up in it at all?"""
+    return LEXICONS.get(source_key, {}).get("keyed_by", "root") == "root"
+
+
+# OpenITI marks a header it generated itself with AUTO. That is the
+# digitisation's annotation, not a chapter title Ibn Jinni wrote, so it comes
+# off at DISPLAY time by the same principle as render_entry(): the stored
+# headword stays verbatim, and the rule that cleans it is readable here.
+_AUTO_RE = re.compile(r"^\s*(?:\|+\s*)?AUTO\s+")
+
+
+def chapter_label(headword):
+    return _AUTO_RE.sub("", headword or "").strip()
+
+
+def passage_search(conn, source_key, root, limit=6):
+    """Passages in an unkeyed book whose text matches the root, APPROVED only.
+
+    Returns (hits, n_more, n_pending).  Ranking is by position in the book,
+    which is the book's own order and not a relevance score this tool would
+    have to invent."""
+    rx = root_search_re(root)
+    src = q(conn, "SELECT id, title, author, attribution FROM sources "
+                  "WHERE key=?", (source_key,)).fetchone()
+    if src is None:
+        return [], 0, 0
+    hits = []
+    for e in q(conn, "SELECT headword, vol, page, text_raw FROM v_entries "
+                     "WHERE source_id=? ORDER BY id", (src["id"],)):
+        if e["text_raw"] is None:
+            continue
+        for text, (vol, page) in _blocks_with_pages(e["text_raw"]):
+            if rx.search(norm_alif(text)):
+                hits.append({
+                    "chapter": chapter_label(e["headword"]),
+                    "vol": str(vol) if vol is not None else e["vol"],
+                    "page": str(page) if page is not None else e["page"],
+                    "text": text})
+    with unguarded(conn):
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM entries WHERE source_id=? AND verified=0 "
+            "AND rejected=0", (src["id"],)).fetchone()[0]
+    return hits[:limit], max(0, len(hits) - limit), pending
+
+
+# ==========================================================================
 # 9.  ATTESTATION
 # ==========================================================================
 #
@@ -3377,6 +3527,61 @@ def cmd_akbar(conn, root):
         _w("  " + line)
     _w("")
     _w(QAC_ATTRIBUTION)
+
+
+def cmd_mentions(conn, root):
+    """Requirement 1b, second half: the books that have no article to look up.
+
+    al-Khasa'is is arranged by topic and Sirr Sina'at al-I'rab by letter, so
+    neither can be asked what it says about a root.  It can only be searched,
+    and the difference is printed, not glossed over."""
+    letters = canonical_root(root)
+    _w(BAR)
+    _w("MENTIONS   %s   (books not keyed by root)" % " ".join(letters))
+    _w(BAR)
+    for line in _wrap(SEARCH_IS_A_STRING_SEARCH, 72):
+        _w(line)
+    _w("")
+    _w("matching rule (this is the whole of it):  %s"
+       % root_search_re(root).pattern)
+    _w("")
+    for key in sorted(k for k in LEXICONS if not root_keyed(k)):
+        src = q(conn, "SELECT title, attribution FROM sources WHERE key=?",
+                (key,)).fetchone()
+        if src is None:
+            _w("%-10s not ingested." % key)
+            continue
+        _w(RULE)
+        for line in _wrap(REFUSAL_NOT_KEYED_BY_ROOT % (
+                src["title"], KEYED_BY_WORD[LEXICONS[key]["keyed_by"]],
+                "".join(letters)), 72):
+            _w(line)
+        hits, more, pending = passage_search(conn, key, root)
+        if not hits:
+            msg = ("NOT APPROVED: %d chapters of this book are ingested and "
+                   "awaiting review, so they were not searched." % pending
+                   ) if pending else (
+                   "No passage in the approved text matches this root.")
+            for line in _wrap(msg, 70):
+                _w("  " + line)
+            _w("")
+            continue
+        for h in hits:
+            _w("")
+            _w("  [%s]  vol %s p. %s" % (h["chapter"], h["vol"], h["page"]))
+            for line in _wrap(h["text"], 70):
+                _w("    " + line)
+        if more:
+            _w("")
+            _w("  %d further passage%s matched and %s not shown."
+               % (more, "" if more == 1 else "s",
+                  "was" if more == 1 else "were"))
+        if pending:
+            _w("  %d chapters are still unapproved and were not searched."
+               % pending)
+        _w("")
+        _w("  %s" % src["attribution"])
+        _w("")
 
 
 def cmd_aya(conn, ref):
@@ -5022,6 +5227,91 @@ def _t(conn):
     return "و+اح+د -> واحد; 'إن ' + 'إلك' -> إن إلك"
 
 
+_PASSAGE_FIXTURE = "\n".join([
+    "# وهذا باب من العربية",
+    "~~يقال في جمع مسكين مساكين وهو مما جاء على مفاعيل",
+    "PageV01P010",
+    "# وقالوا اجتمع القوم اجتماعا",
+    "PageV01P011",
+])
+
+
+@test("HONESTY", "a book not keyed by root is searched, never quoted at it")
+def _t(conn):
+    """al-Khasa'is is arranged by topic and Sirr by letter. Neither has an
+    article on س ك ن, so the tool must not present one -- and must not print
+    an empty card saying "no entry for this root" either, which reads as a
+    claim about the book's contents rather than its organisation."""
+    ck(not root_keyed("khasais") and not root_keyed("sirr"),
+       "a book organised by topic or letter is being treated as root-keyed")
+    with unguarded(conn):
+        conn.execute("SAVEPOINT pas")
+        conn.execute("INSERT INTO sources (key,title,kind,attribution) "
+                     "VALUES ('khasais_t','KT','lexicon','KT ATTRIB')")
+        sid = conn.execute(
+            "SELECT id FROM sources WHERE key='khasais_t'").fetchone()[0]
+        for verified in (0, 1):
+            conn.execute(
+                "INSERT INTO entries (source_id,root_ar,headword,text_raw,"
+                "vol,page,extraction,verified) VALUES (?,NULL,?,?,'1','9',"
+                "'direct',?)", (sid, "باب", _PASSAGE_FIXTURE, verified))
+    try:
+        LEXICONS["khasais_t"] = {"keyed_by": "chapter"}
+        hits, more, pending = passage_search(conn, "khasais_t", "سكن")
+        ck(len(hits) == 1, "%d hits, expected exactly one (the approved row "
+                           "matched once; the pending row must not be read)"
+           % len(hits))
+        ck(pending == 1, "the unsearched pending chapter was not counted")
+        h = hits[0]
+        ck("مساكين" in h["text"], "the passage itself was not returned")
+        ck("PageV" not in h["text"] and "~~" not in h["text"],
+           "the passage leaked digitisation markup")
+        ck(chapter_label("|| AUTO حرف السين") == "حرف السين",
+           "OpenITI's own AUTO marker is shown as if it were a chapter title")
+        with unguarded(conn):
+            kept = conn.execute("SELECT headword FROM entries WHERE "
+                                "source_id=? LIMIT 1", (sid,)).fetchone()[0]
+        ck(kept == "باب", "cleaning the label changed the stored headword")
+        # trap 15 on a PASSAGE: the marker CLOSES the page it names, so the
+        # block that ends before PageV01P010 is ON page 10, not page 9.
+        ck((h["vol"], h["page"]) == ("1", "10"),
+           "passage cited to vol %s p. %s; the closing marker says 1/10"
+           % (h["vol"], h["page"]))
+        # and the search must not reach the unapproved chapter
+        with unguarded(conn):
+            conn.execute("UPDATE entries SET verified=0 WHERE source_id=?",
+                         (sid,))
+        ck(not passage_search(conn, "khasais_t", "سكن")[0],
+           "an unapproved chapter was searched")
+    finally:
+        LEXICONS.pop("khasais_t", None)
+        with unguarded(conn):
+            conn.execute("ROLLBACK TO pas")
+            conn.execute("RELEASE pas")
+    return "searched, page resolved by the closing marker, pending untouched"
+
+
+@test("HONESTY", "the string search states what it misses, and it is true")
+def _t(conn):
+    """A stated limit that the code does not actually have is worse than no
+    statement: the reader calibrates on it. So the two failures the prose
+    admits to are exercised here against the regex itself."""
+    rx = lambda root, word: bool(root_search_re(root).search(norm_alif(word)))
+    ck(rx("سكن", "مساكين") and rx("سكن", "تسكين") and rx("سكن", "ساكن"),
+       "the rule does not find the forms it claims to")
+    # the two admitted failures, in the same order the prose admits them
+    ck(not rx("جمع", "اجتمع"), "form VIII is found after all; fix the prose")
+    ck(not rx("قول", "قال"), "i'lal is found after all; fix the prose")
+    ck(rx("سلم", "سليمان"), "the overmatch is gone; fix the prose")
+    ck(rx("مدد", "مد"), "idgham writes the doubled radical once")
+    for needle in ("STRING SEARCH", "اجتمع", "قال", "سليمان"):
+        ck(needle in SEARCH_IS_A_STRING_SEARCH,
+           "the notice does not mention %s" % needle)
+    ck("REFUSED" in REFUSAL_NOT_KEYED_BY_ROOT,
+       "a book with no article on the root does not refuse")
+    return "3 forms found, form VIII and i'lal missed, سليمان overmatched -- as stated"
+
+
 @test("HONESTY", "ishtiqaq akbar lists, and refuses to interpret")
 def _t(conn):
     """Listing the six permutations is arithmetic and saying which occur is a
@@ -5367,9 +5657,21 @@ def _t(conn):
     ck(data.get("cards"), "no cards at all")
     keys = {c["key"] for c in data["cards"]}
     with unguarded(conn):
-        want = {r[0] for r in conn.execute(
+        have = {r[0] for r in conn.execute(
             "SELECT key FROM sources WHERE kind IN ('lexicon','tafsir')")}
-    ck(keys == want, "cards %s but sources %s" % (sorted(keys), sorted(want)))
+    # every source is accounted for: a book keyed by root gets a card, and a
+    # book that is not gets a search. Neither may simply vanish.
+    want = {k for k in have if root_keyed(k)}
+    ck(keys == want, "cards %s but root-keyed sources %s"
+       % (sorted(keys), sorted(want)))
+    searched = {b["key"] for b in data["passages"]}
+    ck(searched == have - want, "unkeyed books %s but searched %s"
+       % (sorted(have - want), sorted(searched)))
+    for b in data["passages"]:
+        ck(b["refusal"].startswith("REFUSED"),
+           "%s does not say it has no article to quote" % b["key"])
+        ck(b["rule"], "%s does not say its hits come from a string search"
+           % b["key"])
     empty = [c for c in data["cards"] if not c["entries"]]
     ck(empty, "every source happens to have an entry; test is not exercised")
     for c in empty:
@@ -6007,6 +6309,8 @@ h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.11em;
 .card{background:var(--surf);border:1px solid var(--rule);border-radius:4px;
  padding:1rem 1.15rem;margin-bottom:.7rem}
 .card.empty{background:transparent;border-style:dashed;color:var(--faint)}
+.card.empty.ref{color:var(--mad);border-color:var(--mad);
+ font-size:.82rem;line-height:1.6}
 .ct{display:flex;gap:.6rem;align-items:baseline;flex-wrap:wrap;
  margin-bottom:.55rem}
 .ct b{color:var(--ink);font-size:1rem}
@@ -6170,7 +6474,28 @@ function draw(){
     '</div><div class="v ar">'+esc(p.root)+'</div><div class="note">'+
     (p.n? p.n+(p.n==1?" segment":" segments")+" in the Qur’an"
       :"does not occur")+'</div></div>';
-  h+='</div>';}
+  h+='</div><div class="card empty ref">'+esc(r.akbar_refusal)+'</div>';}
+
+ for(const b of r.passages||[]){
+  h+='<h2>'+esc(b.title)+' &mdash; search, not an article</h2>';
+  h+='<div class="card empty ref">'+esc(b.refusal)+'</div>';
+  h+='<div class="cls" style="margin:.5rem 0 .7rem">'+esc(b.rule)+'</div>';
+  if(!b.hits.length){
+   h+='<div class="card empty">'+(b.pending
+     ? 'Nothing approved yet &mdash; '+b.pending+' chapter'+
+       (b.pending==1?"":"s")+' of this book are ingested and awaiting '+
+       'review, so they were not searched.'
+     : 'No passage in the approved text matches this root.')+'</div>';
+   continue;}
+  for(const x of b.hits)
+   h+='<div class="card"><div class="ct"><b>'+esc(b.title)+'</b>'+
+    '<span class="who ar">'+esc(x.chapter)+'</span>'+
+    '<span class="cite">vol '+esc(x.vol)+' p. '+esc(x.page)+'</span></div>'+
+    '<div class="txt ar"><p>'+esc(x.text)+'</p></div>'+
+    '<div class="attrib">'+esc(b.attribution)+'</div></div>';
+  if(b.more) h+='<div class="cls">'+b.more+' further passage'+
+   (b.more==1?"":"s")+' matched and were not shown.</div>';
+ }
 
  h+='<h2>In the Qur’an</h2><div class="tw"><table><thead><tr>'+
   '<th>lemma</th><th>pos</th><th>count</th><th>first</th></tr></thead><tbody>';
@@ -6287,6 +6612,12 @@ def read_root(conn, query):
     for src in q(conn, "SELECT id, key, title, author, edition, attribution "
                        "FROM sources WHERE kind IN ('lexicon','tafsir') "
                        "ORDER BY key"):
+        # A book not keyed by root gets a SEARCH below, not a card here.  An
+        # empty card would say "no entry for this root", which reads as a
+        # statement about the book's contents when it is a statement about
+        # the book's organisation.
+        if not root_keyed(src["key"]):
+            continue
         ents = list(q(conn,
                       "SELECT text_raw, scan_uri, vol, page, extraction, "
                       "headword FROM v_entries WHERE source_id=? AND "
@@ -6321,6 +6652,24 @@ def read_root(conn, query):
                          "title": e["title"], "attribution": e["attribution"]}
                         for e in ents]})
     out["letter_cards"] = letter_cards
+
+    # books organised by topic or by letter: retrieval by string, labelled
+    out["passages"] = []
+    for key in sorted(k for k in LEXICONS if not root_keyed(k)):
+        src = q(conn, "SELECT title, author, attribution FROM sources "
+                      "WHERE key=?", (key,)).fetchone()
+        if src is None:
+            continue
+        hits, more, pending = passage_search(conn, key, root)
+        out["passages"].append({
+            "key": key, "title": src["title"], "author": src["author"],
+            "attribution": src["attribution"],
+            "refusal": REFUSAL_NOT_KEYED_BY_ROOT % (
+                src["title"], KEYED_BY_WORD[LEXICONS[key]["keyed_by"]], root),
+            "rule": SEARCH_IS_A_STRING_SEARCH,
+            "hits": hits, "more": more, "pending": pending})
+
+    out["akbar_refusal"] = REFUSAL_AKBAR_SENSE
     return out
 
 
@@ -6423,6 +6772,7 @@ USAGE = """lughat -- a local Qur'anic lexicography tool (offline, stdlib only)
   lughat.py ilal --check          check the i'lal rules against the Qur'an
   lughat.py akbar <root>          the six permutations, per Ibn Jinni
   lughat.py letter <root|letter>  Ibn Jinni on the root's letters
+  lughat.py mentions <root>       books not keyed by root, searched
   lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
   lughat.py ingest <lexicon> --from PATH
                                   load a lexicon, ALL at verified = 0
@@ -6653,6 +7003,13 @@ def _main(argv):
             sys.stdout.write(USAGE)
             return 2
         cmd_akbar(connect(), argv[2])
+        return 0
+
+    if cmd == "mentions":
+        if len(argv) < 3:
+            sys.stdout.write(USAGE)
+            return 2
+        cmd_mentions(connect(), argv[2])
         return 0
 
     if cmd == "aya":
