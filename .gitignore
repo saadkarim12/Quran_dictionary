@@ -1,0 +1,7 @@
+# Downloaded corpus and the generated database.  The corpus is GPL data from
+# a third party and is fetched by `lughat.py setup`; the database is derived.
+data/
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
