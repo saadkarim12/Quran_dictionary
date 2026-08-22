@@ -18,7 +18,7 @@ phase at all, and one was never addressed. Corrected here.
 | 2 | How the word forms from the letters | **Half.** Ṣarf mechanics done; the word-centred view and the sourced aṣl are pending |
 | 3 | Synonyms | Phase 7, with the furūq |
 | 3 | **Opposites (aḍdād)** | **Was never addressed.** Now Phase 7, and needs a source |
-| 4 | Dictionary + tafsir cards, exact text, selectable | Data scheduled; **the card UI itself was not.** Now Phase 3 |
+| 4 | Dictionary + tafsir cards, exact text, selectable | **Three lexicons ingested** (Maqāyīs, Mufradāt, Lisān), all gated. Card UI is Phase 3 |
 | 5 | Same root elsewhere in the Qurʾān | **Done** |
 | 5 | Same root in ḥadīth | Phase 9 |
 

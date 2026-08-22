@@ -36,8 +36,9 @@ Usage:
     lughat.py root <root>           corpus occurrences of a root
     lughat.py word <word>           search the mushaf text
   lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
-  lughat.py ingest maqayis --from PATH
+  lughat.py ingest <lexicon> --from PATH
                                   load a lexicon, ALL at verified = 0
+                                  lexicons: maqayis, mufradat
   lughat.py review [--stats]      the approval gate, in the terminal
   lughat.py serve [--port=N]      the same gate as a local page (127.0.0.1)
 """
@@ -1083,7 +1084,7 @@ def all_refusals(result):
 #                    from its letters; it is read from a lexicon and carries
 #                    bab_source_id / bab_page.  NULL means unknown.
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = r"""
 PRAGMA journal_mode = WAL;
@@ -1175,6 +1176,9 @@ CREATE TABLE IF NOT EXISTS entries (
     -- 'unmatched'      parsed, but no corpus root -- root_ar is the heading's
     -- 'unparsed'       the heading is not a root at all (a bab title, etc.)
     extraction TEXT,
+    -- comma-separated warnings raised at ingest and shown at review, e.g.
+    -- an entry heading that breaks the source's own alphabetical order.
+    flags      TEXT,
     verified   INTEGER NOT NULL DEFAULT 0,
     verified_at TEXT,
     -- A reviewer's "this extraction is wrong". Distinct from merely pending:
@@ -1388,6 +1392,8 @@ _MIGRATIONS_V2 = [
     ("entries", "verified_at", "TEXT"),
     ("tafsir", "extraction", "TEXT"),
     ("tafsir", "verified_at", "TEXT"),
+    ("entries", "flags", "TEXT"),
+    ("tafsir", "flags", "TEXT"),
     ("entries", "rejected", "INTEGER NOT NULL DEFAULT 0"),
     ("entries", "reject_reason", "TEXT"),
     ("tafsir", "rejected", "INTEGER NOT NULL DEFAULT 0"),
@@ -1552,14 +1558,29 @@ def counts(conn):
 # is stripped at DISPLAY time by the documented rule in render_entry(), so the
 # transformation is readable and reversible instead of baked in.
 
+# Arabic alphabetical order, used to check a source against its OWN ordering.
+# A heading that goes backwards is not a new letter-section: it is a sub-entry,
+# a title, or a digitisation artifact -- and the last of those is how one
+# root's article gets filed under another.
+ALPHABET = "ءابتثجحخدذرزسشصضطظعغفقكلمنهوي"
+
+
+def alpha_key(root):
+    return tuple(ALPHABET.index(c) if c in ALPHABET else 99 for c in root)
+
+
 MAQAYIS_ATTRIBUTION = (
     "Ibn Faris, Mu'jam Maqayis al-Lugha, ed. 'Abd al-Salam Muhammad Harun "
     "(Beirut: Dar al-Jil, 1420/1999), 6 vols. Digital text: OpenITI, "
     "CC BY-NC-SA. https://github.com/OpenITI")
 
+MUFRADAT_ATTRIBUTION = (
+    "al-Raghib al-Isbahani, al-Mufradat fi Gharib al-Qur'an. Digital text: "
+    "OpenITI, CC BY-NC-SA. https://github.com/OpenITI")
+
 _HDR_RE = re.compile(r"^### \|+ *(.*)$")
 _PAGE_RE = re.compile(r"PageV(\d+)P(\d+)")
-_MS_RE = re.compile(r"ms\d+")
+_MS_RE = re.compile(r"\bms\d+\b")
 
 
 # An entry heading in this witness is ALWAYS parenthesised: (سكن), (أبت).
@@ -1586,16 +1607,126 @@ _ENTRY_HDR_RE = re.compile(r"^\(\s*([؀-ۿ]+)\s*\)\s*[:\-]?\s*$")
 _SECTION_HDR_RE = re.compile(r"^\[.*\]\s*$")
 
 
-def _heading_root(heading):
-    """The root this heading names, or None if it does not name one."""
-    m = _ENTRY_HDR_RE.match(heading.strip())
-    if not m:
-        return None
+_BARE_HDR_RE = re.compile(r"^[؀-ۿ]{2,6}$")
+
+
+def _as_root(text):
     try:
-        letters = canonical_root(m.group(1))
+        letters = canonical_root(text)
     except (ValueError, TransliterationError):
         return None
     return "".join(letters) if 2 <= len(letters) <= 5 else None
+
+
+def heading_root_parenthesised(heading):
+    """Maqayis: an entry heading is ALWAYS (سكن). Anything else on a "### |"
+    line is a section title or a digitisation artifact -- see trap 13."""
+    m = _ENTRY_HDR_RE.match(heading.strip())
+    return _as_root(m.group(1)) if m else None
+
+
+def heading_root_bare(heading):
+    """Mufradat: an entry heading is a bare short Arabic token (أبد، سكن).
+    There are no parentheses to lean on, so the guard is the source's own
+    alphabetical order -- see ingest_lexicon."""
+    h = heading.strip()
+    return _as_root(h) if _BARE_HDR_RE.match(h) else None
+
+
+LISAN_ATTRIBUTION = (
+    "Ibn Manzur, Lisan al-'Arab. Digital text: OpenITI, CC BY-NC-SA. "
+    "https://github.com/OpenITI")
+
+_LISAN_BARE = re.compile(r"^# ([؀-ۿ]{2,6})\s*$")
+# The colon after the repeated root is NOT always written -- Lisan has both
+# "# ] بدأ : في أسماء الله" and "# ] سكن السكون ضد الحركة" -- and a leading
+# stop sometimes intervenes ("# ] . صقب :"). Requiring the colon silently
+# dropped 827 entries, سكن among them.
+_LISAN_CONFIRM = re.compile(r"^# \]\s*[.،]?\s*([؀-ۿ]{2,6})(?:\s|:|$)")
+
+
+def detect_markdown_header(lines, i, spec):
+    """maqayis / mufradat: entries are '### |' headers."""
+    m = _HDR_RE.match(lines[i])
+    if not m:
+        return None
+    head = m.group(1)
+    if _SECTION_HDR_RE.match(head.strip()):
+        return ("__SECTION__", None, 1)
+    root = spec["heading"](head)
+    return (head.strip(), root, 1) if root else ("__ARTIFACT__", None, 1)
+
+
+def detect_lisan(lines, i):
+    """Lisan has no '###' markers at all, but it names each root TWICE:
+
+        # بدأ
+        # ] بدأ : في أسماء الله عز وجل المبدىء ...
+
+    Requiring the two to agree is a stronger guard than Maqayis had -- a
+    stray line cannot fake both halves.  A bare head with no confirming line
+    is NOT treated as an entry: 8,441 confirm out of 9,268, and inventing
+    entries from the other 827 would be guessing."""
+    m = _LISAN_BARE.match(lines[i])
+    if not m:
+        return None
+    nxt = lines[i + 1] if i + 1 < len(lines) else ""
+    c = _LISAN_CONFIRM.match(nxt)
+    if not c or c.group(1) != m.group(1):
+        return None
+    return (m.group(1), _as_root(m.group(1)), 1)
+
+
+# Everything a lexicon needs to be ingested.  Adding one is data, not code.
+LEXICONS = {
+    "maqayis": {
+        "title": "Mu'jam Maqayis al-Lugha",
+        "author": "Ibn Faris (d. 395 AH)",
+        "edition": "ed. Harun, Dar al-Jil, 1420/1999, 6 vols",
+        "licence": "CC BY-NC-SA",
+        "licence_note": "OpenITI digital text; non-commercial, share-alike, "
+                        "attribution required. Personal study use.",
+        "url": "https://github.com/OpenITI",
+        "attribution": MAQAYIS_ATTRIBUTION,
+        "heading": heading_root_parenthesised,
+        "detect": detect_markdown_header,
+        "ordered_by": "first",
+    },
+    "mufradat": {
+        "title": "al-Mufradat fi Gharib al-Qur'an",
+        "author": "al-Raghib al-Isbahani (d. 502 AH)",
+        "edition": "OpenITI (Shamela 0023636)",
+        "licence": "CC BY-NC-SA",
+        "licence_note": "OpenITI digital text; non-commercial, share-alike, "
+                        "attribution required. Personal study use.",
+        "url": "https://github.com/OpenITI",
+        "attribution": MUFRADAT_ATTRIBUTION,
+        "heading": heading_root_bare,
+        "detect": detect_markdown_header,
+        "ordered_by": "first",
+    },
+    "lisan": {
+        "title": "Lisan al-'Arab",
+        "author": "Ibn Manzur (d. 711 AH)",
+        "edition": "OpenITI (JK 000880)",
+        "licence": "CC BY-NC-SA",
+        "licence_note": "OpenITI digital text; non-commercial, share-alike, "
+                        "attribution required. Personal study use.",
+        "url": "https://github.com/OpenITI",
+        "attribution": LISAN_ATTRIBUTION,
+        "heading": None,
+        "detect": lambda lines, i, spec: detect_lisan(lines, i),
+        # Lisan and al-Qamus order by the LAST radical (bab), then the first
+        # (fasl). Checking it against first-radical order would flag the whole
+        # book.
+        "ordered_by": "last",
+    },
+}
+
+
+def _heading_root(heading):
+    """Backwards-compatible: the Maqayis rule."""
+    return heading_root_parenthesised(heading)
 
 
 def resolve_root(heading_root, corpus_roots):
@@ -1626,38 +1757,74 @@ def resolve_root(heading_root, corpus_roots):
     return heading_root, "unmatched"
 
 
-def parse_maqayis(text, corpus_roots):
-    """Yield one dict per entry.  text_raw is the block verbatim."""
+def parse_lexicon(text, corpus_roots, spec):
+    """Yield one dict per entry.  text_raw is the block verbatim.
+
+    Two guards, and they do different jobs:
+
+      the heading rule   decides what IS an entry.  Maqayis needs
+                         parentheses because its digitisation inserts headers
+                         mid-word; Mufradat has no parentheses to lean on.
+      alphabetical order checks the source against ITSELF.  A heading that
+                         goes backwards through the alphabet is not a new
+                         letter-section, so it is a sub-entry, a title, or an
+                         artifact.  It is flagged, not dropped -- dropping it
+                         would lose text, and the reviewer can see it."""
+    detect = spec["detect"]
+    order_ix = -1 if spec.get("ordered_by") == "last" else 0
+    lines = text.splitlines()
     page = (None, None)
     cur = None
-    for line in text.splitlines():
+    prev_key = None
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         m = _PAGE_RE.search(line)
         if m:
             page = (int(m.group(1)), int(m.group(2)))
-        h = _HDR_RE.match(line)
-        if h:
-            head = h.group(1)
-            if _SECTION_HDR_RE.match(head.strip()):
+        hit = detect(lines, i, spec)
+        if hit is not None:
+            head, hr, consumed = hit
+            if head == "__SECTION__":
                 if cur:
                     yield cur
                 cur = None
+                i += consumed
                 continue
-            hr = _heading_root(head)
             if hr is None:
-                # a digitisation artifact: text, not a heading
+                # not a heading: text belonging to the entry in progress
                 if cur is not None:
                     cur["lines"].append(line)
+                i += consumed
                 continue
             if cur:
                 yield cur
             root, how = resolve_root(hr, corpus_roots)
-            cur = {"headword": head.strip(), "root_ar": root,
+            flags = []
+            key = alpha_key(hr)[order_ix]
+            # Compared with the PREVIOUS heading, not a running maximum. One
+            # stray heading (Mufradat has وإي sitting inside the hamza
+            # section) would poison a max for the rest of the file and flag
+            # 1,524 sound entries -- a warning that cries wolf is worse than
+            # no warning, because the reviewer learns to ignore the badge.
+            if prev_key is not None and key < prev_key:
+                flags.append("out-of-alphabetical-order")
+            prev_key = key
+            cur = {"headword": head, "root_ar": root,
                    "extraction": how, "vol": page[0], "page": page[1],
-                   "lines": []}
-        elif cur is not None:
+                   "flags": ",".join(flags) or None, "lines": []}
+            i += consumed
+            continue
+        if cur is not None:
             cur["lines"].append(line)
+        i += 1
     if cur:
         yield cur
+
+
+def parse_maqayis(text, corpus_roots):
+    """Backwards-compatible wrapper; the tests use it."""
+    return parse_lexicon(text, corpus_roots, LEXICONS["maqayis"])
 
 
 def render_entry(raw):
@@ -1696,53 +1863,75 @@ def render_entry(raw):
             out[-1] = (out[-1] + " " + line).strip()
         else:
             out.append(line)
+    # Lisan opens each entry body with a bracket that marks the entry, not a
+    # word Ibn Manzur wrote: "# ] سكن السكون ضد الحركة". Structural markup,
+    # so it comes off at display time like the rest.
+    if out and out[0].startswith("]"):
+        out[0] = out[0][1:].lstrip()
     return [l.replace("%", "\n").strip() for l in out]
 
 
-def ingest_maqayis(conn, path):
-    """Load Mu'jam Maqayis al-Lugha.  Every row lands verified = 0."""
+def ingest_lexicon(conn, key, path):
+    """Load a lexicon.  Every row lands verified = 0, without exception."""
+    if key not in LEXICONS:
+        raise ValueError("unknown lexicon %r; known: %s"
+                         % (key, ", ".join(sorted(LEXICONS))))
+    spec = LEXICONS[key]
     with open(path, "rb") as fh:
         text = fh.read().decode("utf-8")
     with unguarded(conn):
         cur = conn.cursor()
-        # ON CONFLICT, not INSERT OR REPLACE: replace would delete the row
-        # and re-insert it with a NEW id, orphaning every entry that points
-        # at it -- including ones a person has already approved.
+        # ON CONFLICT, not INSERT OR REPLACE: replace would delete the row and
+        # re-insert it with a NEW id, orphaning every entry that points at it
+        # -- including ones a person has already approved.
         cur.execute(
             "INSERT INTO sources (key,title,author,edition,kind,"
             "licence,licence_note,distributable,url,attribution) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?) "
+            "VALUES (?,?,?,?,'lexicon',?,?,1,?,?) "
             "ON CONFLICT(key) DO UPDATE SET title=excluded.title,"
             "author=excluded.author,edition=excluded.edition,"
             "licence=excluded.licence,licence_note=excluded.licence_note,"
             "distributable=excluded.distributable,url=excluded.url,"
             "attribution=excluded.attribution",
-            ("maqayis", "Mu'jam Maqayis al-Lugha", "Ibn Faris (d. 395 AH)",
-             "ed. Harun, Dar al-Jil, 1420/1999, 6 vols", "lexicon",
-             "CC BY-NC-SA",
-             "OpenITI digital text; non-commercial, share-alike, attribution "
-             "required. Personal study use.", 1,
-             "https://github.com/OpenITI", MAQAYIS_ATTRIBUTION))
+            (key, spec["title"], spec["author"], spec["edition"],
+             spec["licence"], spec["licence_note"], spec["url"],
+             spec["attribution"]))
         sid = cur.execute(
-            "SELECT id FROM sources WHERE key='maqayis'").fetchone()[0]
-        cur.execute("DELETE FROM entries WHERE source_id=?", (sid,))
+            "SELECT id FROM sources WHERE key=?", (key,)).fetchone()[0]
+        # Re-ingesting must not silently discard review work.
+        kept = cur.execute(
+            "SELECT COUNT(*) FROM entries WHERE source_id=? AND "
+            "(verified=1 OR rejected=1)", (sid,)).fetchone()[0]
+        cur.execute("DELETE FROM entries WHERE source_id=? AND verified=0 "
+                    "AND rejected=0", (sid,))
         corpus = {r[0] for r in cur.execute("SELECT root_ar FROM roots")}
+        seen = set()
+        if kept:
+            seen = {r[0] for r in cur.execute(
+                "SELECT headword FROM entries WHERE source_id=?", (sid,))}
         n = 0
         stats = {}
-        for e in parse_maqayis(text, corpus):
+        for e in parse_lexicon(text, corpus, spec):
             raw = "\n".join(e["lines"]).strip()
             if not raw:
                 continue
+            if e["headword"] in seen:
+                continue          # already decided by a person; leave it alone
             cur.execute(
                 "INSERT INTO entries (source_id,root_ar,headword,text_raw,"
-                "text_norm,vol,page,extraction,verified) "
-                "VALUES (?,?,?,?,?,?,?,?,0)",
+                "text_norm,vol,page,extraction,flags,verified) "
+                "VALUES (?,?,?,?,?,?,?,?,?,0)",
                 (sid, e["root_ar"], e["headword"], raw,
-                 norm_alif(raw), e["vol"], e["page"], e["extraction"]))
+                 norm_alif(raw), e["vol"], e["page"], e["extraction"],
+                 e["flags"]))
             stats[e["extraction"]] = stats.get(e["extraction"], 0) + 1
             n += 1
         conn.commit()
-    return n, stats
+    return n, stats, kept
+
+
+def ingest_maqayis(conn, path):
+    return ingest_lexicon(conn, "maqayis", path)[:2]
 
 
 # ==========================================================================
@@ -2030,12 +2219,17 @@ def cmd_root(conn, root):
         r = conn.execute("SELECT COUNT(*) n FROM entries WHERE root_ar=? AND "
                          "verified=0", (root_ar,)).fetchone()
         pending = r["n"] if r else 0
-    if not ents and pending:
-        _w("  %d entry/entries for this root are INGESTED BUT NOT APPROVED."
+    if pending:
+        # Announced whether or not other entries WERE approved. Showing one
+        # lexicon while silently holding another is a lie by omission: the
+        # reader would take what they see for everything there is.
+        _w("  %d further entry/entries here are NOT APPROVED and are not"
            % pending)
-        _w("  They are not shown, because unreviewed text is never served.")
-        _w("  Run:  python3 lughat.py review")
-    elif not ents:
+        _w("  shown. Unreviewed text is never served.")
+        _w("  Run:  python3 lughat.py serve")
+        if ents:
+            _w("")
+    if not ents and not pending:
         _w("  %s" % NOT_FOUND_UR)
         for line in _wrap(
                 "%s. No lexicon has been ingested yet, so this tool has "
@@ -2126,6 +2320,9 @@ def cmd_review(conn, args):
               row["extraction"]))
         _w("vol %s  p. %s   |  root occurs %s times in the Qur'an"
            % (row["vol"], row["page"], occ["n"] if occ else 0))
+        if row["flags"]:
+            _w("!! FLAG: %s -- check the heading against the printed page"
+               % row["flags"])
         if row["extraction"] not in ("direct",):
             _w("!! the root was INFERRED (%s), not read straight from the "
                "heading" % row["extraction"])
@@ -3024,11 +3221,23 @@ def _t(conn):
     """The build path may propose; only a person may approve. Ingestion that
     could write verified = 1 would make the review gate decorative."""
     src = own_source()
-    body = src[src.index("def ingest_maqayis"):src.index("# 9.  ATTESTATION")]
+    marker = "def " + "ingest_lexicon(conn, key, path):"
+    body = src[src.rindex(marker):src.rindex("def " + "ingest_maqayis")]
+    ck(len(body) > 800, "the ingest slice is empty (%d)" % len(body))
     ck("verified" in body, "the ingest INSERT does not mention verified")
-    ck("verified=1" not in body.replace(" ", ""),
-       "ingestion can write verified = 1")
-    ck("VALUES (?,?,?,?,?,?,?,?,0)" in body,
+    # Ingestion may READ verified (to preserve rows a person already decided)
+    # but must never WRITE it. Checked structurally rather than by line, since
+    # the SQL wraps: no UPDATE of entries at all, and the one INSERT pins 0.
+    flat = " ".join(body.split())
+    ck("UPDATE entries" not in flat,
+       "ingestion updates entries; it may only insert and delete")
+    ck(flat.count("INSERT INTO entries") == 1,
+       "more than one INSERT into entries in the ingest path")
+    ins = flat[flat.index("INSERT INTO entries"):]
+    ins = ins[:ins.index(")", ins.index("VALUES")) + 1]
+    ck(ins.rstrip().endswith(",0)"),
+       "the ingest INSERT does not pin verified to 0: %s" % ins[-40:])
+    ck(",flags,verified) " in body and "?,?,0)" in body.replace(" ", ""),
        "the ingest INSERT does not pin verified to 0")
     n = q(conn, "SELECT COUNT(*) n FROM v_entries").fetchone()["n"]
     total = 0
@@ -3390,6 +3599,114 @@ def _t(conn):
     return "every field escaped; undo scoped to the visible entry; no false empty"
 
 
+_LISAN_FIXTURE = "\n".join([
+    "# سكن",
+    "# ] سكن السكون ضد الحركة سكن الشيء يسكن سكونا",
+    "~~إذا ذهبت حركته",
+    "PageV13P210",
+    "# سلم",
+    "# ] سلم : السلام من أسماء الله عز وجل",
+    "# الليث",
+    "# و الخلب حبل دقيق -- a bare head with no confirming line",
+])
+
+
+@test("HONESTY", "each lexicon is read by its own rules, not one guess")
+def _t(conn):
+    """Three sources, three entry conventions. Maqayis marks entries with
+    parentheses because its digitisation inserts headers mid-word; Mufradat
+    has bare headings; Lisan has no ### markers at all and instead names each
+    root TWICE, which is a stronger guard than either."""
+    for key in ("maqayis", "mufradat", "lisan"):
+        spec = LEXICONS[key]
+        for field in ("title", "author", "attribution", "licence", "detect",
+                      "ordered_by"):
+            ck(spec.get(field), "%s has no %s" % (key, field))
+    # Lisan: the two namings must AGREE, and a lone head is not an entry
+    got = list(parse_lexicon(_LISAN_FIXTURE, {"سكن", "سلم"},
+                             LEXICONS["lisan"]))
+    ck([e["root_ar"] for e in got] == ["سكن", "سلم"],
+       "Lisan parsed %s" % [e["root_ar"] for e in got])
+    ck(all("الليث" not in "".join(e["lines"]) or e["root_ar"] == "سلم"
+           for e in got), "an unconfirmed bare head became an entry")
+    # the confirming line's colon is optional -- requiring it dropped 827
+    # entries from the real text, سكن among them
+    ck(_LISAN_CONFIRM.match("# ] سكن السكون ضد الحركة"),
+       "the confirmation rule still demands a colon")
+    ck(_LISAN_CONFIRM.match("# ] . صقب : الصقب"),
+       "a leading stop defeats the confirmation rule")
+    ck(not _LISAN_CONFIRM.match("# و الخلب حبل"), "confirmation is too loose")
+    return "3 lexicons, 3 entry rules; Lisan requires the root twice"
+
+
+@test("HONESTY", "a source is checked against its OWN ordering scheme")
+def _t(conn):
+    """Lisan and al-Qamus order by the LAST radical. Checking them against
+    first-radical order would flag the entire book, and a warning that cries
+    wolf is worse than none -- the reviewer learns to ignore the badge."""
+    ck(LEXICONS["lisan"]["ordered_by"] == "last", "Lisan is checked wrongly")
+    ck(LEXICONS["maqayis"]["ordered_by"] == "first", "Maqayis checked wrongly")
+    with unguarded(conn):
+        rows = dict(conn.execute(
+            "SELECT s.key, COUNT(*) FROM entries e JOIN sources s "
+            "ON s.id=e.source_id WHERE e.flags IS NOT NULL GROUP BY s.key"))
+        tot = dict(conn.execute(
+            "SELECT s.key, COUNT(*) FROM entries e JOIN sources s "
+            "ON s.id=e.source_id GROUP BY s.key"))
+    for key, n in rows.items():
+        share = 100.0 * n / max(1, tot.get(key, 1))
+        ck(share < 10, "%s flags %.0f%% of its entries -- the check is wrong "
+                       "for this source, not the source" % (key, share))
+    return "flagged: %s of %s" % (rows or "none", tot or "none")
+
+
+@test("HONESTY", "re-ingesting does not discard review work")
+def _t(conn):
+    """Ingest is re-runnable. If it wiped the table it would destroy every
+    decision a person had made, which is the one thing the gate exists to
+    accumulate."""
+    src = own_source()
+    marker = "def " + "ingest_lexicon(conn, key, path):"
+    body = src[src.rindex(marker):src.rindex("def " + "ingest_maqayis")]
+    flat = " ".join(body.split())
+    # the SQL is split across adjacent string literals, so the quote marks
+    # survive a whitespace flatten -- strip them before matching
+    sql = flat.replace('" "', "").replace('"', "")
+    ck("DELETE FROM entries WHERE source_id=? AND verified=0 AND rejected=0"
+       in sql, "ingest deletes rows regardless of review state")
+    ck("DELETE FROM entries WHERE source_id=?," not in sql,
+       "ingest has an unconditional delete of a source's entries")
+    with unguarded(conn):
+        n_decided = conn.execute(
+            "SELECT COUNT(*) FROM entries WHERE verified=1 OR rejected=1"
+        ).fetchone()[0]
+    return "ingest deletes only undecided rows (%d decided today)" % n_decided
+
+
+@test("HONESTY", "the reader announces held-back entries even when it has some")
+def _t(conn):
+    """Showing one lexicon while silently holding another is a lie by
+    omission: the reader takes what they see for everything there is."""
+    out = io.StringIO()
+    real, sys.stdout = sys.stdout, out
+    try:
+        cmd_root(conn, "سكن")
+    finally:
+        sys.stdout = real
+    body = out.getvalue()
+    with unguarded(conn):
+        pend = conn.execute("SELECT COUNT(*) FROM entries WHERE root_ar='سكن' "
+                            "AND verified=0 AND rejected=0").fetchone()[0]
+        appr = conn.execute("SELECT COUNT(*) FROM entries WHERE root_ar='سكن' "
+                            "AND verified=1 AND rejected=0").fetchone()[0]
+    if pend and appr:
+        ck("NOT APPROVED" in body,
+           "entries are held back and the reader is not told")
+    if appr:
+        ck("vol" in body, "an approved entry is shown without its citation")
+    return "%d approved shown, %d pending announced" % (appr, pend)
+
+
 @test("HONESTY", "refusals are refusals, not empty strings")
 def _t(conn):
     res = generate("سكن")
@@ -3598,6 +3915,9 @@ function draw(){
       '</div>':'')+
     (e.scan_only?'<div class="warn hot">This source keyed in no text; the page '+
       'image is the citation.</div>':'')+
+    (e.flags&&e.flags.length?'<div class="warn hot">'+
+      e.flags.map(f=>esc(f)).join(" &middot; ")+
+      ' &mdash; check the heading against the printed page.</div>':'')+
     '<div class="txt ar">'+e.lines.map(l=>"<p>"+esc(l)+"</p>").join("")+
     '</div></div>';
   document.getElementById("hint").textContent=
@@ -3652,7 +3972,7 @@ def _queue_rows(conn, extraction=None, limit=60):
     # otherwise vanish from the queue while still counting as pending, so the
     # reviewer can never reach the end and is never told why.
     sql = ("SELECT e.id, e.headword, e.root_ar, e.extraction, e.vol, e.page, "
-           "e.text_raw, e.scan_uri, s.title, s.author, s.edition, "
+           "e.text_raw, e.scan_uri, e.flags, s.title, s.author, s.edition, "
            "COALESCE((SELECT n_segments FROM roots r "
            "          WHERE r.root_ar = e.root_ar), 0) AS freq "
            "FROM entries e LEFT JOIN sources s ON s.id = e.source_id "
@@ -3682,6 +4002,7 @@ def _queue_rows(conn, extraction=None, limit=60):
                       else ["[scan only — no text keyed in]",
                             r["scan_uri"] or "(no scan_uri either)"]),
             "scan_only": r["text_raw"] is None,
+            "flags": [f for f in (r["flags"] or "").split(",") if f],
         })
     return out
 
@@ -3888,8 +4209,9 @@ USAGE = """lughat -- a local Qur'anic lexicography tool (offline, stdlib only)
   lughat.py root <root>           corpus occurrences of a root
   lughat.py word <word>           search the mushaf text
   lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
-  lughat.py ingest maqayis --from PATH
+  lughat.py ingest <lexicon> --from PATH
                                   load a lexicon, ALL at verified = 0
+                                  lexicons: maqayis, mufradat
   lughat.py review [--stats]      the approval gate, in the terminal
   lughat.py serve [--port=N]      the same gate as a local page (127.0.0.1)
 
@@ -3972,26 +4294,29 @@ def _main(argv):
         return 0
 
     if cmd == "ingest":
-        if len(argv) < 3:
-            sys.stderr.write("usage: lughat.py ingest maqayis --from PATH\n")
-            return 2
-        if argv[2] != "maqayis":
-            sys.stderr.write("unknown source %r; known: maqayis\n" % argv[2])
+        if len(argv) < 3 or argv[2] not in LEXICONS:
+            sys.stderr.write("usage: lughat.py ingest <%s> --from PATH\n"
+                             % "|".join(sorted(LEXICONS)))
             return 2
         if "--from" not in argv:
             sys.stderr.write("ingest needs --from PATH (an OpenITI text)\n")
             return 2
+        key = argv[2]
         path = argv[argv.index("--from") + 1]
         conn = connect()
-        n, stats = ingest_maqayis(conn, path)
+        n, stats, kept = ingest_lexicon(conn, key, path)
+        _w("%s" % LEXICONS[key]["title"])
         _w("ingested %d entries, ALL at verified = 0 (not served)." % n)
         for k in sorted(stats):
             _w("  %-11s %5d" % (k, stats[k]))
+        if kept:
+            _w("  %d entries you had already decided were left untouched."
+               % kept)
         _w("")
         _w("Nothing above is visible to a query until it is approved:")
         _w("  python3 lughat.py review --stats")
-        _w("  python3 lughat.py review")
-        _w(MAQAYIS_ATTRIBUTION)
+        _w("  python3 lughat.py serve")
+        _w(LEXICONS[key]["attribution"])
         return 0
 
     if cmd == "serve":

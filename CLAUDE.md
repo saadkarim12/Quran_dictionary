@@ -295,6 +295,32 @@ entry in progress, rejoined using exactly the whitespace the source itself
 has — `اله` + `مزة` → `الهمزة` — so no spacing is invented and no text is
 dropped. This removed 403 false entries.
 
+### Each lexicon is read by its own rules
+
+One heading rule does not fit three books, and guessing one costs the whole
+extraction:
+
+| | entry marker | ordered by |
+|---|---|---|
+| Maqāyīs | `### | (سكن)` — parentheses required, see trap 13 | first radical |
+| Mufradāt | `### | سكن` — a bare short heading, no parentheses to lean on | first radical |
+| Lisān | no `###` markers at all; the root is named **twice**, `# سكن` then `# ] سكن …` | **last** radical |
+
+Lisān's double naming is the strongest guard of the three — a stray line
+cannot fake both halves — and a bare head with no confirming line is *not* an
+entry. But the confirming colon is **not always written**: `# ] سكن السكون ضد
+الحركة` has none, and requiring it silently dropped **827 entries, `سكن` among
+them**. A guard tuned too tight fails the same way a missing one does, only
+quietly.
+
+`ordered_by` matters as much. Lisān and al-Qāmūs order by the **last** radical
+(bāb), then the first (faṣl); checking them against first-radical order flags
+the entire book. A warning that cries wolf is worse than no warning, because
+the reviewer learns to ignore the badge — which is also why the order check
+compares against the *previous* heading and not a running maximum: one stray
+heading (Mufradāt has `وإي` inside the hamza section) poisoned a max and
+flagged 1,524 sound entries.
+
 ### Two spelling bridges, both recorded as inferences
 
 Measured, not assumed. Direct heading matching covers 81% of corpus roots;
@@ -372,7 +398,8 @@ Single file, stdlib only, offline after `setup`.
     lughat.py root <root>           corpus occurrences of a root
     lughat.py word <word>           search the mushaf text
     lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
-    lughat.py ingest maqayis --from PATH   load a lexicon, all verified = 0
+    lughat.py ingest <lexicon> --from PATH  maqayis | mufradat | lisan
+    lughat.py serve                 the approval gate as a local page
     lughat.py review [--stats]      the approval gate
 
 ## Attribution (required by the licences)
@@ -380,6 +407,10 @@ Single file, stdlib only, offline after `setup`.
 - Ibn Fāris, *Muʿjam Maqāyīs al-Lugha*, ed. ʿAbd al-Salām Muḥammad Hārūn
   (Beirut: Dār al-Jīl, 1420/1999), 6 vols. Digital text: OpenITI,
   CC BY-NC-SA. <https://github.com/OpenITI>
+- al-Rāghib al-Iṣbahānī, *al-Mufradāt fī Gharīb al-Qurʾān*. OpenITI,
+  CC BY-NC-SA. <https://github.com/OpenITI>
+- Ibn Manẓūr, *Lisān al-ʿArab*. OpenITI, CC BY-NC-SA.
+  <https://github.com/OpenITI>
 - Quranic Arabic Corpus, morphology v0.4 — © 2011 Kais Dukes, GNU GPL.
   <http://corpus.quran.com>
 - Tanzil Qur'an text (Uthmani) 1.0.2 — © 2008–2009 Tanzil.info,
