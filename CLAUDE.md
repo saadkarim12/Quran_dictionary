@@ -565,6 +565,11 @@ published work, checked by no one. That is a decision the reader is entitled
 to make about their own tool. It is allowed on four conditions, and the test
 is what keeps them after the asking is forgotten:
 
+`tools/gloss_batch.py` is where the model lives — outside `lughat.py`, by
+design. It reads the approved entries, asks an engine, writes JSONL, and
+reports what it skipped. `--engine=echo` costs the run before a penny is
+spent.
+
 1. **This program does not make them.** It has no model in it and the test
    forbidding one is not relaxed. A gloss is produced by whatever engine the
    reader chooses, *outside* the tool, and imported as a JSONL file of
