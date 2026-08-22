@@ -311,6 +311,26 @@ decorative.
 A root with pending-but-unapproved entries says so. A gap the reader knows
 about is a gap; a gap they don't is a lie by omission.
 
+### Trap 19 — `set_authorizer(None)` is not "no authorizer" on older Pythons
+
+The guard is dropped for ingestion with `unguarded(conn)`. That was written as
+`conn.set_authorizer(None)`, which removes the authorizer on **Python 3.11+**
+and does **not** on 3.10 and earlier: there the callback is stored as `None`,
+every authorization request then fails, and SQLite is told **DENY**. The whole
+program dies with `sqlite3.DatabaseError: not authorized` on a statement as
+innocent as counting rows in `sqlite_master` — on the first command a person
+runs, on a Mac, whose system Python is 3.9.
+
+Handing SQLite a callback that says yes (`_permit_all`) behaves identically on
+every version. And because this build is *developed* on 3.11, no test that
+merely exercises the code can catch it: the test matches on the **call**
+(`conn.set_authorizer(<name>)`, and the name is never `None`), not on
+behaviour it cannot reproduce here.
+
+The general form: **the machine this is written on is not the machine it is
+read on.** A guard that depends on an interpreter version is a guard that is
+absent on somebody's laptop.
+
 ### Trap 13 — a digitisation artifact can file one root's article under another
 
 OpenITI's Maqāyīs inserts `### |` headers **in the middle of a word**:

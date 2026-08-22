@@ -1377,11 +1377,23 @@ def _authorizer(action, arg1, arg2, dbname, trigger_or_view):
     return sqlite3.SQLITE_OK
 
 
+def _permit_all(action, arg1, arg2, dbname, trigger_or_view):
+    """The build path's authorizer.  NOT set_authorizer(None).
+
+    On Python 3.11+ passing None removes the authorizer. On 3.10 and earlier
+    it does not: the callback is stored as None, every authorization request
+    then fails, and SQLite is told DENY -- so the whole program dies with
+    `sqlite3.DatabaseError: not authorized` on statements as innocent as
+    counting rows in sqlite_master. Handing SQLite a callback that says yes
+    works the same way on every version."""
+    return sqlite3.SQLITE_OK
+
+
 @contextlib.contextmanager
 def unguarded(conn):
     """Drop the authorizer for ingestion / review tooling, which legitimately
     writes and reads unverified rows.  The QUERY path never uses this."""
-    conn.set_authorizer(None)
+    conn.set_authorizer(_permit_all)
     try:
         yield conn
     finally:
@@ -1599,7 +1611,7 @@ def load(conn, path=CORPUS_TXT, rebuild=False):
     with open(path, "rb") as fh:
         text = fh.read().decode("utf-8")
 
-    conn.set_authorizer(None)      # ingestion, not the query path
+    conn.set_authorizer(_permit_all)   # ingestion, not the query path
     migrate(conn)  # noqa: E501
     have = conn.execute("PRAGMA user_version").fetchone()[0]
     existing = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE "
@@ -5783,6 +5795,36 @@ def _t(conn):
             conn.execute("DELETE FROM sources WHERE key='_taf'")
             conn.commit()
     return "pending hidden but announced; approved served by range; stamped"
+
+
+@test("INTEGRITY", "the guard is dropped by a callback, never by None")
+def _t(conn):
+    """set_authorizer(None) removes the authorizer on Python 3.11+ and does
+    NOT on 3.10 and earlier -- there it stores None, every authorization
+    request then fails, and SQLite is told DENY. The program died with
+    `not authorized` while counting rows in sqlite_master, on a Mac, on the
+    first command a person ran. This build was developed on 3.11, so no test
+    that merely EXERCISES the code can catch it; the check has to be on the
+    call itself."""
+    # Matched on the CALL, not on the text: this file has to be able to
+    # discuss the bug in a docstring without the test finding its own needle.
+    src = strip_comments(own_source())
+    args = re.findall(r"conn\.set_authorizer\(([A-Za-z_][A-Za-z_0-9]*)\)",
+                      src)
+    ck(args, "no set_authorizer call found at all; has the guard gone?")
+    ck("None" not in args,
+       "set_authorizer(None) is back; it denies everything below Python 3.11")
+    ck(_permit_all(sqlite3.SQLITE_READ, "entries", "text_raw", "main", None)
+       == sqlite3.SQLITE_OK, "the build path's authorizer does not permit")
+    # and the guard must still be armed on the way out
+    with unguarded(conn):
+        conn.execute("SELECT COUNT(*) FROM entries").fetchone()
+    try:
+        q(conn, "SELECT COUNT(*) FROM entries").fetchone()
+        ck(False, "the guard was not re-armed after unguarded()")
+    except UnverifiedAccess:
+        pass
+    return "a permissive callback, not None; guard re-armed after"
 
 
 @test("HONESTY", "the review gate writes only to the two reviewable tables")
