@@ -38,6 +38,7 @@ Usage:
   lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
 """
 
+import contextlib
 import io
 import os
 import re
@@ -331,6 +332,23 @@ def strip_tanwin_alif(s):
     return s
 
 
+SUKUN = "ْ"
+
+
+def _canon_marks(s):
+    """Two identical words can hold their combining marks in different ORDER:
+    the corpus writes نَزَّلَ as zain+shadda+fatha, a template builds it as
+    zain+fatha+shadda.  Byte comparison calls them different words and throws
+    away real attestation.  NFC reorders combining marks canonically (by
+    combining class), so both become the same string.
+
+    The sukun is also dropped.  The Uthmani text does not write it everywhere
+    a template does (يَنزِلُ / يَنْزِلُ, أَنزَلَ / أَنْزَلَ) and its absence marks
+    no vowel, so it carries no contrast that could distinguish two words --
+    while a real vowel is untouched and still does."""
+    return unicodedata.normalize("NFC", s).replace(SUKUN, "")
+
+
 def stem_core(s):
     """The vowelled stem, for EXACT comparison.
 
@@ -345,7 +363,7 @@ def stem_core(s):
     s = strip_tanwin_alif(s)
     while s and (s[-1] in _TANWIN or s[-1] in _SHORT):
         s = s[:-1]
-    return strip_tanwin_alif(s)
+    return _canon_marks(strip_tanwin_alif(s))
 
 
 def skeleton(s):
@@ -355,7 +373,7 @@ def skeleton(s):
 
     Two words with the same skeleton are NOT the same word -- see
     مَسْكَن / مِسْكَن / مُسْكَن / أَسْكَن."""
-    return norm_alif(strip_tanwin_alif(strip_wasl(s)))
+    return _canon_marks(norm_alif(strip_tanwin_alif(strip_wasl(s))))
 
 
 # ==========================================================================
@@ -366,25 +384,61 @@ def skeleton(s):
 # derivable from the letters is the bab -- see section 4 and roots.bab.
 
 WEAK_LETTERS = {"و", "ي"}
+HAMZA = "ء"
 HAMZA_LETTERS = {"ء", "أ", "إ", "آ", "ؤ", "ئ"}
 GUTTURALS = {"ء", "أ", "إ", "آ", "ؤ", "ئ", "ه", "ع", "ح", "غ", "خ"}
 
-# The corpus writes a hamza radical as Buckwalter 'A' (e.g. ROOT:AHd for أحد,
-# ROOT:nbA for نبأ).  An Arabic root never has a true alif as a radical.
-_ROOT_BW_FIX = {"ا": "ء"}
+# A radical slot holds one of 28 consonants.  Everything else that can appear
+# in a root string is a SPELLING of one of them:
+#
+#   ا آ أ إ ٱ ؤ ئ  -> hamza.  An Arabic root never has a true alif radical;
+#                     the corpus writes a hamza radical as Buckwalter 'A'
+#                     (ROOT:Alh, ROOT:nbA), and a person types أ or ا.
+#   ى             -> yaa.  Alef maksura is how a final yaa radical is
+#                     ordinarily typed (رمى for ر م ي), and reading it as
+#                     anything else makes a naqis root look salim.
+#
+# The loader and the query path MUST agree on this, or a root typed one way
+# can never match a root stored the other way.  Both call canonical_root().
+
+_RADICAL_FOLD = {}
+for _ch in "اآأإٱؤئ":
+    _RADICAL_FOLD[_ch] = HAMZA
+_RADICAL_FOLD["ى"] = "ي"
+
+_NOT_A_RADICAL = {"ة": "taa marbuta is a suffix, never a radical"}
 
 
-def root_letters(root):
-    """Accept Arabic (سكن) or Buckwalter (skn); return a list of Arabic
-    radicals.  A bare alif in a root position is a hamza radical."""
+def canonical_root(root):
+    """Accept Arabic (سكن، رمى، اله) or Buckwalter (skn, rmY, Alh) and return
+    the radicals in one canonical spelling.  Raises on anything that cannot
+    be a radical, rather than dropping it."""
+    if root is None:
+        raise ValueError("empty root")
     root = root.strip()
     if not root:
         raise ValueError("empty root")
     if not is_arabic(root):
         root = to_arabic(root)
-    letters = [ch for ch in root if ch not in _MARKS and ch != DAGGER_ALIF
-               and not ch.isspace()]
-    return [_ROOT_BW_FIX.get(ch, ch) for ch in letters]
+    letters = []
+    for ch in root:
+        if ch in _MARKS or ch == DAGGER_ALIF or ch.isspace():
+            continue
+        if ch in _NOT_A_RADICAL:
+            raise ValueError("%r cannot be a radical: %s"
+                             % (ch, _NOT_A_RADICAL[ch]))
+        letters.append(_RADICAL_FOLD.get(ch, ch))
+    if not letters:
+        raise ValueError("no radicals in %r (only marks?)" % root)
+    if not 2 <= len(letters) <= 5:
+        raise ValueError("a root has 2-5 radicals; %r has %d"
+                         % ("".join(letters), len(letters)))
+    return letters
+
+
+def root_letters(root):
+    """Backwards-compatible alias.  One spelling, one code path."""
+    return canonical_root(root)
 
 
 class RootClass(object):
@@ -444,9 +498,16 @@ class RootClass(object):
                 "quadriliteral root: the thulathi abwab below do not apply")
             for i, ch in enumerate(L):
                 if ch in WEAK_LETTERS:
-                    self.kinds.append("weak_rubaai")
+                    # NOT flagged as needing i'lal.  A weak radical in a
+                    # quadriliteral does not undergo it: the corpus reads
+                    # وَسْوَسَ (7:20) and يُوَسْوِسُ (114:5), which is exactly what
+                    # the template produces.  An earlier build flagged these
+                    # UNVERIFIED and was contradicted by its own attestation.
+                    self.kinds.append("weak_rubaai_no_ilal")
                     self.reasons.append(
-                        "weak radical (%s) at position %d" % (ch, i + 1))
+                        "weak letter (%s) at position %d, but a rubaai does "
+                        "not take i'lal on it (cf. وَسْوَسَ, 7:20)"
+                        % (ch, i + 1))
         else:
             self.kinds.append("unsupported")
             self.reasons.append(
@@ -464,7 +525,7 @@ class RootClass(object):
     @property
     def needs_ilal(self):
         return any(k in ("mithal", "ajwaf", "naqis", "lafif_maqrun",
-                         "lafif_mafruq", "weak_rubaai") for k in self.kinds)
+                         "lafif_mafruq") for k in self.kinds)
 
     @property
     def needs_idgham(self):
@@ -605,10 +666,52 @@ MAZID = [
      "madi": "اِFْVَLَّ", "mudari": "يَFْVَLُّ", "amr": "اِFْVَLِLْ",
      "masdar": ["اِFْVِLَاL"], "fail": "مُFْVَLّ", "maful": None,
      "maful_refusal": "form IX (colours and bodily defects) is lazim by rule; "
-                      "it has no ism maf'ul"},
+                      "it has no ism maf'ul",
+     "note": "form IX is confined to colours and bodily defects "
+             "(اِحْمَرَّ، اِعْوَجَّ); whether this root denotes one is not "
+             "derivable from its letters, so the pattern applies to very few "
+             "roots"},
     {"roman": "X",    "name": "istaf'ala",
      "madi": "اِسْتَFْVَLَ", "mudari": "يَسْتَFْVِLُ", "amr": "اِسْتَFْVِLْ",
      "masdar": ["اِسْتِFْVَاL"], "fail": "مُسْتَFْVِL", "maful": "مُسْتَFْVَL"},
+    {"roman": "XI",   "name": "if'aalla",
+     "madi": "اِFْVَاLَّ", "mudari": "يَFْVَاLُّ", "amr": "اِFْVَاLِLْ",
+     "masdar": ["اِFْVِيLَاL"], "fail": "مُFْVَاLّ", "maful": None,
+     "maful_refusal": "form XI, like form IX, is confined to colours and "
+                      "defects and is lazim; it has no ism maf'ul",
+     "note": "forms IX and XI are confined to colours and bodily defects "
+             "(اِحْمَرَّ، اِحْمَارَّ); whether this root denotes one is not "
+             "derivable from its letters"},
+    {"roman": "XII",  "name": "if'aw'ala",
+     "madi": "اِFْVَوْVَLَ", "mudari": "يَFْVَوْVِLُ", "amr": "اِFْVَوْVِLْ",
+     "masdar": ["اِFْVِيVَاL"], "fail": "مُFْVَوْVِL", "maful": "مُFْVَوْVَL"},
+    {"roman": "XIII", "name": "if'awwala",
+     "madi": "اِFْVَوَّLَ", "mudari": "يَFْVَوِّLُ", "amr": "اِFْVَوِّLْ",
+     "masdar": ["اِFْVِوَّاL"], "fail": "مُFْVَوِّL", "maful": "مُFْVَوَّL"},
+]
+
+# --- the rubaai (quadriliteral) -------------------------------------------
+#
+# Easier than the thulathi, not harder: there is no bab ambiguity (the mudari'
+# is fixed at يُفَعْلِلُ) and NO SAMA'I MASDAR PROBLEM -- فَعْلَلَة and فِعْلَال
+# are both qiyasi, so refusal R1 simply does not arise here.  زَلْزَلَ and
+# وَسْوَسَ and دَمْدَمَ are Qur'anic; refusing them was a self-imposed gap.
+
+RUBAAI = [
+    {"roman": "Q-I",  "name": "fa'lala",
+     "madi": "FَVْLَQَ", "mudari": "يُFَVْLِQُ", "amr": "FَVْLِQْ",
+     "masdar": ["FَVْLَQَة", "FِVْLَاQ"], "fail": "مُFَVْLِQ",
+     "maful": "مُFَVْLَQ"},
+    {"roman": "Q-II", "name": "tafa'lala",
+     "madi": "تَFَVْLَQَ", "mudari": "يَتَFَVْLَQُ", "amr": "تَFَVْLَQْ",
+     "masdar": ["تَFَVْLُQ"], "fail": "مُتَFَVْLِQ", "maful": "مُتَFَVْLَQ"},
+    {"roman": "Q-III", "name": "if'anlala",
+     "madi": "اِFْVَنْLَQَ", "mudari": "يَFْVَنْLِQُ", "amr": "اِFْVَنْLِQْ",
+     "masdar": ["اِFْVِنْLَاQ"], "fail": "مُFْVَنْLِQ", "maful": "مُFْVَنْLَQ"},
+    {"roman": "Q-IV", "name": "if'alalla",
+     "madi": "اِFْVَLَQَّ", "mudari": "يَFْVَLِQُّ", "amr": "اِFْVَLِQِQْ",
+     "masdar": ["اِFْVِLْQَاQ"], "fail": "مُFْVَLِQّ", "maful": None,
+     "maful_refusal": "form اِفْعَلَلَّ is lazim; it has no ism maf'ul"},
 ]
 
 # Derivatives of the thulathi mujarrad other than the verb itself.
@@ -641,18 +744,35 @@ REFUSAL_BAB_UNKNOWN = (
 )
 
 REFUSAL_FAIL_BAB5 = (
-    "REFUSED. Bab 5 (fa'ula) does not take the fa'il pattern; it takes a "
-    "sifa mushabbaha (fa'iil, fa'l, fa'al, ...), which is sama'i and not "
-    "derivable. Quote it from a lexicon."
+    "REFUSED. The qiyas for bab 5 (fa'ula) is the sifa mushabbaha (fa'iil, "
+    "fa'l, fa'al, ...), which is sama'i and not derivable. A fa'il IS heard "
+    "from some fa'ula verbs (حَمُضَ فهو حَامِض، طَهُرَ فهو طَاهِر), but that too "
+    "is sama'i. Either way this tool cannot derive it: quote it from a "
+    "lexicon."
 )
 
 REFUSAL_MAFUL_BAB5 = (
-    "REFUSED. Bab 5 (fa'ula) is lazim by rule; it has no ism maf'ul."
+    "REFUSED. Bab 5 (fa'ula) is lazim by rule, so it has no direct ism "
+    "maf'ul. (One built on a zarf or a jarr-majrur -- مَمْرُورٌ بِه -- is "
+    "standard, but that is not derivable from the root either.)"
 )
 
 # Form VIII assimilates or replaces its infixed taa' after certain first
 # radicals (iSTabara, izdajara, itta'akhara).  Those rules are not implemented.
-FORM_VIII_TAA_IBDAL = set("صضطظدذزوي") | {"ث"}
+# اِفْتَعَلَ replaces or assimilates its infixed taa' after these first
+# radicals: ص ض ط ظ -> taa becomes طاء (اِصْطَبَرَ); د ذ ز -> daal (اِزْدَجَرَ);
+# and ت ث و ي ء assimilate outright (ٱتَّبَعَ، ٱثَّاقَلَ، ٱتَّصَلَ، ٱتَّخَذَ).
+# None of those rules is implemented, so forms built on such a root are raw
+# templates.  ت is the case that matters most and is easiest to miss: تبع is
+# a perfectly SOUND root, so nothing else would have flagged it.
+FORM_VIII_TAA_IBDAL = set("صضطظدذز") | set("تثوي") | {HAMZA}
+
+# اِنْفَعَلَ is not built when the faa' is one of these: the nuun of the pattern
+# meets a letter it cannot sit before.  ن م ر ل و ي ء -- so اِنْنَصَرَ is not a
+# word (the form is اِنْتَصَرَ, form VIII).  For ل ر م some texts phrase this as
+# istithqal rather than absolute prohibition; either way the template output
+# is not a claim this tool can stand behind.
+FORM_VII_BLOCKED_FA = set("نمرلوي") | {HAMZA}
 
 
 class Refusal(object):
@@ -735,7 +855,45 @@ def generate(root, bab=None, bab_source=None):
         "notes": [],
     }
 
+    if rc.n == 4:
+        if bab is not None:
+            out["notes"].append(
+                "You supplied bab %d, but the six abwab are the THULATHI "
+                "system. A rubaai has no bab: its mudari' is fixed at "
+                "yufa'lilu. The bab is ignored." % bab)
+        out["notes"].append(
+            "This is a rubaai (quadriliteral). Its masdar is NOT sama'i -- "
+            "fa'lala and fi'laal are both qiyasi -- so refusal R1 does not "
+            "arise and the masdar below is derived.")
+        for spec in RUBAAI:
+            section = {"roman": spec["roman"], "name": spec["name"],
+                       "forms": []}
+            for slot, key in (("madi (3MS)", "madi"),
+                              ("mudari' (3MS)", "mudari"),
+                              ("amr (2MS)", "amr")):
+                section["forms"].append(_mk(slot, spec[key], letters, rc))
+            for m in spec["masdar"]:
+                section["forms"].append(
+                    _mk("masdar (qiyasi)", m, letters, rc))
+            section["forms"].append(
+                _mk("ism fa'il", spec["fail"], letters, rc))
+            if spec["maful"] is None:
+                section["forms"].append(
+                    Refusal("ism maf'ul", "REFUSED. " + spec["maful_refusal"]))
+            else:
+                section["forms"].append(_mk(
+                    "ism maf'ul", spec["maful"], letters, rc,
+                    notes=["holds only if this form of the verb is "
+                           "muta'addi; not derivable from the root"]))
+            out["mazid"].append(section)
+        return out
+
     if not rc.is_thulathi:
+        if bab is not None:
+            out["notes"].append(
+                "You supplied bab %d, but the six abwab are the THULATHI "
+                "system and this root has %d radicals. The bab is ignored."
+                % (bab, rc.n))
         out["notes"].append(
             "The six abwab and the mazid fih forms below are the thulathi "
             "system. This root has %d radicals, so they do not apply and are "
@@ -757,17 +915,31 @@ def generate(root, bab=None, bab_source=None):
             "forms": [],
         }
         # Bab 3's phonological licence IS derivable from the letters.
+        bab_caveats = []
         if b == 3:
-            gut = [x for x in (letters[1], letters[2]) if x in GUTTURALS]
-            section["condition"] = (
-                "licensed: guttural %s present as R2/R3" % "/".join(gut)
-                if gut else
-                "NOT licensed by the letters: bab 3 requires a guttural "
-                "(ء ه ع ح غ خ) as R2 or R3, and this root has none")
+            # A TENDENCY, not a test.  The usual formulation names the 'ayn or
+            # the laam, but أَبَى يَأْبَى is bab 3 with its halq letter at the
+            # FAA' -- the stock counterexample.  And the condition is never
+            # sufficient: رَجَعَ يَرْجِعُ has 'ayn as R2 and is bab 2.  So this
+            # reports what the letters show and claims nothing more.
+            gut = [(i, x) for i, x in enumerate(letters) if x in GUTTURALS]
+            if gut:
+                section["condition"] = (
+                    "guttural %s present at R%s -- consistent with bab 3, "
+                    "but not proof of it"
+                    % ("/".join(x for _, x in gut),
+                       "/".join(str(i + 1) for i, _ in gut)))
+            else:
+                section["condition"] = (
+                    "no guttural (ء ه ع ح غ خ) anywhere in this root. Bab 3 "
+                    "usually has one at the 'ayn or laam, so bab 3 is "
+                    "unlikely here -- but that is a tendency with named "
+                    "exceptions, not a rule, and this tool does not decide it")
         for slot, key in (("madi (3MS)", "madi"),
                           ("mudari' (3MS)", "mudari"),
                           ("amr (2MS)", "amr")):
-            section["forms"].append(_mk(slot, spec[key], letters, rc))
+            section["forms"].append(
+                _mk(slot, spec[key], letters, rc, bab_caveats))
 
         # ---- REFUSAL 1 -------------------------------------------------
         section["forms"].append(Refusal("masdar", REFUSAL_MASDAR_MUJARRAD))
@@ -776,27 +948,44 @@ def generate(root, bab=None, bab_source=None):
             section["forms"].append(Refusal("ism fa'il", REFUSAL_FAIL_BAB5))
             section["forms"].append(Refusal("ism maf'ul", REFUSAL_MAFUL_BAB5))
         else:
-            section["forms"].append(_mk("ism fa'il", FAIL_MUJARRAD, letters, rc))
+            section["forms"].append(
+                _mk("ism fa'il", FAIL_MUJARRAD, letters, rc, bab_caveats))
             section["forms"].append(_mk(
-                "ism maf'ul", MAFUL_MUJARRAD, letters, rc,
+                "ism maf'ul", MAFUL_MUJARRAD, letters, rc, bab_caveats,
                 notes=["holds only if the verb is muta'addi; transitivity is "
                        "not derivable from the root and must be sourced"]))
-        # ism makan / zaman: vowel follows the mudari', so it needs the bab
-        section["forms"].append(_mk(
-            "ism makan/zaman", spec["makan"], letters, rc,
-            notes=[] if not hypothetical else
+        # ism makan / zaman: vowel follows the mudari', so it needs the bab.
+        # The qiyas is right, but there is a closed SAMA'I class of maf'il
+        # nouns from verbs that are not bab 2 -- and it is heavily Qur'anic:
+        # مَسْجِد (28x, from سَجَدَ يَسْجُدُ), مَشْرِق, مَغْرِب, مَطْلِع, مَوْضِع.
+        # The rule cannot know which root is in that class, so it says so.
+        makan_notes = list(
             ["derived under bab %d, which is a hypothesis here, not a sourced "
-             "fact; a different bab gives a different vowel" % b]))
+             "fact; a different bab gives a different vowel" % b]
+            if hypothetical else [])
+        makan_notes.append(
+            "the maf'al/maf'il vowel follows the mudari' by qiyas, but a "
+            "closed SAMA'I class takes maf'il from verbs that are not bab 2 "
+            "(مَسْجِد from سَجَدَ يَسْجُدُ, and مَشْرِق مَغْرِب مَطْلِع مَوْضِع). "
+            "Membership is not derivable; check a lexicon before relying on "
+            "this vowel")
+        section["forms"].append(_mk(
+            "ism makan/zaman", spec["makan"], letters, rc, bab_caveats,
+            notes=makan_notes))
         out["mujarrad"].append(section)
 
     # ---- derivatives that do not depend on the bab ----------------------
     out["mujarrad_derived"].append(_mk(
         "ism tafdil", TAFDIL, letters, rc,
         notes=["holds only if the meaning admits comparison and the verb is "
-               "thulathi, tamm, mutasarrif, mubna li-l-ma'lum and not a "
-               "colour/defect -- conditions not derivable from the letters",
-               "HOMOGRAPH: this pattern is identical to the madi of form IV; "
-               "a corpus hit may be the verb, not the noun. Read the tag."]))
+               "thulathi, tamm, mutasarrif, MUTHBAT (not negated), mabni "
+               "li-l-ma'lum and not a colour/defect -- seven conditions, none "
+               "of them derivable from the letters",
+               "HOMOGRAPH 1: this pattern is identical to the madi of form "
+               "IV; a corpus hit may be the verb, not the noun. Read the tag.",
+               "HOMOGRAPH 2: for a colour or defect root the same string is "
+               "the sifa mushabbaha (حمر -> أَحْمَر), which is the very case "
+               "the conditions above exclude"]))
     for tpl in AALA:
         out["mujarrad_derived"].append(_mk(
             "ism ala", tpl, letters, rc,
@@ -809,6 +998,11 @@ def generate(root, bab=None, bab_source=None):
     # ---- mazid fih -------------------------------------------------------
     for spec in MAZID:
         extra = []
+        if spec["roman"] == "VII" and letters[0] in FORM_VII_BLOCKED_FA:
+            extra.append("form VII is not built when the faa' is %s "
+                         "(ن م ر ل و ي ء): the nuun cannot sit before it, so "
+                         "this is not a word -- for such roots the muta'awi' "
+                         "sense goes to form VIII" % letters[0])
         if spec["roman"] == "VIII" and letters[0] in FORM_VIII_TAA_IBDAL:
             extra.append("form VIII requires ibdal/idgham of the infixed taa' "
                          "after R1 = %s; that rule is not implemented, so "
@@ -818,21 +1012,30 @@ def generate(root, bab=None, bab_source=None):
             "name": spec["name"],
             "forms": [],
         }
+        fnotes = [spec["note"]] if spec.get("note") else []
         for slot, key in (("madi (3MS)", "madi"),
                           ("mudari' (3MS)", "mudari"),
                           ("amr (2MS)", "amr")):
-            section["forms"].append(_mk(slot, spec[key], letters, rc, extra))
+            section["forms"].append(
+                _mk(slot, spec[key], letters, rc, extra, fnotes))
         # mazid masadir are QIYASI -- safe to derive.  This is the one place a
         # masdar may be generated.
         for m in spec["masdar"]:
-            section["forms"].append(_mk("masdar (qiyasi)", m, letters, rc, extra))
-        section["forms"].append(_mk("ism fa'il", spec["fail"], letters, rc, extra))
+            section["forms"].append(
+                _mk("masdar (qiyasi)", m, letters, rc, extra, fnotes))
+        section["forms"].append(
+            _mk("ism fa'il", spec["fail"], letters, rc, extra, fnotes))
         if spec["maful"] is None:
             section["forms"].append(
                 Refusal("ism maf'ul", "REFUSED. " + spec["maful_refusal"]))
         else:
+            # same dependency as the mujarrad's ism maf'ul: forms V and VI in
+            # particular are often lazim.
             section["forms"].append(
-                _mk("ism maf'ul", spec["maful"], letters, rc, extra))
+                _mk("ism maf'ul", spec["maful"], letters, rc, extra,
+                    fnotes + ["holds only if this form of the verb is "
+                              "muta'addi; transitivity is not derivable from "
+                              "the root and must be sourced"]))
         out["mazid"].append(section)
 
     return out
@@ -998,26 +1201,53 @@ TANZIL_ATTRIBUTION = ("Tanzil Qur'an text (Uthmani, 1.0.2), "
 # ==========================================================================
 
 class UnverifiedAccess(RuntimeError):
-    """Raised when a query would read sourced prose without the verified
-    filter.  This is a bug in the caller, and it is fatal by design."""
+    """Raised when a query would read sourced prose outside the verified
+    views.  This is a bug in the caller, and it is fatal by design."""
 
 
-_BASE_TABLE_RE = re.compile(
-    r"\b(?:from|join|into|update)\s+[\"'`\[]?(entries|tafsir)\b", re.I)
+# Enforcement is SQLite's own authorizer callback, not a regex over the SQL
+# text.  An earlier build pattern-matched the statement string; that was
+# defeated by `main.entries`, by `FROM/**/entries`, by a comma cross join, by
+# a scalar subquery, and by creating a second view over the base table.  A
+# regex sees text; the authorizer sees the actual table SQLite resolved, at
+# prepare time, after every alias, qualifier, CTE and view has been expanded.
+#
+# Reads of entries/tafsir are permitted ONLY when SQLite reports that the read
+# is happening through v_entries / v_tafsir, which carry WHERE verified = 1.
+
+_GUARDED_TABLES = ("entries", "tafsir")
+_ALLOWED_VIEWS = ("v_entries", "v_tafsir")
+
+
+def _authorizer(action, arg1, arg2, dbname, trigger_or_view):
+    if action == sqlite3.SQLITE_READ and arg1 in _GUARDED_TABLES:
+        if trigger_or_view in _ALLOWED_VIEWS:
+            return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
+@contextlib.contextmanager
+def unguarded(conn):
+    """Drop the authorizer for ingestion / review tooling, which legitimately
+    writes and reads unverified rows.  The QUERY path never uses this."""
+    conn.set_authorizer(None)
+    try:
+        yield conn
+    finally:
+        conn.set_authorizer(_authorizer)
 
 
 def q(conn, sql, params=()):
-    """Every read in the query path goes through here.
-
-    Sourced prose (entries, tafsir) may only be read through v_entries /
-    v_tafsir, which filter verified = 1.  Naming a base table here raises.
-    Loading code uses conn.execute directly and is the only thing allowed to."""
-    m = _BASE_TABLE_RE.search(sql)
-    if m:
-        raise UnverifiedAccess(
-            "query names base table %r; unverified rows must never be served. "
-            "Read through v_%s instead." % (m.group(1), m.group(1)))
-    return conn.execute(sql, params)
+    """Every read in the query path goes through here."""
+    try:
+        return conn.execute(sql, params)
+    except sqlite3.DatabaseError as e:
+        if "prohibited" in str(e):
+            raise UnverifiedAccess(
+                "%s -- unverified rows must never be served; read through "
+                "v_entries / v_tafsir instead" % e)
+        raise
 
 
 def connect(path=DB_PATH, create=False):
@@ -1030,6 +1260,7 @@ def connect(path=DB_PATH, create=False):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.set_authorizer(_authorizer)
     return conn
 
 
@@ -1116,6 +1347,7 @@ def load(conn, path=CORPUS_TXT, rebuild=False):
     with open(path, "rb") as fh:
         text = fh.read().decode("utf-8")
 
+    conn.set_authorizer(None)      # ingestion, not the query path
     have = conn.execute("PRAGMA user_version").fetchone()[0]
     existing = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE "
                             "type='table' AND name='segments'").fetchone()[0]
@@ -1153,7 +1385,11 @@ def load(conn, path=CORPUS_TXT, rebuild=False):
     words = {}
     for r in parse_corpus(text):
         form_ar = to_arabic(r["form_bw"])
-        root_ar = to_arabic(r["root_bw"]) if r["root_bw"] else None
+        # canonical_root(), the same function the query path uses -- otherwise
+        # ROOT:Alh lands under اله while a search for اله asks for ءله and the
+        # tool reports 2851 segments as absent.
+        root_ar = ("".join(canonical_root(r["root_bw"]))
+                   if r["root_bw"] else None)
         lemma_letters, lemma_hom = split_lemma(r["lemma_bw"])
         lemma_ar = to_arabic(lemma_letters) if lemma_letters else None
         rows.append((qac_id, r["sura"], r["aya"], r["word"], r["seg"],
@@ -1189,6 +1425,7 @@ def load(conn, path=CORPUS_TXT, rebuild=False):
         conn.execute("UPDATE roots SET weakness=? WHERE id=?",
                      (RootClass(root_letters(rar)).label(), rid))
     conn.commit()
+    conn.set_authorizer(_authorizer)
     return counts(conn)
 
 
@@ -1251,10 +1488,16 @@ class Attestation(object):
 
 
 def attest(conn, text, root_ar=None, limit=8):
-    """Look a generated form up in the corpus.  Pure retrieval."""
+    """Look a generated form up in the corpus.  Pure retrieval.
+
+    The cap is applied AFTER ranking, never before.  Truncating in sura order
+    and then sorting EXACT-first can drop every exact hit and leave a screen
+    of skeleton matches each stamped "not attestation" -- so the reader
+    concludes there is no evidence when there is.  Anything dropped is
+    counted and reported, not silently discarded."""
     core = stem_core(text)
     skel = skeleton(text)
-    sql = ("SELECT * FROM segments WHERE skel = ? AND is_stem = 1")
+    sql = "SELECT * FROM segments WHERE skel = ? AND is_stem = 1"
     params = [skel]
     if root_ar:
         sql += " AND root_ar = ?"
@@ -1269,10 +1512,19 @@ def attest(conn, text, root_ar=None, limit=8):
             continue
         seen.add(key)
         hits.append(Attestation(kind, row))
-        if len(hits) >= limit:
-            break
-    hits.sort(key=lambda a: (a.kind != "EXACT", a.sura, a.aya))
-    return hits
+    hits.sort(key=lambda a: (a.kind != "EXACT", a.sura, a.aya, a.word))
+    shown, dropped = hits[:limit], hits[limit:]
+    return AttestationSet(shown, len(dropped),
+                          sum(1 for a in dropped if a.kind == "EXACT"))
+
+
+class AttestationSet(list):
+    """The hits shown, plus an honest count of what the cap left out."""
+
+    def __init__(self, shown, n_dropped, n_dropped_exact):
+        list.__init__(self, shown)
+        self.n_dropped = n_dropped
+        self.n_dropped_exact = n_dropped_exact
 
 
 def attest_result(conn, result):
@@ -1306,12 +1558,16 @@ def print_attestations(ats, indent="      "):
     if not ats:
         _w(indent + "not found in the corpus")
         return
+    n_dropped = getattr(ats, "n_dropped", 0)
     for a in ats:
         mark = "EXACT   " if a.kind == "EXACT" else "SKELETON"
         _w("%s%s %-14s %-10s %s" % (indent, mark, a.form_ar, a.ref, a.grammar()))
         if a.kind == "SKELETON":
             _w(indent + "         ^ same consonants, different vowels: "
                         "this is a DIFFERENT WORD, not attestation")
+    if n_dropped:
+        _w("%s... and %d more not shown (%d of them EXACT)"
+           % (indent, n_dropped, ats.n_dropped_exact))
 
 
 def print_form(f, conn=None):
@@ -1523,6 +1779,10 @@ def cmd_aya(conn, ref):
 
 
 def cmd_word(conn, word):
+    # USAGE says words may be typed in Buckwalter; honour that rather than
+    # returning a confident zero.
+    if not is_arabic(word):
+        word = to_arabic(word)
     keys = query_keys(word)
     _w(BAR)
     _w("WORD SEARCH: %s" % word)
@@ -1553,19 +1813,24 @@ def cmd_word(conn, word):
     _w("")
     _w("%d occurrence(s) as a stem segment." % len(srows))
     if srows and not rows:
-        # Not a false negative, and worth saying so plainly: the corpus splits
-        # ٱل / ب / و / ل into their own segments, so a word the mushaf writes
-        # with a prefix has no whole-word row under its bare spelling.
-        _w("  (0 whole words but %d stems: the corpus segments prefixes "
-           "(ٱل، ب، و، ل)" % len(srows))
-        _w("   separately, so the mushaf's spelling of this word carries one.)")
+        # State the FACT, not a mechanism.  An earlier build asserted here that
+        # the corpus had split off a prefix; for أنفس the extra segment is an
+        # attached pronoun SUFFIX, so the explanation was simply untrue. Show
+        # the containing word instead and let it speak: it is corpus text, and
+        # the reader can see for themselves what is attached.
+        _w("  (This stem never stands alone as a whole word; it occurs inside")
+        _w("   larger words. The containing word is shown below.)")
     byroot = {}
     for s in srows:
         byroot.setdefault(s["root_ar"], []).append(s)
     for rt, ss in sorted(byroot.items(), key=lambda kv: -len(kv[1])):
-        _w("  root %-8s %4d  e.g. %s at %d:%d:%d:%d  [%s]"
-           % (rt or "-", len(ss), ss[0]["form_ar"], ss[0]["sura"],
-              ss[0]["aya"], ss[0]["word"], ss[0]["seg"], ss[0]["features"]))
+        e = ss[0]
+        whole = q(conn, "SELECT form_ar FROM words WHERE sura=? AND aya=? AND "
+                        "word=?", (e["sura"], e["aya"], e["word"])).fetchone()
+        _w("  root %-8s %4d  e.g. %s at %d:%d:%d:%d"
+           % (rt or "-", len(ss), e["form_ar"], e["sura"], e["aya"],
+              e["word"], e["seg"]))
+        _w("       in the word %s   [%s]" % (whole["form_ar"], e["features"]))
     _w("")
     _w(QAC_ATTRIBUTION)
 
@@ -1678,9 +1943,13 @@ def _t(conn):
         ck(to_buckwalter(r["form_ar"]) == r["form_bw"],
            "ar->bw %r -> %r" % (r["form_ar"], to_buckwalter(r["form_ar"])))
         n += 1
+    # roots are stored CANONICALLY (a hamza radical as ء, not as the corpus's
+    # bare alif), so the check is that the canonicaliser agrees, not that the
+    # transliterator round-trips.
     for r in q(conn, "SELECT DISTINCT root_bw, root_ar FROM segments "
                      "WHERE root_ar IS NOT NULL"):
-        ck(to_buckwalter(r["root_ar"]) == r["root_bw"], "root %r" % r["root_bw"])
+        ck("".join(canonical_root(r["root_bw"])) == r["root_ar"],
+           "root %r stored as %r" % (r["root_bw"], r["root_ar"]))
         n += 1
     return "%d strings, reversible both ways" % n
 
@@ -1873,36 +2142,68 @@ def _t(conn):
 
 @test("HONESTY", "verified = 0 rows are never served")
 def _t(conn):
-    conn.execute("INSERT INTO sources (key,title,kind,attribution) "
-                 "VALUES ('_t','TEST','lexicon','TEST')")
-    sid = conn.execute("SELECT id FROM sources WHERE key='_t'").fetchone()[0]
-    try:
+    with unguarded(conn):
+        conn.execute("INSERT INTO sources (key,title,kind,attribution) "
+                     "VALUES ('_t','TEST','lexicon','TEST')")
+        sid = conn.execute(
+            "SELECT id FROM sources WHERE key='_t'").fetchone()[0]
         conn.execute("INSERT INTO entries (source_id,root_ar,text_raw,"
                      "text_norm,vol,page,verified) VALUES (?,?,?,?,?,?,0)",
                      (sid, "سكن", "UNVERIFIED PROSE", "x", "1", "1"))
         conn.execute("INSERT INTO entries (source_id,root_ar,text_raw,"
                      "text_norm,vol,page,verified) VALUES (?,?,?,?,?,?,1)",
                      (sid, "سكن", "VERIFIED PROSE", "x", "1", "2"))
-        rows = list(q(conn, "SELECT text_raw FROM v_entries WHERE root_ar=?",
-                      ("سكن",)))
-        texts = [r["text_raw"] for r in rows]
+    try:
+        texts = [r["text_raw"] for r in
+                 q(conn, "SELECT text_raw FROM v_entries WHERE root_ar=?",
+                   ("سكن",))]
         ck("UNVERIFIED PROSE" not in texts, "an unverified row was served!")
         ck("VERIFIED PROSE" in texts, "the verified row was lost")
-        # and the guard must refuse a query that goes round the view
-        for sql in ("SELECT * FROM entries",
-                    "select text_raw from  entries where 1",
-                    "SELECT * FROM v_entries JOIN tafsir ON 1"):
+
+        # Every one of these defeated the previous regex guard.  The
+        # authorizer sees the table SQLite actually resolved, after aliases,
+        # qualifiers, CTEs and views, so none of them can work.
+        attacks = [
+            "SELECT text_raw FROM entries",
+            "SELECT text_raw FROM main.entries",
+            'SELECT text_raw FROM "main"."entries"',
+            "SELECT text_raw FROM main.[entries]",
+            "SELECT text_raw FROM/**/entries",
+            "SELECT text_raw FROM /*x*/ entries",
+            "SELECT text_raw FROM --x\n entries",
+            "SELECT e.text_raw FROM sources s, entries e",
+            "WITH z AS (SELECT 1) SELECT text_raw FROM z, entries",
+            "SELECT (SELECT text_raw FROM main.entries LIMIT 1)",
+            "SELECT text_raw FROM(SELECT * FROM main.entries)",
+            "SELECT text_raw FROM main.tafsir",
+            "SELECT * FROM v_entries JOIN tafsir ON 1",
+        ]
+        for sql in attacks:
             try:
-                q(conn, sql)
+                list(q(conn, sql))
             except UnverifiedAccess:
                 pass
             else:
                 raise Fail("the guard let through: %s" % sql)
+
+        # and laundering the table through a second view must not work either
+        with unguarded(conn):
+            conn.execute("CREATE VIEW IF NOT EXISTS _launder AS "
+                         "SELECT * FROM entries")
+        try:
+            list(q(conn, "SELECT text_raw FROM _launder"))
+        except UnverifiedAccess:
+            pass
+        else:
+            raise Fail("a view over the base table laundered unverified rows")
     finally:
-        conn.execute("DELETE FROM entries WHERE source_id=?", (sid,))
-        conn.execute("DELETE FROM sources WHERE id=?", (sid,))
-        conn.commit()
-    return "view filters; q() guard rejects 3/3 base-table queries"
+        with unguarded(conn):
+            conn.execute("DROP VIEW IF EXISTS _launder")
+            conn.execute("DELETE FROM entries WHERE source_id=?", (sid,))
+            conn.execute("DELETE FROM sources WHERE id=?", (sid,))
+            conn.commit()
+    return ("view filters; authorizer rejects %d/%d bypasses plus view "
+            "laundering" % (len(attacks), len(attacks)))
 
 
 @test("HONESTY", "roots.bab is unsourced, and bab-dependent output refuses")
@@ -1978,23 +2279,29 @@ def _t(conn):
         out = io.StringIO()
         real, sys.stdout = sys.stdout, out
         try:
-            conn.execute("BEGIN")
-            conn.execute("UPDATE segments SET %s = ?, core = ?" % poisoned,
-                         (SENT, SENT))
-            conn.execute("UPDATE words SET %s = ?" % poisoned, (SENT,))
-            conn.execute("INSERT INTO sources (key,title,kind,attribution) "
-                         "VALUES ('_s','TEST LEXICON','lexicon','TEST')")
-            sid = conn.execute(
-                "SELECT id FROM sources WHERE key='_s'").fetchone()[0]
-            conn.execute("INSERT INTO entries (source_id,root_ar,text_raw,"
-                         "text_norm,vol,page,verified) VALUES (?,?,?,?,?,?,1)",
-                         (sid, "سكن", "VERBATIM ENTRY TEXT", SENT, "1", "9"))
+            with unguarded(conn):
+                conn.execute("SAVEPOINT poison")
+                conn.execute(
+                    "UPDATE segments SET %s = ?, core = ?" % poisoned,
+                    (SENT, SENT))
+                conn.execute("UPDATE words SET %s = ?" % poisoned, (SENT,))
+                conn.execute(
+                    "INSERT INTO sources (key,title,kind,attribution) "
+                    "VALUES ('_s','TEST LEXICON','lexicon','TEST')")
+                sid = conn.execute(
+                    "SELECT id FROM sources WHERE key='_s'").fetchone()[0]
+                conn.execute(
+                    "INSERT INTO entries (source_id,root_ar,text_raw,"
+                    "text_norm,vol,page,verified) VALUES (?,?,?,?,?,?,1)",
+                    (sid, "سكن", "VERBATIM ENTRY TEXT", SENT, "1", "9"))
             cmd_word(conn, query)
             cmd_root(conn, "سكن")
             cmd_sarf(conn, "سكن", 1)
         finally:
             sys.stdout = real
-            conn.execute("ROLLBACK")
+            with unguarded(conn):
+                conn.execute("ROLLBACK TO poison")
+                conn.execute("RELEASE poison")
         chunk = out.getvalue()
         ck(SENT not in chunk,
            "the search key %s reached stdout: %r" % (
@@ -2080,6 +2387,184 @@ def _t(conn):
        "an absent root produced %d lines -- it should produce a gap, not prose"
        % len(text.splitlines()))
     return "%s / %s, and nothing invented" % (NOT_FOUND_UR, NOT_FOUND_EN)
+
+
+@test("HONESTY", "every corpus root is reachable by the name it is stored under")
+def _t(conn):
+    """The loader and the query path must canonicalise identically. When they
+    disagreed, 135 roots (9,791 segments) were unreachable and `root اله`
+    said الله's root does not occur in the Qur'an -- a false statement about
+    a named source, which is the worst output this program can produce."""
+    bad = []
+    for r in q(conn, "SELECT root_ar, root_bw, n_segments FROM roots"):
+        for typed in (r["root_ar"], r["root_bw"]):
+            hit = q(conn, "SELECT n_segments FROM roots WHERE root_ar = ?",
+                    ("".join(canonical_root(typed)),)).fetchone()
+            if hit is None:
+                bad.append((typed, r["n_segments"]))
+    ck(not bad, "%d roots unreachable, e.g. %s" % (len(bad), bad[:3]))
+    # and the specific regression, end to end
+    for typed in ("اله", "أله", "Alh", "امن", "ابي"):
+        out = io.StringIO()
+        real, sys.stdout = sys.stdout, out
+        try:
+            cmd_root(conn, typed)
+        finally:
+            sys.stdout = real
+        # NOT the Urdu line alone -- that also, correctly, marks the empty
+        # lexicon section. The claim under test is the corpus one.
+        ck("does not occur in the Quranic Arabic Corpus"
+           not in out.getvalue(),
+           "%r reported as absent from the corpus" % typed)
+    return "all %d roots reachable in Arabic and in Buckwalter" % q(
+        conn, "SELECT COUNT(*) n FROM roots").fetchone()["n"]
+
+
+@test("HONESTY", "alef maksura is a weak radical, not a sound one")
+def _t(conn):
+    """رمى typed with U+0649 was classified salim and produced رَمَىَ / يَرْمُىُ
+    with no banner at all -- the tool asserting 'no weak letter' about a
+    naqis root."""
+    for typed in ("رمى", "رمي", "rmY", "rmy"):
+        rc = classify_root(typed)
+        ck("naqis" in rc.kinds, "%r classified %s" % (typed, rc.kinds))
+        ck(rc.needs_ilal, "%r not marked as needing i'lal" % typed)
+        ck(all(not f.verified for f in all_generated_forms(generate(typed))),
+           "%r emitted a verified form" % typed)
+    ck("".join(canonical_root("رمى")) == "".join(canonical_root("رمي")),
+       "the two spellings do not canonicalise together")
+    return "رمى / رمي / rmY / rmy all naqis, all unverified"
+
+
+@test("HONESTY", "combining-mark order does not hide attestation")
+def _t(conn):
+    """The corpus writes نَزَّلَ as zain+shadda+fatha; a template builds it as
+    zain+fatha+shadda. Byte comparison called the same word two words and
+    discarded the evidence."""
+    tpl = apply_wazn("FَVَّLَ", canonical_root("نزل"))
+    corpus = q(conn, "SELECT form_ar FROM segments WHERE form_bw='naz~ala'"
+               ).fetchone()["form_ar"]
+    ck(tpl != corpus, "test is void: the strings are already byte-identical")
+    ck(stem_core(tpl) == stem_core(corpus),
+       "mark order still splits one word into two")
+    ats = attest(conn, tpl, "نزل")
+    ck(any(a.kind == "EXACT" for a in ats),
+       "form II of نزل is not EXACT-attested; got %s"
+       % [(a.kind, a.form_ar) for a in ats][:3])
+    # a real vowel difference must STILL separate two words
+    ck(stem_core("مَسْكَن") != stem_core("مِسْكَن"), "NFC merged two words")
+    ck(stem_core("سَكَنَ") != stem_core("سُكِنَ"), "NFC merged two words")
+    return "نَزَّلَ matches the corpus; مَسْكَن / مِسْكَن still distinct"
+
+
+@test("HONESTY", "attestation is ranked before it is capped")
+def _t(conn):
+    """Truncating in sura order and sorting afterwards could drop every EXACT
+    hit, leaving a screen of skeleton matches each stamped 'not attestation'
+    -- so the reader concludes there is no evidence when there is."""
+    ats = attest(conn, apply_wazn("FَVَLَ", canonical_root("تبع")), "تبع")
+    ck(ats and ats[0].kind == "EXACT",
+       "EXACT hit for تَبَعَ was pushed out by the cap; got %s"
+       % [(a.kind, a.form_ar) for a in ats][:3])
+    ck(any((a.sura, a.aya) == (14, 21) for a in ats), "14:21 missing")
+    # nothing may be dropped silently
+    many = attest(conn, apply_wazn("FَVَLَ", canonical_root("قول")), "قول",
+                  limit=2)
+    ck(many.n_dropped > 0 and len(many) == 2, "cap did not engage")
+    return "EXACT ranked first; %d hits withheld are reported, not hidden" % (
+        many.n_dropped)
+
+
+@test("HONESTY", "forms the rules exclude are not emitted as correct")
+def _t(conn):
+    """Three cases where a SOUND root still yields a non-word, so the weak-root
+    banner does not fire and nothing else would have caught it."""
+    # form VIII: the infixed taa' assimilates after ت (ٱتَّبَعَ, ~99x in the corpus)
+    viii = [s for s in generate("تبع")["mazid"] if s["roman"] == "VIII"][0]
+    f = viii["forms"][0]
+    ck(f.text == "اِتْتَبَعَ", "expected the raw template, got %r" % f.text)
+    ck(not f.verified and f.caveats, "اِتْتَبَعَ was emitted as VERIFIED")
+    # form VII is not built when the faa' is ن م ر ل و ي ء
+    vii = [s for s in generate("نصر")["mazid"] if s["roman"] == "VII"][0]
+    ck(not vii["forms"][0].verified, "اِنْنَصَرَ was emitted as VERIFIED")
+    # form IX is confined to colours and defects -- an applicability note
+    ix = [s for s in generate("نصر")["mazid"] if s["roman"] == "IX"][0]
+    ck(any("colour" in n for n in ix["forms"][0].notes),
+       "form IX carries no restriction note")
+    return "اِتْتَبَعَ and اِنْنَصَرَ flagged; form IX carries its restriction"
+
+
+@test("HONESTY", "the ism makan does not overclaim its vowel")
+def _t(conn):
+    """مَسْجِد is bab 1 yet takes maf'il -- a closed sama'i class the qiyas
+    cannot see. The tool printed مَسْجَد as verified while its own attestation
+    said 'not found in the corpus' for a word that is there 28 times."""
+    sec = [x for x in generate("سجد", bab=1)["mujarrad"] if x["bab"] == 1][0]
+    makan = [f for f in sec["forms"] if f.slot.startswith("ism makan")][0]
+    ck(any("SAMA'I" in n or "sama'i" in n for n in makan.notes),
+       "no note about the sama'i maf'il class: %s" % makan.notes)
+    ck("مَسْجِد" in " ".join(makan.notes), "the note does not name the case")
+    n = q(conn, "SELECT COUNT(*) n FROM segments WHERE root_ar='سجد' AND "
+                "form_ar LIKE ?", ("%" + "مَسْجِد" + "%",)).fetchone()["n"]
+    ck(n > 0, "مَسْجِد is not in the corpus -- the example is wrong")
+    return "note present, and مَسْجِد occurs %d times as the corpus reads it" % n
+
+
+@test("HONESTY", "the rubaai is derived, not refused, and matches the corpus")
+def _t(conn):
+    """The rubaai has no bab ambiguity and no sama'i masdar, so R1 does not
+    arise. زَلْزَلَة and زِلْزَال are both qiyasi and both Qur'anic."""
+    res = generate("زلزل")
+    ms = [f for f in all_generated_forms(res) if f.slot.startswith("masdar")]
+    ck(len(ms) >= 2, "rubaai masdar not derived")
+    attest_result(conn, res)
+    ex = {f.text: [a for a in f.attestations if a.kind == "EXACT"] for f in ms}
+    ck(ex.get("زَلْزَلَة"), "زَلْزَلَة not attested")
+    ck(ex.get("زِلْزَال"), "زِلْزَال not attested")
+    # a weak letter in a rubaai takes no i'lal -- the corpus proves it
+    w = generate("وسوس")
+    madi = [f for f in all_generated_forms(w) if f.slot.startswith("madi")][0]
+    ck(madi.verified, "وَسْوَسَ flagged UNVERIFIED though 7:20 reads it exactly")
+    ck(any(a.kind == "EXACT" for a in attest(conn, madi.text, "وسوس")),
+       "وَسْوَسَ not attested")
+    return "زَلْزَلَة 22:1, زِلْزَال 99:1, وَسْوَسَ 7:20 -- all EXACT"
+
+
+@test("HONESTY", "no mechanism is asserted that was not checked")
+def _t(conn):
+    """An earlier build told the reader that a stem with no whole-word row had
+    been split from a PREFIX. For أنفس the extra segment is a pronoun SUFFIX,
+    so the explanation was simply untrue -- generated prose wearing the
+    costume of a rule."""
+    out = io.StringIO()
+    real, sys.stdout = sys.stdout, out
+    try:
+        cmd_word(conn, "انفس")
+    finally:
+        sys.stdout = real
+    body = out.getvalue()
+    ck("prefix" not in body.lower(),
+       "the output asserts a prefix mechanism it did not check")
+    ck("أَنفُسَهُمْ" in body or "انفسهم" in norm_alif(body),
+       "the containing word is not shown")
+    return "states the fact, shows the containing word, explains nothing"
+
+
+@test("HONESTY", "documented input modes actually work")
+def _t(conn):
+    """USAGE promises Buckwalter input. cmd_word ignored it and returned a
+    confident zero for `qul`."""
+    for typed in ("qul", "قل"):
+        out = io.StringIO()
+        real, sys.stdout = sys.stdout, out
+        try:
+            cmd_word(conn, typed)
+        finally:
+            sys.stdout = real
+        first = [l for l in out.getvalue().splitlines()
+                 if "as a whole word" in l][0]
+        ck(not first.startswith("0 "), "%r found nothing: %s" % (typed, first))
+    return "Buckwalter and Arabic both resolve"
 
 
 @test("HONESTY", "refusals are refusals, not empty strings")

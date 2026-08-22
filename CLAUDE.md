@@ -38,7 +38,7 @@ and "emit a refusal", emit the refusal.
 
 | Rule | Enforced by |
 |---|---|
-| `verified = 0` never served | Views `v_entries` / `v_tafsir` + the `q()` guard, which raises if any query names the base tables `entries` / `tafsir` |
+| `verified = 0` never served | Views `v_entries` / `v_tafsir`, enforced by **SQLite's authorizer callback**, not by pattern-matching the SQL |
 | No generated maṣdar for the mujarrad | `Refusal` objects returned by the generator; the maṣdar slot for a mujarrad bāb has no template at all |
 | Weak roots not silently emitted | `classify_root()` + `Form.verified` flag + loud banner |
 | Skeleton ≠ attestation | `Attestation.kind` is `EXACT` or `SKELETON`; only `EXACT` sets `is_attestation` |
@@ -136,7 +136,63 @@ tanwīn whose alif is written. Leave that alif in the stem and the attestation
 disappears — a gap where evidence exists, which is the mirror-image failure of
 a false match and just as wrong.
 
-### 7. Two kinds of doubt, kept apart
+### 7. A regex over SQL text is not a guard
+
+The first build checked for the base tables with a regex. It was defeated by
+`main.entries`, by `"main"."entries"`, by `FROM/**/entries`, by a comma cross
+join, by a scalar subquery, and by `CREATE VIEW launder AS SELECT * FROM
+entries`. A regex sees *text*; the authorizer sees the table **SQLite actually
+resolved**, at prepare time, after every alias, qualifier, CTE and view has
+been expanded. Reads of `entries` / `tafsir` are permitted only when SQLite
+reports the read is happening through `v_entries` / `v_tafsir`.
+
+Ingestion and review tooling use `unguarded(conn)`. The query path never does.
+
+### 8. The loader and the query path must canonicalise identically
+
+QAC writes a hamza radical as Buckwalter `A` (`ROOT:Alh`, `ROOT:nbA`) — no
+Arabic root has a true alif radical. The loader stored `اله` and every lookup
+asked for `ءله`, so **135 roots and 9,791 segments were unreachable**, and
+`root اله` answered *"this root does not occur in the Quranic Arabic Corpus"*
+about the root of الله, 2,851 segments. A false statement about a named source
+is the worst output this program can produce, and it was produced by two
+functions politely disagreeing.
+
+There is now one `canonical_root()`, called by both. It also folds `ى` → `ي`:
+a root typed `رمى` — the ordinary way to type it — was classified **sālim**
+and printed `رَمَىَ`, `يَرْمُىُ`, `مَرْمُوى` with no banner, while asserting "no
+weak letter".
+
+### 9. Two identical words can be different byte strings
+
+The corpus writes `نَزَّلَ` as zain + shadda + fatḥa; a template builds it as
+zain + fatḥa + shadda. Comparing code points called one word two words and
+threw the evidence away — for all of forms II, V, IX and every muḍāʿaf root.
+Comparison keys are therefore **NFC-normalised**, which reorders combining
+marks by canonical class.
+
+The sukūn is also dropped from the comparison: the Uthmani text does not write
+it everywhere a template does (`يَنزِلُ` / `يَنْزِلُ`), and its absence marks no
+vowel, so it carries no contrast that could distinguish two words — while a
+real vowel is untouched and still does. `مَسْكَن` and `مِسْكَن` stay distinct.
+
+### 10. Rank before you truncate
+
+`attest()` collected the first N hits in sura order and sorted EXACT-first
+afterwards, so the cap could drop every exact match and leave a screen of
+skeleton matches each stamped "not attestation". The reader concludes there is
+no evidence when there is. Rank first, cap second, and **report what was
+withheld** — a silent cap reads as "that is all there is".
+
+### 11. Do not explain a mechanism you did not check
+
+A build of this file told the reader that a stem with no whole-word row had
+been split from a **prefix**. For `أنفس` the extra segment is a pronoun
+*suffix*, so the sentence was simply false: generated prose wearing the costume
+of a rule. It is gone. The tool now states the fact and shows the containing
+word, which is corpus text, and explains nothing.
+
+### 12. Two kinds of doubt, kept apart
 
 If every uncertainty printed the same `UNVERIFIED` banner, the banner would
 stop meaning anything and the reader would learn to ignore it. So:
@@ -177,6 +233,34 @@ They must never be emitted as if correct.
 
 ---
 
+## What the rules are allowed to claim
+
+A pattern being correct is not the same as the pattern *applying*. Three
+places where the engine used to overclaim:
+
+- **The ism makān** follows the muḍāriʿ vowel by qiyās, but a closed **samāʿī**
+  class takes `مَفْعِل` from verbs that are not bāb 2 — and it is heavily
+  Qurʾānic: `مَسْجِد` (28×, from سَجَدَ يَسْجُدُ), `مَشْرِق`, `مَغْرِب`, `مَطْلِع`,
+  `مَوْضِع`. The tool printed `مَسْجَد` as verified while its own attestation
+  said "not found in the corpus". Membership is not derivable; the slot says so.
+- **Bāb 3's guttural** is a tendency, not a licence test. `أَبَى يَأْبَى` is the
+  stock counterexample — its ḥalq letter is the **fāʾ** — and the condition is
+  never sufficient either (`رَجَعَ يَرْجِعُ` has ع at R2 and is bāb 2).
+- **Form VII** is not built when the fāʾ is ن م ر ل و ي ء (`اِنْنَصَرَ` is not a
+  word); **form VIII**'s infixed tāʾ assimilates after ت ث و ي ء and changes
+  after ص ض ط ظ د ذ ز (`ٱتَّبَعَ`, ~99× in the corpus, was printed `اِتْتَبَعَ`
+  and marked *verified* — تبع is a perfectly sound root, so nothing else
+  would have caught it); **forms IX and XI** are confined to colours and
+  bodily defects.
+
+## The rubāʿī is easier than the thulāthī, not harder
+
+`فَعْلَلَ` has no bāb ambiguity — the muḍāriʿ is fixed at `يُفَعْلِلُ` — and no
+samāʿī maṣdar: `فَعْلَلَة` and `فِعْلَال` are both qiyāsī, so **refusal R1 does
+not arise**. Refusing quadriliterals was a self-imposed gap. The corpus proves
+the templates: `زَلْزَلَة` 22:1, `زِلْزَال` 99:1, `دَمْدَمَ` 91:14, `وَسْوَسَ` 7:20 —
+all EXACT.
+
 ## Sourcing
 
 `roots.bab` is a **sourced column.** The bāb of a root is not derivable from
@@ -198,7 +282,7 @@ search key and is never displayed.
 
     salim   967   ajwaf 221   naqis 164   mudaaf 147
     mithal   74   lafif  29   other  40          total 1642
-    490 of 1642 roots need iʿlāl → their forms are UNVERIFIED
+    488 of 1642 roots need iʿlāl → their forms are UNVERIFIED
 
 `lafīf` is its own bucket here. An earlier build folded those 29 roots into
 ajwaf (+12), mithal (+11) and muḍāʿaf (+6), which reproduces the older tally
@@ -206,7 +290,11 @@ of 233/85/153 and an "other" of 40. A root weak in *two* positions is neither
 an ajwaf nor a mithal, and counting it as one overstates how well the
 templates behave on it. The older run's "482 affected" also missed 6 roots
 that are both lafīf and muḍāʿaf (حيي and its kind) plus 2 weak quadriliterals;
-they need iʿlāl too, hence 490.
+they need iʿlāl too, hence 490 — and then 488, because the 2 weak
+quadriliterals do **not** need it: a weak radical in a rubāʿī takes no iʿlāl,
+and the corpus settled it. `وَسْوَسَ` was being printed UNVERIFIED while 7:20
+and 114:5 read exactly what the template produced. When the Qurʾān contradicts
+a flag, the flag is wrong.
 
 Do not tune the classifier to reproduce a remembered number. If a count
 changes, find out which roots moved and why.
