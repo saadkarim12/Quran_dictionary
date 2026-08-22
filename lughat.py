@@ -51,6 +51,7 @@ Usage:
   lughat.py serve [--port=N]      the same gate as a local page (127.0.0.1)
   lughat.py read [--port=N]       the READING surface: approved sources only
   lughat.py export [--roots=N]    the reader as one shareable file
+  lughat.py gloss --from=FILE     import machine glosses (not made here)
 """
 
 import contextlib
@@ -1196,7 +1197,7 @@ def all_refusals(result):
 #                    from its letters; it is read from a lexicon and carries
 #                    bab_source_id / bab_page.  NULL means unknown.
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 SCHEMA = r"""
 PRAGMA journal_mode = WAL;
@@ -1534,6 +1535,22 @@ def _extract_member(blob):
 # Columns added after v1.  Migrating rather than rebuilding matters: entries
 # may hold rows a person has read and approved, and that work must survive.
 _NEW_TABLES = {
+    # MACHINE GLOSSES. Deliberately NOT a column on `entries`: the scholar's
+    # text and a machine's rendering of it must be impossible to confuse at
+    # the storage layer, not merely at the display layer. Nothing here is
+    # ever written by this program -- glosses are IMPORTED from a file, the
+    # way a translation is, so the query path keeps no model in it and the
+    # test that forbids one stays true.
+    "glosses": """
+        CREATE TABLE IF NOT EXISTS glosses (
+            id        INTEGER PRIMARY KEY,
+            entry_id  INTEGER NOT NULL REFERENCES entries(id),
+            lang      TEXT NOT NULL,
+            text      TEXT NOT NULL,
+            engine    TEXT NOT NULL,
+            made_at   TEXT,
+            UNIQUE (entry_id, lang, engine)
+        )""",
     "translations": """
         CREATE TABLE IF NOT EXISTS translations (
             id         INTEGER PRIMARY KEY,
@@ -3561,6 +3578,21 @@ def opposition_statements(conn, root, limit=6):
 # ayah set of the file must equal the corpus's 6,236 EXACTLY, or the ingest
 # refuses and prints what differed.
 
+# A machine's rendering of a scholar's sentence is not a translation in the
+# sense the rest of this program uses the word: nobody published it, nobody
+# checked it, and no page carries it. It is allowed here because a reader
+# asked for it with that understood -- and it is quarantined so the
+# understanding survives being forgotten: its own table, its own block on the
+# page, its own warning on every one, and never inside the paragraph it
+# renders.
+GLOSS_WARNING = (
+    "MACHINE TRANSLATION \u2014 not %s's words, and not checked by anyone. "
+    "Produced by %s. It may be wrong in ways this tool cannot detect. The "
+    "Arabic above is the source; this is a reading aid, not evidence.")
+
+GLOSS_LANGS = {"en": "English", "ur": "Urdu"}
+
+
 REFUSAL_TRANSLATE_MYSELF = (
     "REFUSED. This tool does not translate. A rendering it composed itself "
     "would be the one thing the whole design forbids -- generated prose "
@@ -3705,6 +3737,54 @@ def ingest_translation(conn, key, path=None, url=None):
             "VALUES (?,?,?,?)", [(sid, s, a, t) for s, a, t in rows])
         conn.commit()
     return len(rows)
+
+
+def import_glosses(conn, path):
+    """Load machine glosses from a JSONL file: one object per line, with
+    entry_id, lang, text and engine.
+
+    This program does not produce them. It cannot: there is no model in it,
+    and the test that forbids one is not relaxed for this. A gloss is made
+    by whatever engine the reader chooses, outside the tool, and imported
+    here the way a published translation is -- which also means the reader
+    can see, delete and regenerate them without touching a line of a
+    scholar's text."""
+    n = bad = 0
+    langs = set()
+    with unguarded(conn):
+        ids = {r[0] for r in conn.execute("SELECT id FROM entries")}
+        cur = conn.cursor()
+        with open(path, "rb") as fh:
+            for line in fh.read().decode("utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                if rec.get("entry_id") not in ids or not rec.get("text") \
+                        or rec.get("lang") not in GLOSS_LANGS \
+                        or not rec.get("engine"):
+                    bad += 1
+                    continue
+                cur.execute(
+                    "INSERT INTO glosses (entry_id,lang,text,engine,made_at) "
+                    "VALUES (?,?,?,?,datetime('now')) "
+                    "ON CONFLICT(entry_id,lang,engine) DO UPDATE SET "
+                    "text=excluded.text, made_at=excluded.made_at",
+                    (rec["entry_id"], rec["lang"], rec["text"],
+                     rec["engine"]))
+                langs.add(rec["lang"])
+                n += 1
+        conn.commit()
+    return n, bad, sorted(langs)
+
+
+def glosses_for(conn, entry_id):
+    """Machine glosses attached to one entry.  Never joined into its text."""
+    return [{"lang": g["lang"], "language": GLOSS_LANGS.get(g["lang"], "?"),
+             "text": g["text"], "engine": g["engine"],
+             "rtl": g["lang"] != "en"}
+            for g in q(conn, "SELECT lang, text, engine FROM glosses "
+                             "WHERE entry_id=? ORDER BY lang", (entry_id,))]
 
 
 def installed_translations(conn):
@@ -4605,6 +4685,50 @@ def cmd_akbar(conn, root):
         _w("  " + line)
     _w("")
     _w(QAC_ATTRIBUTION)
+
+
+def cmd_gloss(conn, args):
+    """Import machine glosses, or say what is loaded."""
+    path = ([a.split("=", 1)[1] for a in args if a.startswith("--from=")]
+            or [None])[0]
+    if "--clear" in args:
+        with unguarded(conn):
+            conn.execute("DELETE FROM glosses")
+            conn.commit()
+        _w("all glosses deleted. No scholar's text was touched.")
+        return
+    if path:
+        n, bad, langs = import_glosses(conn, path)
+        _w("imported %d glosses (%s)%s"
+           % (n, ", ".join(GLOSS_LANGS.get(l, l) for l in langs) or "-",
+              "; %d lines rejected" % bad if bad else ""))
+    _w(BAR)
+    _w("MACHINE GLOSSES")
+    _w(BAR)
+    for line in _wrap(
+            "This program does not produce these. It has no model in it and "
+            "the test that forbids one is not relaxed for them: a gloss is "
+            "made by whatever engine you choose, outside the tool, and "
+            "imported here as a JSONL file of "
+            "{entry_id, lang, text, engine}. They live in their own table, "
+            "never inside a scholar's text, and every one is shown under a "
+            "warning naming the engine.", 72):
+        _w(line)
+    _w("")
+    with unguarded(conn):
+        rows = list(conn.execute(
+            "SELECT lang, engine, COUNT(*) n FROM glosses "
+            "GROUP BY lang, engine ORDER BY lang"))
+        tot = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+    if not rows:
+        _w("None loaded.")
+    for r in rows:
+        _w("  %-8s %-28s %5d of %d entries"
+           % (GLOSS_LANGS.get(r["lang"], r["lang"]), r["engine"][:28],
+              r["n"], tot))
+    _w("")
+    _w("  python3 lughat.py gloss --from=glosses.jsonl")
+    _w("  python3 lughat.py gloss --clear")
 
 
 def cmd_translation(conn, args):
@@ -6593,6 +6717,71 @@ def _t(conn):
         opp["hits"])
 
 
+@test("HONESTY", "a machine gloss is quarantined, and says what it is")
+def _t(conn):
+    """A reader asked for machine translation of the articles, knowing it is
+    nobody's published work. It is allowed on four conditions, and this test
+    is what keeps them after the asking is forgotten: it lives in its own
+    table, never inside a scholar's text, never without a warning naming the
+    engine, and never produced by this program."""
+    # 1. this program still contains no model and no query-time network
+    src = strip_comments(own_source())
+    for verb, obj in (("import", "openai"), ("import", "anthropic"),
+                      ("googletrans", "translate")):
+        ck(verb + " " + obj not in src, "a model reached the source: %s" % obj)
+    body = strip_comments(
+        own_source()[:own_source().index("# 11." + "  TESTS")])
+    writers = re.findall("INSERT INTO " + "glosses", body)
+    ck(len(writers) == 1,
+       "glosses are written from %d places outside the tests" % len(writers))
+    fn = src[src.index("def " + "import_glosses("):]
+    fn = fn[:fn.index("\ndef ")]
+    ck("json.loads" in fn and "open(path" in fn,
+       "glosses are not imported from a file; is something generating them?")
+
+    # 2. it is not, and cannot be, part of the scholar's text
+    with unguarded(conn):
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(entries)")}
+    ck(not {c for c in cols if "gloss" in c},
+       "a gloss column grew on entries: %s" % cols)
+    with unguarded(conn):
+        conn.execute("SAVEPOINT gl")
+        eid = conn.execute(
+            "SELECT id FROM entries WHERE verified=1 AND text_raw IS NOT NULL "
+            "LIMIT 1").fetchone()
+    try:
+        if eid is None:
+            raise Skip("nothing approved to attach a gloss to")
+        eid = eid[0]
+        with unguarded(conn):
+            conn.execute(
+                "INSERT INTO glosses (entry_id,lang,text,engine) "
+                "VALUES (?,'en','GLOSS FIXTURE TEXT','test-engine')", (eid,))
+            raw = conn.execute("SELECT text_raw FROM entries WHERE id=?",
+                               (eid,)).fetchone()[0]
+        ck("GLOSS FIXTURE" not in raw, "the gloss was written into text_raw")
+        ck("GLOSS FIXTURE" not in " ".join(render_entry(raw)),
+           "the gloss reached the rendered article")
+        got = glosses_for(conn, eid)
+        ck(got and got[0]["engine"] == "test-engine",
+           "the gloss did not come back with its engine")
+
+        # 3. the page shows it apart, under a warning, every time
+        js = READ_HTML[READ_HTML.index("function gloss("):]
+        js = js[:js.index("function att(")]
+        ck("glw" in js and "warn" in js,
+           "the page renders a gloss without a warning")
+        ck(js.count("x.text") == 1 and "e.lines" not in js,
+           "the gloss is interleaved with the scholar's paragraphs")
+        ck("%s" in GLOSS_WARNING and "not checked by anyone" in GLOSS_WARNING,
+           "the warning does not say whose words these are not")
+    finally:
+        with unguarded(conn):
+            conn.execute("ROLLBACK TO gl")
+            conn.execute("RELEASE gl")
+    return "own table, own block, warning names the engine, imported not made"
+
+
 @test("HONESTY", "a translation is a translator's, and never this tool's")
 def _t(conn):
     """The one place generated prose would be least visible is beside a
@@ -8142,6 +8331,10 @@ h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.11em;
 .slot .att.sk{color:var(--och)}
 .slot .att i{font-style:normal;opacity:.75}
 .aya{font-size:1.2rem;line-height:2.1;color:var(--ink);margin:.2rem 0 .5rem;padding:.5rem .7rem;background:var(--surf);border-radius:4px;border:1px solid var(--rule)}
+.gl{margin-top:.7rem;padding-top:.6rem;border-top:1px dashed var(--och)}
+.glw{font-size:.68rem;line-height:1.5;color:var(--och);margin-bottom:.35rem;text-transform:none;letter-spacing:0}
+.glt{font-size:.94rem;line-height:1.7;color:var(--mut)}
+.glt.rtl{direction:rtl;text-align:right;line-height:2.4;font-family:"Noto Nastaliq Urdu","Jameel Noori Nastaleeq","Geeza Pro",serif}
 .trs{display:grid;gap:.5rem;margin:0 0 .6rem;
  grid-template-columns:repeat(auto-fit,minmax(19rem,1fr))}
 .tr.ltr{direction:ltr;text-align:left;font-family:inherit;line-height:1.7;
@@ -8329,6 +8522,19 @@ async function tocOpen(){
     : '<div class="card empty">'+esc(d.error||"not available")+'</div>';}));
 }
 
+function gloss(e, who, warn){
+ // Below the Arabic, behind a rule, with the warning on EVERY one -- not
+ // interleaved with the scholar's paragraphs, where a wrong line would read
+ // as his meaning.
+ const g=(e.glosses||[]);
+ if(!g.length) return "";
+ return '<div class="gl">'+g.map(x=>
+   '<div class="glw">&#9888; '+esc(warn.replace("%s",who)
+      .replace("%s",x.engine))+'</div>'+
+   '<div class="glt'+(x.rtl?" rtl":"")+'">'+esc(x.text)+'</div>').join("")+
+  '</div>';
+}
+
 function att(f){
  // EXACT is attestation; SKELETON is a DIFFERENT WORD and is labelled so.
  let o='';
@@ -8409,6 +8615,7 @@ function draw(){
       'not read one at a time">bulk-approved</span>':'')+
     '<span class="cite">vol '+esc(e.vol)+' p. '+esc(e.page)+'</span></div>'+
     '<div class="txt ar">'+e.lines.map(l=>"<p>"+esc(l)+"</p>").join("")+'</div>'+
+    gloss(e, c.author||c.title, r.gloss_warning)+
     '<div class="attrib">'+esc(c.attribution)+'</div></div>';}
  }
 
@@ -8747,7 +8954,7 @@ def read_root(conn, query):
         if not root_keyed(src["key"]):
             continue
         ents = list(q(conn,
-                      "SELECT text_raw, scan_uri, vol, page, extraction, "
+                      "SELECT id, text_raw, scan_uri, vol, page, extraction, "
                       "headword, verified_by FROM v_entries WHERE "
                       "source_id=? AND root_ar=? ORDER BY id",
                       (src["id"], root)))
@@ -8768,6 +8975,11 @@ def read_root(conn, query):
                 # belongs to" are different claims, and the reader is told
                 # which one they are looking at
                 "bulk": e["verified_by"] == "bulk",
+                # a separate key, never merged into `lines`: the scholar's
+                # paragraphs and a machine's rendering of them do not share
+                # a field any more than they share a table
+                "glosses": glosses_for(conn, e["id"]),
+                "author": src["author"] or src["title"],
                 "lines": (render_entry(e["text_raw"])
                           if e["text_raw"] is not None
                           else ["[scan only]", e["scan_uri"] or ""]),
@@ -8852,6 +9064,7 @@ def read_root(conn, query):
         {"key": r["key"], "title": r["title"], "author": r["author"]}
         for r in installed_translations(conn)]
     out["translate_refusal"] = REFUSAL_TRANSLATE_MYSELF
+    out["gloss_warning"] = GLOSS_WARNING
     out["tafsir_sources"] = [
         {"key": r["key"], "title": r["title"]}
         for r in q(conn, "SELECT key, title FROM sources WHERE kind='tafsir' "
@@ -9103,6 +9316,7 @@ USAGE = """lughat -- a local Qur'anic lexicography tool (offline, stdlib only)
   lughat.py serve [--port=N]      the same gate as a local page (127.0.0.1)
   lughat.py read [--port=N]       the READING surface: approved sources only
   lughat.py export [--roots=N]    the reader as one shareable file
+  lughat.py gloss --from=FILE     import machine glosses (not made here)
 
 Roots and words may be typed in Arabic (سكن) or Buckwalter (skn).
 """
@@ -9356,6 +9570,10 @@ def _main(argv):
             sys.stdout.write(USAGE)
             return 2
         cmd_akbar(connect(), argv[2])
+        return 0
+
+    if cmd == "gloss":
+        cmd_gloss(connect(), argv[2:])
         return 0
 
     if cmd == "export":

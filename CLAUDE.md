@@ -557,6 +557,34 @@ Taking those offsets from a *different* string than the match was found in
 turned `السكون ضد الحركة` into `ضد لحركة`: a word of Ibn Manẓūr's corrupted by
 one character, in a card carrying his name. Trap 8 again.
 
+## Machine glosses: allowed, and quarantined
+
+A reader asked for the dictionary articles in Urdu and English knowing that
+no such translation exists — that it would be a machine's rendering, nobody's
+published work, checked by no one. That is a decision the reader is entitled
+to make about their own tool. It is allowed on four conditions, and the test
+is what keeps them after the asking is forgotten:
+
+1. **This program does not make them.** It has no model in it and the test
+   forbidding one is not relaxed. A gloss is produced by whatever engine the
+   reader chooses, *outside* the tool, and imported as a JSONL file of
+   `{entry_id, lang, text, engine}` — the same shape as a Tanzil translation.
+   So the query path stays pure retrieval, and the whole corpus can be
+   re-glossed by a better engine without touching a line of a scholar's text.
+2. **Its own table.** `glosses`, never a column on `entries`: the scholar's
+   words and a machine's rendering of them must be impossible to confuse at
+   the storage layer, not merely on screen.
+3. **Its own block, below the Arabic, behind a rule** — never interleaved
+   paragraph by paragraph, which is the arrangement where a wrong line reads
+   as the scholar's meaning.
+4. **A warning on every one, naming the engine**: *not Ibn Fāris's words, and
+   not checked by anyone.* `gloss --clear` deletes them all and touches
+   nothing else.
+
+What this is not: `entries.text_raw` is still byte-exact, still the only
+thing a citation points at, and a gloss carries no page number, because there
+is no page it was printed on.
+
 ## Urdu beside the Arabic
 
 A translation shown next to a scholar's words is where generated prose would
