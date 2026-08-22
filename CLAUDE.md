@@ -442,6 +442,40 @@ digitisation*, not to Ibn Jinnī, who treated all 29.
 
 ## Sourcing
 
+### The bāb comes from the muṣḥaf, because the lexicons have no vowels
+
+The plan was to read the muḍāriʿ vowel off a cited lexicon page. **That is
+impossible with the texts that exist**: the OpenITI digitisations of Maqāyīs,
+al-Mufradāt and Lisān carry *zero* diacritics — measured, 0 marks in 125,000
+characters. The vowel is simply not in them.
+
+But the Qurʾān is fully vowelled, and where a root's form-I verb occurs in
+both aspects the muṣḥaf settles the bāb itself:
+
+    سَكَنَ (6:13)  +  يَسْكُنُ (7:189)   →  fatḥa/ḍamma  →  bāb 1 (naṣara)
+
+The citation is a **verse**, checkable in any muṣḥaf — a stronger warrant than
+a lexicon reference, not a weaker one. 136 roots, `bab_method =
+'mushaf-vowelling'`, with `bab_evidence` holding both references.
+
+Four restrictions, each of which loses roots and each of which is necessary:
+
+- **Sound roots only.** Iʿlāl moves and lengthens a weak root's vowels, so its
+  surface ḥarakāt are not the pattern's. `قَالَ` has no ḥaraka on its ʿayn at all.
+- **Form I, active only.** QAC does *not* tag every passive — 28:58 `تُسْكَن`
+  carries no PASS marker — so the passive is read off the vowelling, which
+  states it: a ḍamma on the muḍāriʿ prefix, or a ḍamma/kasra pair in the māḍī.
+- **Both aspects must occur**, or there is no pair to read.
+- **One vowelling each.** `كَبِرَ يَكْبَرُ` and `كَبُرَ يَكْبُرُ` are two verbs
+  sharing a root; `لبس` likewise. The tool **refuses** and prints the
+  conflicting verses. A silent majority vote is exactly the quiet inference
+  this program exists to refuse — and note the test asserts the *ambiguity
+  flag*, not merely that the bāb came out NULL, because a majority vote on
+  كبر happens to land on an invalid vowel pair and would have passed.
+
+The remaining 1,506 roots have no sourced bāb, and everything depending on it
+still refuses for them.
+
 `roots.bab` is a **sourced column.** The bāb of a root is not derivable from
 its letters — `سكن` is bāb 1 and `ضرب` is bāb 2 and nothing in س/ك/ن or
 ض/ر/ب says so. It is read from a lexicon and stored with `bab_source_id` and
@@ -488,6 +522,7 @@ Single file, stdlib only, offline after `setup`.
     lughat.py root <root>           corpus occurrences of a root
     lughat.py word <word>           search the mushaf text
     lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
+    lughat.py bab [<root>|--derive] the bāb, read off the Qurʾān's vowelling
     lughat.py akbar <root>          the six permutations, per Ibn Jinnī
     lughat.py letter <root>         Ibn Jinnī on the root's letters
     lughat.py ingest <lexicon> --from PATH
