@@ -5806,10 +5806,9 @@ def _t(conn):
     bad = []
     for page in ("REVIEW_HTML", "READ_HTML"):
         html = globals()[page]
-        for m in re.finditer(r"textContent\s*=([^;]*);", html, re.S):
-            if "&" in m.group(1) and ";" in m.group(1).replace("\\;", ""):
-                if re.search(r"&[a-zA-Z]+;|&#\d+;", m.group(1)):
-                    bad.append((page, " ".join(m.group(1).split())[:60]))
+        for m in re.finditer(r"textContent\s*=(.*?);\s*\n", html, re.S):
+            if re.search(r"&[a-zA-Z]+;|&#\d+;", m.group(1)):
+                bad.append((page, " ".join(m.group(1).split())[:60]))
     ck(not bad, "an HTML entity is assigned to textContent: %s" % bad)
     return "%d text-node assignments, none carrying an entity" % sum(
         len(re.findall(r"textContent\s*=", globals()[p]))
