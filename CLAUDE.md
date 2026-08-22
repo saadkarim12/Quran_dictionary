@@ -321,6 +321,62 @@ compares against the *previous* heading and not a running maximum: one stray
 heading (Mufradāt has `وإي` inside the hamza section) poisoned a max and
 flagged 1,524 sound entries.
 
+### Trap 14 — the digitisation's own marks destroy a heading
+
+`### | (نهي) ms1086` is not a heading, because the detectors anchored on `$`
+while only `render_entry()` stripped `ms####`. Ibn Fāris's article on نهي was
+dropped; `(حول) ms0282` folded into the entry for **حوك**; al-Rāghib on نور,
+روح, بدل, سود, شرط, مهل and حقب all landed under their neighbours. Four more
+died to a bracket the digitiser left inside the parentheses — `( [بقر)` — بقر
+among them. **Clean a heading before matching it, with the same rules that
+clean the body.**
+
+### Trap 15 — a page marker CLOSES the page it names
+
+Every one of these files ends with its final words followed inline by the last
+marker, and the Shamela ones open with a `PageV00P000` sentinel. Text after
+`PageV01P006` is therefore on p. **7**. Taking the previous marker put all
+15,500 citations one page too low, and at a volume boundary in the wrong
+volume as well — `(حد)` cited to vol 1 p. 513 when it opens vol 2 p. 3.
+
+A wrong page is a wrong citation, which is the whole product. Resolve an
+entry's page by **looking ahead** to the marker that closes it.
+
+Because this is a *systematic* correction, re-ingesting must reach rows a
+person has already approved: their decision stands, but their citation is
+rewritten. So the "already decided, leave alone" fingerprint is keyed on the
+headword and text, **never on vol/page** — keying on those made every
+corrected row look like a new entry and left the approved one wrong.
+
+### Trap 16 — a heading you cannot confirm is still a boundary
+
+In Lisān a bare `# سفه` whose confirming line does not parse used to flow
+onward, so its article landed under the *previous* root: 34,017 bytes
+misfiled, one entry being **99% Ibn Manẓūr on سفه while labelled سده**. The
+same for a head too long to be a root — استبرق, زنجبيل, ميكائيل, منجنون are
+Lisān headwords, and 16 articles ended up under a neighbour because
+`canonical_root()` rejected the head and the line became body text.
+
+**Anything that looks like a heading closes the entry in progress**, whether or
+not it opens a new one. Dropping text is bad; filing it under the wrong
+scholar's root is worse.
+
+### The order check must fit the book, and cry wolf at nothing
+
+Three books, three ordering schemes and three useful depths:
+
+| | ordered by | positions checkable | flags |
+|---|---|---|---|
+| Maqāyīs | first radical | 2 (the bāb fixes the first two) | 29 / 4,654 |
+| Mufradāt | first radical | **1** — it heads by *word*, not root | 5 / 1,701 |
+| Lisān | **last** radical | 2 | 97 / 9,238 |
+
+Checking Mufradāt at depth 2 flags 7% of a sound book; checking Maqāyīs at
+full depth flags 11%. A `[باب …]` also **restarts** the alphabet, so the key
+resets at a section. The check is a weak secondary signal — the real guards
+are the parenthesis rule, Lisān's double naming, and heading cleaning — and a
+badge that fires on a tenth of a book teaches the reviewer to ignore it.
+
 ### Two spelling bridges, both recorded as inferences
 
 Measured, not assumed. Direct heading matching covers 81% of corpus roots;
