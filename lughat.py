@@ -38,17 +38,21 @@ Usage:
   lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
   lughat.py ingest maqayis --from PATH
                                   load a lexicon, ALL at verified = 0
-  lughat.py review [--stats]      the approval gate: the only writer of
-                                  verified = 1
+  lughat.py review [--stats]      the approval gate, in the terminal
+  lughat.py serve [--port=N]      the same gate as a local page (127.0.0.1)
 """
 
 import contextlib
 import io
+import json
+import threading
 import os
+import secrets
 import re
 import sqlite3
 import sys
 import tarfile
+import traceback
 import unicodedata
 
 # --------------------------------------------------------------------------
@@ -1079,7 +1083,7 @@ def all_refusals(result):
 #                    from its letters; it is read from a lexicon and carries
 #                    bab_source_id / bab_page.  NULL means unknown.
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = r"""
 PRAGMA journal_mode = WAL;
@@ -1173,6 +1177,10 @@ CREATE TABLE IF NOT EXISTS entries (
     extraction TEXT,
     verified   INTEGER NOT NULL DEFAULT 0,
     verified_at TEXT,
+    -- A reviewer's "this extraction is wrong". Distinct from merely pending:
+    -- without it a bad entry returns to the head of the queue forever.
+    rejected   INTEGER NOT NULL DEFAULT 0,
+    reject_reason TEXT,
     CHECK (text_raw IS NOT NULL OR scan_uri IS NOT NULL)
 );
 
@@ -1269,14 +1277,17 @@ def q(conn, sql, params=()):
         raise
 
 
-def connect(path=DB_PATH, create=False):
+def connect(path=DB_PATH, create=False, threadsafe=False):
     if not create and not os.path.exists(path):
         raise SystemExit(
             "no database at %s -- run:  python3 lughat.py setup" % path)
     d = os.path.dirname(path)
     if d and not os.path.isdir(d):
         os.makedirs(d)
-    conn = sqlite3.connect(path)
+    # threadsafe=True is for the review server only: a sqlite3 connection is
+    # thread-affine by default, and the browser opens several connections at
+    # once.  Every DB touch there is serialised by DB_LOCK.
+    conn = sqlite3.connect(path, check_same_thread=not threadsafe)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     if conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
@@ -1374,6 +1385,10 @@ _MIGRATIONS_V2 = [
     ("entries", "verified_at", "TEXT"),
     ("tafsir", "extraction", "TEXT"),
     ("tafsir", "verified_at", "TEXT"),
+    ("entries", "rejected", "INTEGER NOT NULL DEFAULT 0"),
+    ("entries", "reject_reason", "TEXT"),
+    ("tafsir", "rejected", "INTEGER NOT NULL DEFAULT 0"),
+    ("tafsir", "reject_reason", "TEXT"),
 ]
 
 
@@ -2077,7 +2092,7 @@ def cmd_review(conn, args):
         return
 
     sql = ("SELECT e.*, s.title FROM entries e JOIN sources s "
-           "ON s.id = e.source_id WHERE e.verified = 0")
+           "ON s.id = e.source_id WHERE e.verified = 0 AND e.rejected = 0")
     params = []
     if only:
         sql += " AND e.extraction = ?"
@@ -2234,6 +2249,23 @@ def cmd_word(conn, word):
 
 class Fail(AssertionError):
     pass
+
+
+def own_source():
+    return open(os.path.abspath(__file__), "rb").read().decode("utf-8")
+
+
+def source_section(banner, end_banner):
+    """Slice a numbered section out of this file.
+
+    Uses rindex for the opening banner on purpose. Several tests grep sections
+    that are defined AFTER the test suite, and a test naming a banner puts that
+    banner into the file earlier than the real one -- so index() finds the
+    needle inside the haystack's description of itself, and the slice comes
+    back empty. This trap has now been walked into four times."""
+    src = own_source()
+    start = src.rindex(banner)
+    return src[start:src.index(end_banner, start)]
 
 
 _TESTS = {"INTEGRITY": [], "HONESTY": []}
@@ -2610,7 +2642,7 @@ def _t(conn):
 
 @test("HONESTY", "no generative or network dependency in the query path")
 def _t(conn):
-    src = open(os.path.abspath(__file__), "rb").read().decode("utf-8")
+    src = own_source()
     # The needles are assembled at run time; spelling them out as literals
     # would plant them in the very file this test greps.
     for verb, obj in (("import", "openai"), ("import", "anthropic"),
@@ -2619,12 +2651,17 @@ def _t(conn):
         needle = verb + (" " if verb in ("import", "from") else ".") + obj
         ck(needle not in src, "found %r in the source" % needle)
     # urllib may be imported, but only inside the setup path
-    net = "import" + " urllib"          # assembled, for the same reason
-    ck(src.count(net) == 1, "urllib imported %d times" % src.count(net))
+    # urllib.request is the network. urllib.parse is string handling and the
+    # review server uses it to read a query string; counting bare "urllib"
+    # conflated the two.
+    net = "import" + " urllib.request"
+    ck(src.count(net) == 1, "urllib.request imported %d times" % src.count(net))
     ck("def fetch_corpus" in src.split(net)[0][-2000:],
-       "the urllib import escaped fetch_corpus")
-    ck(net not in src.split("def attest(")[1],
-       "a network import appears after the query layer begins")
+       "the urllib.request import escaped fetch_corpus")
+    # assembled, so this list does not plant its own needles in the file
+    for mod in ("socket", "ssl", "ftplib", "http.client"):
+        needle = "import" + " " + mod
+        ck(needle not in src, "found %r in the source" % needle)
     # and the query commands must run with the network primitives removed
     import builtins
     real_import = builtins.__import__
@@ -2974,7 +3011,7 @@ _FIXTURE = "\n".join([
 def _t(conn):
     """The build path may propose; only a person may approve. Ingestion that
     could write verified = 1 would make the review gate decorative."""
-    src = open(os.path.abspath(__file__), "rb").read().decode("utf-8")
+    src = own_source()
     body = src[src.index("def ingest_maqayis"):src.index("# 9.  ATTESTATION")]
     ck("verified" in body, "the ingest INSERT does not mention verified")
     ck("verified=1" not in body.replace(" ", ""),
@@ -3099,7 +3136,7 @@ def _t(conn):
 def _t(conn):
     """Bumping the schema must never drop a table that can hold rows a person
     has read and approved."""
-    src = open(os.path.abspath(__file__), "rb").read().decode("utf-8")
+    src = own_source()
     body = src[src.index("def migrate("):src.index("def schema_columns_ok")]
     for danger in ("DROP TABLE", "DELETE FROM entries", "DELETE FROM tafsir"):
         ck(danger not in body, "migrate() contains %r" % danger)
@@ -3109,6 +3146,100 @@ def _t(conn):
        "the loader drops entries")
     ck(schema_columns_ok(conn), "the live schema is missing a column")
     return "no destructive statement in migrate(); live schema complete"
+
+
+@test("HONESTY", "the review server is the build path and cannot be the reader's")
+def _t(conn):
+    """It shows UNVERIFIED text -- that is its job -- so it must be impossible
+    to mistake for, or reach, the reading surface."""
+    ck(REVIEW_HOST == "127.0.0.1", "the review server binds beyond localhost")
+    # Sliced by section banner via source_section(), which handles the
+    # self-reference trap described there.
+    body = source_section("# 11b." + "  THE REVIEW SERVER", "# 12." + "  CLI")
+    ck(len(body) > 2000, "the review section slice is empty (%d)" % len(body))
+    ck("0.0.0.0" not in body, "the handler can bind to a public interface")
+    # the routes it exposes are the queue, the stats and the decision. No
+    # query-path route may appear, or unverified prose acquires a reader.
+    routes = set(re.findall(r'u\.path [!=]= "([^"]+)"', body))
+    ck(routes == {"/", "/api/queue", "/api/stats", "/api/decide"},
+       "unexpected route(s): %s" % sorted(routes))
+    for banned in ("cmd_root", "cmd_word", "cmd_sarf", "cmd_aya"):
+        ck(banned not in body, "the review server exposes %s" % banned)
+    ck("compare_digest" in body, "the token check is not constant-time")
+    ck("frame-ancestors 'none'" in body, "the review page can be framed")
+    return "127.0.0.1 only; 4 routes, none of them a reading route"
+
+
+@test("HONESTY", "approve, reject and undo do exactly what they say")
+def _t(conn):
+    # No SAVEPOINT here: _decide() commits, and a commit releases every
+    # savepoint, so the rollback would fail. Clean up by deleting instead.
+    with unguarded(conn):
+        conn.execute("DELETE FROM entries WHERE source_id IN "
+                     "(SELECT id FROM sources WHERE key='_rv')")
+        conn.execute("DELETE FROM sources WHERE key='_rv'")
+        conn.execute("INSERT INTO sources (key,title,kind,attribution) "
+                     "VALUES ('_rv','RV','lexicon','RV')")
+        sid = conn.execute(
+            "SELECT id FROM sources WHERE key='_rv'").fetchone()[0]
+        conn.execute("INSERT INTO entries (source_id,root_ar,headword,"
+                     "text_raw,vol,page,extraction,verified) "
+                     "VALUES (?,?,?,?,?,?,'direct',0)",
+                     (sid, "سكن", "(سكن)", "REVIEW LOOP PROSE", "3", "87"))
+        eid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    try:
+        def served():
+            out = io.StringIO()
+            real, sys.stdout = sys.stdout, out
+            try:
+                cmd_root(conn, "سكن")
+            finally:
+                sys.stdout = real
+            return "REVIEW LOOP PROSE" in out.getvalue()
+
+        def queued():
+            return eid in [r["id"] for r in _queue_rows(conn, limit=9999)]
+
+        ck(not served() and queued(), "a fresh entry should be queued, unserved")
+        _decide(conn, eid, "approve")
+        ck(served(), "approve did not make it servable")
+        ck(not queued(), "an approved entry is still in the queue")
+        with unguarded(conn):
+            ck(conn.execute("SELECT verified_at FROM entries WHERE id=?",
+                            (eid,)).fetchone()["verified_at"],
+               "approve left no audit stamp")
+        _decide(conn, eid, "reject", "wrong root")
+        ck(not served(), "a rejected entry is still being served")
+        ck(not queued(), "a rejected entry returns to the queue forever")
+        _decide(conn, eid, "unset")
+        ck(not served() and queued(), "undo did not restore the pending state")
+        try:
+            _decide(conn, eid, "approve_all")
+        except ValueError:
+            pass
+        else:
+            raise Fail("_decide accepted an unknown decision")
+    finally:
+        with unguarded(conn):
+            conn.execute("DELETE FROM entries WHERE source_id=?", (sid,))
+            conn.execute("DELETE FROM sources WHERE id=?", (sid,))
+            conn.commit()
+    return "approve serves + stamps; reject unserves + retires; undo restores"
+
+
+@test("HONESTY", "the queue is ordered by what the reader will actually meet")
+def _t(conn):
+    """The gate is only honoured if it is bearable. Root frequency in the
+    Qur'an is steeply skewed, so offering entries most-frequent-first is what
+    makes a few hundred decisions worth more than a few thousand."""
+    rows = _queue_rows(conn, limit=40)
+    if len(rows) < 5:
+        return "queue too short to check ordering"
+    freqs = [r["freq"] for r in rows]
+    ck(freqs == sorted(freqs, reverse=True),
+       "the queue is not frequency-ordered: %s" % freqs[:8])
+    ck(freqs[0] > 0, "the head of the queue is a root with no occurrences")
+    return "head of queue: %s (%d occurrences)" % (rows[0]["root"], freqs[0])
 
 
 @test("HONESTY", "refusals are refusals, not empty strings")
@@ -3159,6 +3290,365 @@ def run_tests(conn):
 
 
 # ==========================================================================
+# 11b.  THE REVIEW SERVER  --  build path, never the query path
+# ==========================================================================
+#
+# This is the approval gate with a keyboard instead of a prompt.  It exists
+# because the gate is only honoured if it is bearable: 4,628 entries at one
+# terminal keystroke each is not.
+#
+# It is emphatically NOT the reading surface.  It shows UNVERIFIED text -- that
+# is its whole job -- so it is kept apart from everything a reader sees:
+#
+#   * it binds to 127.0.0.1 only, and there is no option to bind elsewhere;
+#   * every API call needs a token minted at startup, so a page on another
+#     site cannot drive it by POSTing to localhost;
+#   * it serves no query-path route at all.  Nothing here can be mistaken for
+#     the reader's view of the dictionary.
+#
+# Stdlib http.server, so lughat.py stays single-file and offline.  The handler
+# logic ports to FastAPI unchanged if a real framework is ever wanted.
+
+REVIEW_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Review queue — lughat</title>
+<style>
+:root{
+  --bg:#EFF1EF;--surface:#F8F9F7;--ink:#14181A;--body:#2C3436;--muted:#5B6663;
+  --faint:#7F8A86;--rule:#D6DBD7;--soft:#E3E7E3;
+  --madder:#9C3B2E;--madder-bg:#F0E2DE;--verd:#3D6A57;--verd-bg:#DEEAE3;
+  --ochre:#8E6A1F;--ochre-bg:#F0E7D3;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#101413;--surface:#171C1A;--ink:#E9ECE7;--body:#C7CEC9;--muted:#94A09B;
+  --faint:#78837E;--rule:#2A322F;--soft:#222A27;
+  --madder:#D8796A;--madder-bg:#33211E;--verd:#7CBBA0;--verd-bg:#1A2A24;
+  --ochre:#CFA75B;--ochre-bg:#2A2418;}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--body);
+  font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
+.ar{font-family:"SBL BibLit","Traditional Arabic","Amiri","Geeza Pro",serif;
+  direction:rtl;unicode-bidi:isolate}
+header{position:sticky;top:0;background:var(--surface);
+  border-bottom:1px solid var(--rule);padding:.7rem 1.1rem;z-index:5}
+.bar{display:flex;align-items:center;gap:1rem;flex-wrap:wrap;
+  max-width:900px;margin:0 auto}
+.brand{font-weight:600;color:var(--ink);letter-spacing:-.01em}
+.brand small{display:block;font-weight:400;font-size:.72rem;color:var(--madder);
+  letter-spacing:.04em;text-transform:uppercase}
+.prog{flex:1;min-width:130px;height:7px;background:var(--soft);border-radius:1px;
+  overflow:hidden}
+.prog i{display:block;height:100%;background:var(--verd);width:0;transition:width .2s}
+.count{font-variant-numeric:tabular-nums;font-size:.85rem;color:var(--muted)}
+select{font:inherit;font-size:.85rem;padding:.25rem .4rem;background:var(--bg);
+  color:var(--body);border:1px solid var(--rule);border-radius:3px}
+main{max-width:900px;margin:0 auto;padding:1.6rem 1.1rem 7rem}
+.card{background:var(--surface);border:1px solid var(--rule);border-radius:4px;
+  padding:1.3rem 1.4rem;margin-bottom:1rem}
+.meta{display:flex;gap:.55rem;align-items:baseline;flex-wrap:wrap;
+  padding-bottom:.7rem;margin-bottom:.9rem;border-bottom:1px solid var(--soft)}
+.head{font-size:1.5rem;color:var(--ink);font-weight:600}
+.arrow{color:var(--faint)}
+.root{font-size:1.5rem;color:var(--ink)}
+.badge{font-size:.68rem;letter-spacing:.06em;text-transform:uppercase;
+  padding:.18rem .45rem;border-radius:2px;font-weight:600}
+.badge.direct{background:var(--verd-bg);color:var(--verd)}
+.badge.geminate,.badge.weak_final{background:var(--ochre-bg);color:var(--ochre)}
+.badge.unmatched{background:var(--madder-bg);color:var(--madder)}
+.cite{margin-left:auto;font-size:.82rem;color:var(--muted);
+  font-variant-numeric:tabular-nums}
+.warn{background:var(--ochre-bg);color:var(--ochre);font-size:.85rem;
+  padding:.5rem .7rem;border-radius:3px;margin-bottom:.9rem}
+.warn.hot{background:var(--madder-bg);color:var(--madder)}
+.txt p{margin:0 0 .7rem;font-size:1.16rem;line-height:1.95;color:var(--ink)}
+.txt p:last-child{margin-bottom:0}
+footer{position:fixed;left:0;right:0;bottom:0;background:var(--surface);
+  border-top:1px solid var(--rule);padding:.75rem 1.1rem}
+.acts{max-width:900px;margin:0 auto;display:flex;gap:.6rem;align-items:center;
+  flex-wrap:wrap}
+button{font:inherit;font-size:.9rem;padding:.5rem .95rem;border-radius:3px;
+  border:1px solid var(--rule);background:var(--bg);color:var(--body);cursor:pointer}
+button:hover{border-color:var(--muted)}
+button:focus-visible{outline:2px solid var(--verd);outline-offset:2px}
+button.ok{background:var(--verd);border-color:var(--verd);color:var(--bg);font-weight:600}
+button.no{background:var(--madder);border-color:var(--madder);color:var(--bg)}
+kbd{font:inherit;font-size:.74rem;opacity:.75;border:1px solid currentColor;
+  border-radius:2px;padding:0 .25rem;margin-left:.35rem}
+.hint{margin-left:auto;font-size:.8rem;color:var(--faint)}
+.done{text-align:center;padding:4rem 1rem;color:var(--muted)}
+.done b{display:block;font-size:1.3rem;color:var(--ink);margin-bottom:.5rem}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style></head><body>
+<header><div class="bar">
+  <div class="brand">Review queue<small>unverified &mdash; not served</small></div>
+  <div class="prog"><i id="pi"></i></div>
+  <span class="count" id="ct">&hellip;</span>
+  <select id="filt">
+    <option value="">every extraction</option>
+    <option value="direct">direct only</option>
+    <option value="geminate">geminate bridge</option>
+    <option value="weak_final">weak-final bridge</option>
+    <option value="unmatched">unmatched</option>
+  </select>
+</div></header>
+<main id="main"><div class="done">loading&hellip;</div></main>
+<footer><div class="acts">
+  <button class="ok" onclick="decide('approve')">Approve<kbd>A</kbd></button>
+  <button onclick="skip()">Skip<kbd>S</kbd></button>
+  <button class="no" onclick="decide('reject')">Wrong extraction<kbd>R</kbd></button>
+  <button onclick="undo()">Undo<kbd>U</kbd></button>
+  <span class="hint" id="hint"></span>
+</div></footer>
+<script>
+const T="__TOKEN__";let q=[],i=0,last=null,tot=0,done=0;
+const api=(p,o)=>fetch(p+(p.includes("?")?"&":"?")+"t="+encodeURIComponent(T),o)
+  .then(r=>r.json());
+function esc(s){return String(s).replace(/[&<>"]/g,c=>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+async function load(){
+  const ex=document.getElementById("filt").value;
+  const st=await api("/api/stats");
+  tot=st.stats.reduce((a,s)=>a+s.pending+s.approved+s.rejected,0);
+  done=st.stats.reduce((a,s)=>a+s.approved+s.rejected,0);
+  const d=await api("/api/queue?extraction="+encodeURIComponent(ex));
+  q=d.entries;i=0;draw();
+}
+function draw(){
+  const m=document.getElementById("main");
+  document.getElementById("pi").style.width=(tot?100*done/tot:0)+"%";
+  document.getElementById("ct").textContent=done+" / "+tot+" decided";
+  if(i>=q.length){
+    m.innerHTML='<div class="done"><b>Queue empty for this filter.</b>'+
+      'Everything you did not approve stays unserved.</div>';
+    document.getElementById("hint").textContent="";return;}
+  const e=q[i];
+  const inferred=e.extraction!=="direct";
+  m.innerHTML='<div class="card"><div class="meta">'+
+    '<span class="head ar">'+esc(e.headword)+'</span>'+
+    '<span class="arrow">&rarr;</span>'+
+    '<span class="root ar">'+esc(e.root)+'</span>'+
+    '<span class="badge '+esc(e.extraction)+'">'+esc(e.extraction)+'</span>'+
+    '<span class="cite">'+esc(e.source)+' &middot; vol '+esc(e.vol)+
+      ' p. '+esc(e.page)+' &middot; root occurs '+e.freq+'&times;</span></div>'+
+    (inferred?'<div class="warn'+(e.extraction==="unmatched"?" hot":"")+'">'+
+      'The root was INFERRED ('+esc(e.extraction)+'), not read from the heading.'+
+      (e.extraction==="unmatched"?" This root does not occur in the Qur'an.":"")+
+      '</div>':'')+
+    '<div class="txt ar">'+e.lines.map(l=>"<p>"+esc(l)+"</p>").join("")+
+    '</div></div>';
+  document.getElementById("hint").textContent=(q.length-i)+" loaded";
+}
+async function decide(d){
+  if(i>=q.length)return;const e=q[i];
+  await api("/api/decide",{method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({id:e.id,decision:d})});
+  last=e;done++;i++;draw();
+}
+function skip(){if(i<q.length){i++;draw();}}
+async function undo(){
+  if(!last)return;
+  await api("/api/decide",{method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({id:last.id,decision:"unset"})});
+  done--;i=Math.max(0,i-1);last=null;draw();
+}
+addEventListener("keydown",ev=>{
+  if(ev.target.tagName==="SELECT")return;
+  const k=ev.key.toLowerCase();
+  if(k==="a"){ev.preventDefault();decide("approve");}
+  else if(k==="s"||k===" "){ev.preventDefault();skip();}
+  else if(k==="r"){ev.preventDefault();decide("reject");}
+  else if(k==="u"){ev.preventDefault();undo();}
+});
+document.getElementById("filt").addEventListener("change",load);
+load();
+</script></body></html>
+"""
+
+REVIEW_HOST = "127.0.0.1"
+REVIEW_PORT = 8765
+
+
+def _queue_rows(conn, extraction=None, limit=60):
+    sql = ("SELECT e.id, e.headword, e.root_ar, e.extraction, e.vol, e.page, "
+           "e.text_raw, s.title, s.author, s.edition, "
+           "COALESCE((SELECT n_segments FROM roots r "
+           "          WHERE r.root_ar = e.root_ar), 0) AS freq "
+           "FROM entries e JOIN sources s ON s.id = e.source_id "
+           "WHERE e.verified = 0 AND e.rejected = 0")
+    params = []
+    if extraction:
+        sql += " AND e.extraction = ?"
+        params.append(extraction)
+    sql += " ORDER BY freq DESC, e.id LIMIT ?"
+    params.append(int(limit))
+    with unguarded(conn):
+        rows = list(conn.execute(sql, params))
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"], "headword": r["headword"],
+            "root": r["root_ar"] or "", "extraction": r["extraction"],
+            "vol": r["vol"], "page": r["page"], "freq": r["freq"],
+            "source": r["title"], "author": r["author"] or "",
+            "edition": r["edition"] or "",
+            "lines": render_entry(r["text_raw"]),
+        })
+    return out
+
+
+def _queue_stats(conn):
+    with unguarded(conn):
+        rows = list(conn.execute(
+            "SELECT extraction, "
+            "SUM(verified=1) approved, SUM(rejected=1) rejected, "
+            "SUM(verified=0 AND rejected=0) pending "
+            "FROM entries GROUP BY extraction ORDER BY extraction"))
+    return [{"extraction": r["extraction"], "approved": r["approved"],
+             "rejected": r["rejected"], "pending": r["pending"]} for r in rows]
+
+
+def _decide(conn, entry_id, decision, reason=None):
+    if decision not in ("approve", "reject", "unset"):
+        raise ValueError("decision must be approve, reject or unset")
+    with unguarded(conn):
+        if decision == "approve":
+            conn.execute("UPDATE entries SET verified=1, rejected=0, "
+                         "verified_at=datetime('now') WHERE id=?", (entry_id,))
+        elif decision == "reject":
+            conn.execute("UPDATE entries SET verified=0, rejected=1, "
+                         "reject_reason=? WHERE id=?", (reason, entry_id))
+        else:
+            conn.execute("UPDATE entries SET verified=0, rejected=0, "
+                         "verified_at=NULL, reject_reason=NULL WHERE id=?",
+                         (entry_id,))
+        conn.commit()
+        row = conn.execute("SELECT verified, rejected FROM entries WHERE id=?",
+                           (entry_id,)).fetchone()
+    return {"id": entry_id, "verified": row["verified"],
+            "rejected": row["rejected"]} if row else None
+
+
+DB_LOCK = threading.Lock()
+
+
+def make_review_app(conn, token):
+    """Return a BaseHTTPRequestHandler class bound to this connection."""
+    import http.server
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        server_version = "lughat-review"
+
+        def log_message(self, fmt, *a):        # quiet; this is a local tool
+            pass
+
+        def _send(self, code, body, ctype="application/json; charset=utf-8"):
+            blob = body if isinstance(body, bytes) else body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(blob)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            # this page must never be embedded, and must never talk out
+            # connect-src 'self' is load-bearing: without it default-src
+            # 'none' blocks the page's own fetch() and the queue never loads.
+            self.send_header("Content-Security-Policy",
+                             "default-src 'none'; style-src 'unsafe-inline'; "
+                             "script-src 'unsafe-inline'; connect-src 'self'; "
+                             "frame-ancestors 'none'; base-uri 'none'; "
+                             "form-action 'none'")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+            self.wfile.write(blob)
+
+        def _authed(self, qs):
+            got = qs.get("t", [""])[0]
+            # constant-time, so the token cannot be guessed a byte at a time
+            return secrets.compare_digest(got, token)
+
+        def do_GET(self):
+            import urllib.parse as up
+            u = up.urlparse(self.path)
+            qs = up.parse_qs(u.query)
+            if u.path == "/":
+                if not self._authed(qs):
+                    return self._send(403, "missing or bad token\n",
+                                      "text/plain; charset=utf-8")
+                return self._send(200, REVIEW_HTML.replace("__TOKEN__", token),
+                                  "text/html; charset=utf-8")
+            if not self._authed(qs):
+                return self._send(403, json.dumps({"error": "bad token"}))
+            if u.path == "/api/queue":
+                ex = qs.get("extraction", [None])[0] or None
+                with DB_LOCK:
+                    rows = _queue_rows(conn, ex)
+                return self._send(200, json.dumps(
+                    {"entries": rows}, ensure_ascii=False))
+            if u.path == "/api/stats":
+                with DB_LOCK:
+                    st = _queue_stats(conn)
+                return self._send(200, json.dumps(
+                    {"stats": st}, ensure_ascii=False))
+            return self._send(404, json.dumps({"error": "no such route"}))
+
+        def do_POST(self):
+            import urllib.parse as up
+            u = up.urlparse(self.path)
+            qs = up.parse_qs(u.query)
+            if not self._authed(qs):
+                return self._send(403, json.dumps({"error": "bad token"}))
+            if u.path != "/api/decide":
+                return self._send(404, json.dumps({"error": "no such route"}))
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 64 * 1024:
+                return self._send(413, json.dumps({"error": "too large"}))
+            try:
+                payload = json.loads(self.rfile.read(n).decode("utf-8"))
+                with DB_LOCK:
+                    res = _decide(conn, int(payload["id"]),
+                                  payload["decision"], payload.get("reason"))
+            except (ValueError, KeyError, TypeError) as e:
+                return self._send(400, json.dumps({"error": str(e)}))
+            except Exception:                                   # noqa: BLE001
+                sys.stderr.write(traceback.format_exc())
+                return self._send(500, json.dumps({"error": "server error"}))
+            return self._send(200, json.dumps({"ok": True, "row": res}))
+
+    return Handler
+
+
+def cmd_serve(conn, args):
+    import http.server
+    port = REVIEW_PORT
+    for a in args:
+        if a.startswith("--port="):
+            port = int(a.split("=", 1)[1])
+    token = secrets.token_urlsafe(18)
+    handler = make_review_app(conn, token)
+    httpd = http.server.ThreadingHTTPServer((REVIEW_HOST, port), handler)
+    url = "http://%s:%d/?t=%s" % (REVIEW_HOST, port, token)
+    _w(BAR)
+    _w("REVIEW SERVER -- the build path, not the reading surface.")
+    _w(BAR)
+    _w("This page shows UNVERIFIED text. That is its job. Nothing you see")
+    _w("here is served to a query until you approve it.")
+    _w("")
+    _w("  %s" % url)
+    _w("")
+    _w("Bound to %s only. The token is new every run." % REVIEW_HOST)
+    _w("Ctrl-C to stop.")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        _w("")
+        _w("stopped.")
+    finally:
+        httpd.server_close()
+    return 0
+
+
+# ==========================================================================
 # 12.  CLI
 # ==========================================================================
 
@@ -3173,8 +3663,8 @@ USAGE = """lughat -- a local Qur'anic lexicography tool (offline, stdlib only)
   lughat.py aya <sura:aya>        print an ayah, to check against a mushaf
   lughat.py ingest maqayis --from PATH
                                   load a lexicon, ALL at verified = 0
-  lughat.py review [--stats]      the approval gate: the only writer of
-                                  verified = 1
+  lughat.py review [--stats]      the approval gate, in the terminal
+  lughat.py serve [--port=N]      the same gate as a local page (127.0.0.1)
 
 Roots and words may be typed in Arabic (سكن) or Buckwalter (skn).
 """
@@ -3276,6 +3766,9 @@ def _main(argv):
         _w("  python3 lughat.py review")
         _w(MAQAYIS_ATTRIBUTION)
         return 0
+
+    if cmd == "serve":
+        return cmd_serve(connect(threadsafe=True), argv[2:])
 
     if cmd == "review":
         cmd_review(connect(), argv[2:])
