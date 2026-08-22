@@ -5730,12 +5730,26 @@ def _t(conn):
     # the premise: such a root really is unreachable from the reader
     ck(read_root(conn, row[0]).get("absent"),
        "%s is reachable after all; the queue is hiding useful work" % row[0])
-    default = {r["extraction"] for r in _queue_rows(conn, limit=400)}
-    ck("unmatched" not in default,
-       "the default queue leads with work no reader can see")
-    asked = _queue_rows(conn, extraction="unmatched", limit=5)
-    ck(asked and all(r["extraction"] == "unmatched" for r in asked),
-       "asking for unmatched does not return them")
+    with unguarded(conn):
+        conn.execute("SAVEPOINT unm")
+        top = conn.execute("SELECT root_ar FROM roots ORDER BY n_segments "
+                           "DESC LIMIT 1").fetchone()[0]
+        conn.execute("INSERT INTO entries (source_id,root_ar,headword,"
+                     "text_raw,vol,page,extraction,verified) SELECT id,?,?,"
+                     "'UNMATCHED FIXTURE','1','1','unmatched',0 "
+                     "FROM sources WHERE kind='lexicon' LIMIT 1",
+                     (top, "(%s)" % top))
+    try:
+        default = {r["extraction"] for r in _queue_rows(conn, limit=400)}
+        ck("unmatched" not in default,
+           "the default queue leads with work no reader can see")
+        asked = _queue_rows(conn, extraction="unmatched", limit=5)
+        ck(asked and all(r["extraction"] == "unmatched" for r in asked),
+           "asking for unmatched does not return them")
+    finally:
+        with unguarded(conn):
+            conn.execute("ROLLBACK TO unm")
+            conn.execute("RELEASE unm")
     # and the count is not swallowed
     src = strip_comments(own_source())
     ck("further entries are pending whose heading maps to no root" in src,
