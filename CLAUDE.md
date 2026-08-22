@@ -802,8 +802,18 @@ would put a single `unguarded(conn)` call between the reader and a
 fabrication. Its one unguarded query is a `COUNT(*)` of pending rows — a
 number, never text — so an empty card can say *why* it is empty.
 
-Both bind `127.0.0.1`. There is no link to give anyone: the tool is offline by
-architecture, and a "share" would mean serving unreviewed lexicon text.
+Both bind `127.0.0.1`. Neither can be shared as a link, because a server on
+this machine is not reachable from another one — and a "share" of the review
+gate would mean serving unreviewed lexicon text.
+
+`export` is the answer to that: **the reading surface with its server
+removed**, one file, no database. The payload is built by the same
+`read_root()` the server uses, on a **guarded** connection, so an export can
+no more carry an unreviewed article than the page it is made from. What it
+loses is the database, so it holds only the roots it was built with and
+**says so in a banner** rather than pretending to be the whole tool. Sharing
+one shares CC BY-NC-SA lexicon text: every card carries its attribution, and
+that has to travel with it.
 
 The page has **three views**, because the three questions are different and
 the books answering them are keyed differently — a dictionary by **root**, Ibn

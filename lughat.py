@@ -50,9 +50,11 @@ Usage:
   lughat.py review --root=<root>  decide one root's entries now
   lughat.py serve [--port=N]      the same gate as a local page (127.0.0.1)
   lughat.py read [--port=N]       the READING surface: approved sources only
+  lughat.py export [--roots=N]    the reader as one shareable file
 """
 
 import contextlib
+import datetime
 import inspect
 import hashlib
 import io
@@ -8910,6 +8912,110 @@ def make_read_app(conn):
     return Handler
 
 
+EXPORT_BANNER = (
+    "A STATIC EXPORT of %d roots, made on %s from a database in which a "
+    "person had approved this text. It is the reading surface with its "
+    "server removed: the same rendering, the same refusals, the same "
+    "citations, and nothing in it can be searched beyond the roots carried "
+    "here. The whole tool -- 1,642 roots, both queues, the review gate -- "
+    "runs locally from the repository."
+)
+
+
+def export_page(conn, n_roots=60, when=None, include=()):
+    """The reading surface as one self-contained file.
+
+    Everything it carries has been APPROVED: the payload is built by the same
+    read_root() the server uses, on a guarded connection, so an export can no
+    more leak an unreviewed article than the page it is made from. What it
+    loses is the database -- it holds the roots it was built with and says
+    so, rather than pretending to be the whole tool."""
+    roots = [r["root_ar"] for r in q(
+        conn, "SELECT root_ar FROM roots ORDER BY n_segments DESC, root_ar "
+              "LIMIT ?", (int(n_roots),))]
+    # The commonest roots are function words. A named root can be added, and
+    # the banner then says so: an export that quietly held a hand-picked set
+    # would misrepresent what the tool covers.
+    named = []
+    for extra in include:
+        canon = "".join(canonical_root(extra))
+        if canon not in roots and q(conn, "SELECT 1 FROM roots WHERE "
+                                          "root_ar=?", (canon,)).fetchone():
+            roots.append(canon)
+            named.append(canon)
+    data = {}
+    for r in roots:
+        data[r] = read_root(conn, r)
+    inv = [x for x in root_inventory(conn) if x["r"] in data]
+    blob = json.dumps({"pages": data, "roots": inv}, ensure_ascii=False)
+
+    html = READ_HTML
+    # 1. the lookup replaces the fetch
+    old = ' const r=await fetch("/api/read?q="+encodeURIComponent(t))' \
+          '.then(x=>x.json());'
+    assert html.count(old) == 1, "the export cannot find the reader's fetch"
+    html = html.replace(old, """ const k=EXPORT.pages[t]||EXPORT.pages[
+   Object.keys(EXPORT.pages).find(x=>x===t)||""];
+ const r=k||{error:"This export carries "+Object.keys(EXPORT.pages).length+
+  " roots and "+t+" is not one of them. The full tool has all 1,642."};""", 1)
+    # 2. the picker reads the embedded inventory
+    old = ' ROOTS=(await fetch("/api/roots").then(x=>x.json())).roots;'
+    assert html.count(old) == 1, "the export cannot find the picker's fetch"
+    html = html.replace(old, " ROOTS=EXPORT.roots;", 1)
+    # 3. his table of contents needs the server; it goes, rather than
+    #    becoming a list of titles that cannot be opened
+    html, n_toc = re.subn(
+        r"""\s*h\+='<details class="fold" id="toc">.*?</details>';""",
+        "", html, count=1, flags=re.S)
+    assert n_toc == 1, "the export cannot find the chapter browser"
+    banner = EXPORT_BANNER % (len(data), when or "an unrecorded date")
+    banner += (" The roots carried are the %d commonest in the Qurʾān%s."
+               % (int(n_roots),
+                  ", plus " + " ".join(named) if named else ""))
+    html = html.replace(
+        '<main id="m">',
+        '<div class="xbanner">' + banner + '</div>\n<main id="m">', 1)
+    html = html.replace("</style>",
+                        ".xbanner{max-width:940px;margin:0 auto;"
+                        "padding:.7rem 1.1rem;font-size:.78rem;"
+                        "color:var(--mut);line-height:1.6}\n</style>", 1)
+    html = html.replace("<script>",
+                        "<script>\nconst EXPORT=" + blob + ";", 1)
+    return html
+
+
+def cmd_export(conn, args):
+    n = 60
+    out = "lughat-export.html"
+    include = []
+    for a in args:
+        if a.startswith("--roots="):
+            n = int(a.split("=", 1)[1])
+        elif a.startswith("--out="):
+            out = a.split("=", 1)[1]
+        elif a.startswith("--include="):
+            include = [x for x in a.split("=", 1)[1].split(",") if x.strip()]
+    html = export_page(conn, n, when=datetime.date.today().isoformat(),
+                       include=include)
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    mb = os.path.getsize(out) / 1e6
+    carried = html.count('"query":')
+    _w("wrote %s  (%d roots, %.1f MB)" % (out, carried, mb))
+    _w("")
+    for line in _wrap(
+            "Everything in it was approved before it was written: the export "
+            "is built by the same read_root() the reader uses, on a guarded "
+            "connection. Sharing it shares CC BY-NC-SA lexicon text, so the "
+            "attribution on every card has to travel with it -- it does.",
+            72):
+        _w(line)
+    if mb > 12:
+        _w("")
+        _w("NOTE: over 12 MB. Fewer roots if it has to be opened on a phone.")
+    return out
+
+
 def cmd_read(conn, args):
     import http.server
     port = READ_PORT
@@ -8965,6 +9071,7 @@ USAGE = """lughat -- a local Qur'anic lexicography tool (offline, stdlib only)
   lughat.py review --root=<root>  decide one root's entries now
   lughat.py serve [--port=N]      the same gate as a local page (127.0.0.1)
   lughat.py read [--port=N]       the READING surface: approved sources only
+  lughat.py export [--roots=N]    the reader as one shareable file
 
 Roots and words may be typed in Arabic (سكن) or Buckwalter (skn).
 """
@@ -9218,6 +9325,10 @@ def _main(argv):
             sys.stdout.write(USAGE)
             return 2
         cmd_akbar(connect(), argv[2])
+        return 0
+
+    if cmd == "export":
+        cmd_export(connect(), argv[2:])
         return 0
 
     if cmd == "translation":
