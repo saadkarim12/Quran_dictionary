@@ -640,6 +640,30 @@ it **closes what is in progress and opens nothing**. Treating it as a pericope
 reported 114 sūra preambles as 114 comments that could not be anchored — a
 refusal count that overstated the gap by more than a third.
 
+### Bulk approval, and why it is stamped
+
+15,768 entries one at a time is a gate nobody finishes, and a gate nobody
+finishes is a tool nobody uses. So `review --approve-all` accepts a **class**
+— a source, an extraction method, a root, a text match — and it is not a
+hidden shortcut:
+
+- it **names a class or refuses**. `--approve-all` alone would make the gate
+  decorative, so at least one of `--source= --extraction= --root= --contains=`
+  is required.
+- it **prints what the gate is for**, including the أكر-under-الله failure.
+- it **shows a sample** — twelve entries taken at a stride across the class,
+  not off the front, because the first N entries of a lexicon are all in the
+  same letter and a letter is the wrong unit to judge a book by.
+- it demands the word **yes**.
+- every row it approves is stamped `verified_by = 'bulk'`, **permanently**,
+  and the reading page badges it. *A person read this* and *a person accepted
+  the class this belongs to* are different claims about the same text, and
+  the reader is told which one they are looking at.
+
+The stamp is what makes the shortcut honest rather than a quiet weakening.
+A test asserts the stamp is written, that the badge reaches the page, and —
+by calling it, not by grepping for the word — that a class must be named.
+
 ### The gate has to be reachable from the word you are reading
 
 The queue is 15,768 entries in frequency order. That is the right default and
@@ -757,6 +781,8 @@ Single file, stdlib only, offline after `setup`.
     lughat.py serve [--port=N]      the approval gate as a local page
     lughat.py review [--stats]      the approval gate
     lughat.py review --root=<root>  approve one root's entries now
+    lughat.py review --approve-all --source=K   approve a class,
+                                    after a sample; stamped `bulk`
     lughat.py review --tafsir       the same gate, for commentary
     lughat.py read [--port=N]       the reading surface: approved sources only
 

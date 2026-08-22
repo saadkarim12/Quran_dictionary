@@ -1194,7 +1194,7 @@ def all_refusals(result):
 #                    from its letters; it is read from a lexicon and carries
 #                    bab_source_id / bab_page.  NULL means unknown.
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 SCHEMA = r"""
 PRAGMA journal_mode = WAL;
@@ -1564,6 +1564,12 @@ _MIGRATIONS_V2 = [
     ("tafsir", "anchor_method", "TEXT"),
     ("tafsir", "anchor_evidence", "TEXT"),
     ("tafsir", "page_to", "TEXT"),
+    # HOW a row was approved: read one at a time, or waved through in bulk.
+    # The distinction is permanent and shown to the reader, because "a person
+    # read this" and "a person accepted the class this belongs to" are not
+    # the same claim.
+    ("entries", "verified_by", "TEXT"),
+    ("tafsir", "verified_by", "TEXT"),
 ]
 
 
@@ -4114,6 +4120,34 @@ def cmd_review(conn, args):
             root = "".join(canonical_root(a.split("=", 1)[1]))
     if "--tafsir" in args:
         return _review_tafsir(conn)
+    if "--approve-all" in args:
+        where, params, bits = [], [], []
+        if source:
+            where.append("e.source_id = (SELECT id FROM sources WHERE key=?)")
+            params.append(source)
+            bits.append("source %s" % source)
+        if only:
+            where.append("e.extraction = ?")
+            params.append(only)
+            bits.append("extraction %s" % only)
+        if root:
+            where.append("e.root_ar = ?")
+            params.append(root)
+            bits.append("root %s" % root)
+        if contains:
+            where.append("(e.headword LIKE ? OR e.text_raw LIKE ?)")
+            params += ["%" + contains + "%"] * 2
+            bits.append("text containing %s" % contains)
+        if not where:
+            # Approving EVERYTHING with one keystroke is not a workflow, it is
+            # the gate deleting itself. A class has to be named.
+            raise SystemExit(
+                "REFUSED. --approve-all needs a class to approve: at least "
+                "one of --source=, --extraction=, --root=, --contains=.\n"
+                "Approving every pending row at once would make the gate "
+                "decorative.")
+        _bulk_approve(conn, " AND ".join(where), params, ", ".join(bits))
+        return
     if "--stats" in args:
         _w(BAR)
         _w("REVIEW QUEUE")
@@ -4227,6 +4261,76 @@ def cmd_review(conn, args):
             approved += 1
     _w("")
     _w("%d approved this session. The rest stay unserved." % approved)
+
+
+BULK_WARNING = (
+    "This approves %d entries WITHOUT showing them to you one at a time.\n"
+    "\n"
+    "The gate exists because the ROOT of each entry was derived by a parser, "
+    "and a parser can be wrong in a way that looks perfectly sourced -- a "
+    "digitisation artifact once filed Ibn Faris's article on أكر (digging) "
+    "under the root of الله, with a page number on it.\n"
+    "\n"
+    "What you are about to do is accept a CLASS rather than read its "
+    "members. Every row approved this way is stamped `bulk` and stays "
+    "distinguishable forever: the reading page badges it, and you can find "
+    "them again with  review --stats.  Reject any one of them later with "
+    "review --root=<root>.")
+
+
+def _bulk_approve(conn, sql_where, params, label, sample=12):
+    """Approve a whole class at once, after showing a sample of it.
+
+    Not a hidden shortcut: it prints what the gate is for, shows a random
+    handful so the class can be judged on evidence rather than hope, and
+    requires the word `yes`. And it records HOW each row was approved."""
+    with unguarded(conn):
+        rows = list(conn.execute(
+            "SELECT e.id, e.headword, e.root_ar, e.extraction, e.vol, e.page, "
+            "e.text_raw, s.title FROM entries e JOIN sources s "
+            "ON s.id = e.source_id WHERE e.verified=0 AND e.rejected=0 AND "
+            + sql_where, params))
+    if not rows:
+        _w("Nothing pending for %s." % label)
+        return 0
+    _w(BAR)
+    _w("BULK APPROVAL   %s" % label)
+    _w(BAR)
+    for line in (BULK_WARNING % len(rows)).split("\n"):
+        for w in (_wrap(line, 72) if line else [""]):
+            _w(w)
+    _w("")
+    # a sample, spread across the class rather than taken from its start:
+    # the first N entries of a lexicon are all in the same letter, and a
+    # letter is exactly the wrong unit to judge a whole book by.
+    step = max(1, len(rows) // sample)
+    shown = rows[::step][:sample]
+    _w("A sample of %d, spread across the %d:" % (len(shown), len(rows)))
+    for r in shown:
+        _w("")
+        _w("  %s  %s -> %s  [%s]  vol %s p. %s"
+           % (r["title"][:22], r["headword"], r["root_ar"] or "-",
+              r["extraction"], r["vol"], r["page"]))
+        body = render_entry(r["text_raw"] or "")
+        for line in _wrap(body[0] if body else "(no text)", 68)[:2]:
+            _w("     " + line)
+    _w("")
+    _w(RULE)
+    try:
+        ans = input("approve all %d? type yes to confirm: " % len(rows)).strip()
+    except EOFError:
+        ans = ""
+    if ans.lower() != "yes":
+        _w("nothing approved.")
+        return 0
+    with unguarded(conn):
+        conn.executemany(
+            "UPDATE entries SET verified=1, rejected=0, reject_reason=NULL, "
+            "verified_at=datetime('now'), verified_by='bulk' WHERE id=?",
+            [(r["id"],) for r in rows])
+        conn.commit()
+    _w("%d approved, stamped `bulk`." % len(rows))
+    return len(rows)
 
 
 def _review_tafsir(conn):
@@ -5587,6 +5691,44 @@ def _t(conn):
        "the renderer invented punctuation the book does not have: %r" % got)
     ck("خلاف الاضطراب والحركة" in " ".join(shown), "the text itself was lost")
     return "stored verbatim (%d chars), rendered clean" % len(raw)
+
+
+@test("HONESTY", "a row waved through in bulk says so, forever")
+def _t(conn):
+    """Bulk approval is a real weakening of the gate, so it is not allowed to
+    be invisible: the row records HOW it was approved, and the reader sees a
+    badge. "A person read this" and "a person accepted the class it belongs
+    to" are different claims about the same text."""
+    src = strip_comments(own_source())
+    # the bulk path must stamp, and must be the only thing that stamps 'bulk'
+    stamps = re.findall(r"verified_by *= *'([a-z]+)'", src)
+    ck(stamps == ["bulk"], "verified_by is written as %s" % stamps)
+    ck("--approve-all" in src, "the bulk path has gone")
+    # it must refuse to approve everything at once -- called, not grepped
+    out = io.StringIO()
+    real, sys.stdout = sys.stdout, out
+    try:
+        cmd_review(conn, ["--approve-all"])
+        ck(False, "--approve-all with no class named was not refused")
+    except SystemExit as e:
+        ck("REFUSED" in str(e), "it refused without saying why: %s" % e)
+    finally:
+        sys.stdout = real
+    # and it must show a sample and demand a typed confirmation
+    fn = src[src.index("def " + "_bulk_approve("):]
+    fn = fn[:fn.index("\ndef ")]
+    ck("sample" in fn and "input(" in fn and '"yes"' in fn,
+       "bulk approval neither samples nor confirms")
+    ck("rows[::step]" in fn,
+       "the sample is taken from the start of the class, where every entry "
+       "is in the same letter")
+    # the badge reaches the page
+    ck('"bulk"' in READ_HTML or "e.bulk" in READ_HTML,
+       "the reading page does not badge a bulk-approved entry")
+    with unguarded(conn):
+        n = conn.execute("SELECT COUNT(*) FROM entries WHERE "
+                         "verified_by = ?", ("bulk",)).fetchone()[0]
+    return "%d rows stamped bulk and badged; --approve-all needs a class" % n
 
 
 @test("HONESTY", "an ingested entry is not served until it is approved")
@@ -7509,7 +7651,8 @@ def _queue_stats(conn, table="entries"):
              "rejected": r["rejected"], "pending": r["pending"]} for r in rows]
 
 
-def _decide(conn, entry_id, decision, reason=None, table="entries"):
+def _decide(conn, entry_id, decision, reason=None, table="entries",
+            how="read"):
     if decision not in ("approve", "reject", "unset"):
         raise ValueError("decision must be approve, reject or unset")
     tbl = _table(table)
@@ -7519,8 +7662,8 @@ def _decide(conn, entry_id, decision, reason=None, table="entries"):
         # reject_reason -- an audit trail that contradicts itself.
         if decision == "approve":
             conn.execute("UPDATE %s SET verified=1, rejected=0, "
-                         "reject_reason=NULL, verified_at=datetime('now')"
-                         " WHERE id=?" % tbl, (entry_id,))
+                         "reject_reason=NULL, verified_at=datetime('now'), "
+                         "verified_by=? WHERE id=?" % tbl, (how, entry_id))
         elif decision == "reject":
             conn.execute("UPDATE %s SET verified=0, rejected=1, "
                          "verified_at=NULL, reject_reason=? WHERE id=?"
@@ -7760,6 +7903,7 @@ main{max-width:940px;margin:0 auto;padding:1.5rem 1.1rem 5rem}
  padding:.16rem .45rem;border-radius:2px;background:var(--soft);color:var(--mut)}
 .pill.ok{background:var(--verdbg);color:var(--verd)}
 .pill.no{background:var(--madbg);color:var(--mad)}
+.pill.warn{background:var(--ochbg);color:var(--och)}
 h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.11em;
  color:var(--faint);margin:1.8rem 0 .6rem;font-weight:600}
 .card{background:var(--surf);border:1px solid var(--rule);border-radius:4px;
@@ -8056,6 +8200,8 @@ function draw(){
     '<span class="who">'+esc(c.author)+'</span>'+
     (e.extraction&&e.extraction!=="direct"
       ? '<span class="pill no">root inferred: '+esc(e.extraction)+'</span>':'')+
+    (e.bulk? '<span class="pill warn" title="approved as part of a class, '+
+      'not read one at a time">bulk-approved</span>':'')+
     '<span class="cite">vol '+esc(e.vol)+' p. '+esc(e.page)+'</span></div>'+
     '<div class="txt ar">'+e.lines.map(l=>"<p>"+esc(l)+"</p>").join("")+'</div>'+
     '<div class="attrib">'+esc(c.attribution)+'</div></div>';}
@@ -8397,8 +8543,9 @@ def read_root(conn, query):
             continue
         ents = list(q(conn,
                       "SELECT text_raw, scan_uri, vol, page, extraction, "
-                      "headword FROM v_entries WHERE source_id=? AND "
-                      "root_ar=? ORDER BY id", (src["id"], root)))
+                      "headword, verified_by FROM v_entries WHERE "
+                      "source_id=? AND root_ar=? ORDER BY id",
+                      (src["id"], root)))
         with unguarded(conn):
             pending = conn.execute(
                 "SELECT COUNT(*) n FROM entries WHERE source_id=? AND "
@@ -8412,6 +8559,10 @@ def read_root(conn, query):
             card["entries"].append({
                 "headword": e["headword"], "vol": e["vol"], "page": e["page"],
                 "extraction": e["extraction"],
+                # "a person read this" and "a person accepted the class it
+                # belongs to" are different claims, and the reader is told
+                # which one they are looking at
+                "bulk": e["verified_by"] == "bulk",
                 "lines": (render_entry(e["text_raw"])
                           if e["text_raw"] is not None
                           else ["[scan only]", e["scan_uri"] or ""]),
