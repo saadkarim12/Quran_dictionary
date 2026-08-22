@@ -6767,12 +6767,17 @@ def _t(conn):
            "the gloss did not come back with its engine")
 
         # 3. the page shows it apart, under a warning, every time
-        js = READ_HTML[READ_HTML.index("function gloss("):]
+        js = READ_HTML[READ_HTML.index("function body("):]
         js = js[:js.index("function att(")]
         ck("glw" in js and "warn" in js,
            "the page renders a gloss without a warning")
-        ck(js.count("x.text") == 1 and "e.lines" not in js,
-           "the gloss is interleaved with the scholar's paragraphs")
+        ck(js.count("x.text") == 1,
+           "the gloss is rendered from more than one place")
+        ck("e.lines.map" in js and "x.text" in js
+           and js.index("e.lines.map") < js.index("x.text"),
+           "the gloss is not laid out beside the article as a whole")
+        ck("</p>" not in js.split("x.text")[1][:200],
+           "the gloss is being split into paragraphs against the Arabic")
         ck("%s" in GLOSS_WARNING and "not checked by anyone" in GLOSS_WARNING,
            "the warning does not say whose words these are not")
     finally:
@@ -8331,7 +8336,12 @@ h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.11em;
 .slot .att.sk{color:var(--och)}
 .slot .att i{font-style:normal;opacity:.75}
 .aya{font-size:1.2rem;line-height:2.1;color:var(--ink);margin:.2rem 0 .5rem;padding:.5rem .7rem;background:var(--surf);border-radius:4px;border:1px solid var(--rule)}
-.gl{margin-top:.7rem;padding-top:.6rem;border-top:1px dashed var(--och)}
+.sbs{display:grid;gap:.9rem;align-items:start;
+ grid-template-columns:repeat(auto-fit,minmax(18rem,1fr))}
+.sbs .txt{margin:0}
+.gl{padding:.5rem .7rem;border:1px dashed var(--och);border-radius:3px;
+ background:var(--ochbg)}
+.srcsel label.mach{color:var(--och)}
 .glw{font-size:.68rem;line-height:1.5;color:var(--och);margin-bottom:.35rem;text-transform:none;letter-spacing:0}
 .glt{font-size:.94rem;line-height:1.7;color:var(--mut)}
 .glt.rtl{direction:rtl;text-align:right;line-height:2.4;font-family:"Noto Nastaliq Urdu","Jameel Noori Nastaleeq","Geeza Pro",serif}
@@ -8522,17 +8532,21 @@ async function tocOpen(){
     : '<div class="card empty">'+esc(d.error||"not available")+'</div>';}));
 }
 
-function gloss(e, who, warn){
- // Below the Arabic, behind a rule, with the warning on EVERY one -- not
- // interleaved with the scholar's paragraphs, where a wrong line would read
- // as his meaning.
- const g=(e.glosses||[]);
- if(!g.length) return "";
- return '<div class="gl">'+g.map(x=>
+function body(e, who, warn){
+ // Arabic in one column, the gloss beside it -- as WHOLES. The paragraphs
+ // are not laid out against each other: a machine gloss is one rendering of
+ // the whole article, and lining it up line by line would imply a
+ // correspondence nobody checked.
+ const ar='<div class="txt ar">'+e.lines.map(l=>"<p>"+esc(l)+"</p>").join("")+
+   '</div>';
+ const g=(e.glosses||[]).filter(x=>!HIDDEN.has("gloss:"+x.lang));
+ if(!g.length) return ar;
+ return '<div class="sbs">'+ar+g.map(x=>
+   '<div class="gl">'+
    '<div class="glw">&#9888; '+esc(warn.replace("%s",who)
       .replace("%s",x.engine))+'</div>'+
-   '<div class="glt'+(x.rtl?" rtl":"")+'">'+esc(x.text)+'</div>').join("")+
-  '</div>';
+   '<div class="glt'+(x.rtl?" rtl":"")+'">'+esc(x.text)+'</div></div>'
+ ).join("")+'</div>';
 }
 
 function att(f){
@@ -8591,6 +8605,12 @@ function draw(){
  for(const c of r.cards.concat(r.tafsir_sources||[], r.translations||[]))
   h+='<label><input type="checkbox" data-k="'+esc(c.key)+
   '"'+(HIDDEN.has(c.key)?"":" checked")+'> '+esc(c.title)+'</label>';
+ // the machine glosses are switched separately, and labelled as machine
+ // output in the switch itself, not only in the card
+ for(const g of (r.gloss_langs||[]))
+  h+='<label class="mach"><input type="checkbox" data-k="gloss:'+esc(g.lang)+
+   '"'+(HIDDEN.has("gloss:"+g.lang)?"":" checked")+'> '+esc(g.language)+
+   ' \u2014 machine</label>';
  h+='</div>';
  for(const c of r.cards){
   if(HIDDEN.has(c.key)) continue;
@@ -8614,8 +8634,7 @@ function draw(){
     (e.bulk? '<span class="pill warn" title="approved as part of a class, '+
       'not read one at a time">bulk-approved</span>':'')+
     '<span class="cite">vol '+esc(e.vol)+' p. '+esc(e.page)+'</span></div>'+
-    '<div class="txt ar">'+e.lines.map(l=>"<p>"+esc(l)+"</p>").join("")+'</div>'+
-    gloss(e, c.author||c.title, r.gloss_warning)+
+    body(e, c.author||c.title, r.gloss_warning)+
     '<div class="attrib">'+esc(c.attribution)+'</div></div>';}
  }
 
@@ -9065,6 +9084,12 @@ def read_root(conn, query):
         for r in installed_translations(conn)]
     out["translate_refusal"] = REFUSAL_TRANSLATE_MYSELF
     out["gloss_warning"] = GLOSS_WARNING
+    # which gloss languages this root actually has, so the switch offers
+    # only what exists rather than a menu of empty promises
+    langs = sorted({g["lang"] for c in out["cards"] for e in c["entries"]
+                    for g in e["glosses"]})
+    out["gloss_langs"] = [{"lang": l, "language": GLOSS_LANGS.get(l, l)}
+                          for l in langs]
     out["tafsir_sources"] = [
         {"key": r["key"], "title": r["title"]}
         for r in q(conn, "SELECT key, title FROM sources WHERE kind='tafsir' "

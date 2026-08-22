@@ -574,9 +574,11 @@ is what keeps them after the asking is forgotten:
 2. **Its own table.** `glosses`, never a column on `entries`: the scholar's
    words and a machine's rendering of them must be impossible to confuse at
    the storage layer, not merely on screen.
-3. **Its own block, below the Arabic, behind a rule** — never interleaved
-   paragraph by paragraph, which is the arrangement where a wrong line reads
-   as the scholar's meaning.
+3. **Its own column beside the Arabic**, and as a WHOLE — never interleaved
+   paragraph against paragraph, which would imply a correspondence nobody
+   checked and is the arrangement where a wrong line reads as the scholar's
+   meaning. Each language is switched on and off in the source selector,
+   labelled *machine* in the switch itself and not only in the card.
 4. **A warning on every one, naming the engine**: *not Ibn Fāris's words, and
    not checked by anyone.* `gloss --clear` deletes them all and touches
    nothing else.
