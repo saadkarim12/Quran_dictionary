@@ -8933,11 +8933,17 @@ let VIEW=(()=>{try{return localStorage.getItem("lughat.view")||"dict";}
               catch(e){return "dict";}})();
 let GLOSS=(()=>{try{return localStorage.getItem("lughat.gloss")==="1";}
                 catch(e){return false;}})();
-const TABBAR='<nav class="tabs">'+VIEWS.map(v=>
+// A FUNCTION, not a const. As a const this was a snapshot taken once at
+// load, so every redraw re-inserted the switch in its ORIGINAL state: GLOSS
+// flipped and the Urdu appeared, but the box drew itself unchecked again a
+// moment later, which reads as a control that does nothing.
+function tabbar(){
+ return '<nav class="tabs">'+VIEWS.map(v=>
   '<button data-v="'+v[0]+'">'+v[1]+'</button>').join("")+
   '<label class="gsw" title="machine-translated Urdu beside the Arabic">'+
   '<input type="checkbox" id="gsw"'+(GLOSS?" checked":"")+'> Urdu</label>'+
   '</nav>';
+}
 
 // MACHINE URDU. Rendered OUTSIDE the card, because the card's border is this
 // page's one visual promise -- verbatim, cited -- and no machine's output may
@@ -8961,9 +8967,10 @@ function quotedBlock(e){
    ((q.translations||[]).length?', with '+esc(q.translations[0].author):'')+
    '</summary>'+
    '<div class="aya ar">'+esc(q.ayah)+'</div>';
-  for(const t of (q.translations||[]))
+  for(const t of (q.translations||[])){
+   if(HIDDEN.has(t.key)) continue;
    h+='<div class="tr ur">'+esc(t.text)+'<span class="by">'+esc(t.title)+
-    ' &middot; '+esc(t.author)+'</span></div>';
+    ' &middot; '+esc(t.author)+'</span></div>';}
   h+='</details>';
  }
  return h;
@@ -9015,7 +9022,7 @@ function draw(){
  // Jinni by LETTER and by TOPIC, the mushaf by AYAH.
  h+='<section data-view="dict">';
  h+='<h2>Dictionaries</h2><div class="srcsel">';
- for(const c of r.cards.concat(r.tafsir_sources||[], r.translations||[]))
+ for(const c of r.cards.concat(r.tafsir_sources||[]))
   h+='<label><input type="checkbox" data-k="'+esc(c.key)+
   '"'+(HIDDEN.has(c.key)?"":" checked")+'> '+esc(c.title)+'</label>';
  h+='</div>';
@@ -9161,6 +9168,13 @@ function draw(){
 
  h+='</details>';
  h+='</section><section data-view="quran">';
+ if((r.translations||[]).length){
+  h+='<div class="srcsel">';
+  for(const c of r.translations)
+   h+='<label><input type="checkbox" data-k="'+esc(c.key)+
+   '"'+(HIDDEN.has(c.key)?"":" checked")+'> '+esc(c.title)+'</label>';
+  h+='</div>';
+ }
  h+='<h2>Tafsir</h2><div class="cls" style="margin:-.3rem 0 .6rem">'+
   'on the āyāt where this root occurs</div>';
   for(const a of r.tafsir){
@@ -9254,7 +9268,7 @@ function draw(){
   }
  }
  h+='</section>';
- m.innerHTML=TABBAR+h;
+ m.innerHTML=tabbar()+h;
  showView(VIEW);
  const toc=document.getElementById("toc");
  if(toc) toc.addEventListener("toggle",()=>{if(toc.open)tocOpen();});
@@ -9265,7 +9279,7 @@ function draw(){
   GLOSS=gs.checked;
   try{localStorage.setItem("lughat.gloss",GLOSS?"1":"0");}catch(e){}
   draw();showView(VIEW);});
- m.querySelectorAll("input[type=checkbox]").forEach(cb=>{
+ m.querySelectorAll(".srcsel input[type=checkbox]").forEach(cb=>{
   cb.addEventListener("change",()=>{
    const k=cb.dataset.k;
    if(cb.checked)HIDDEN.delete(k);else HIDDEN.add(k);
