@@ -557,13 +557,190 @@ Taking those offsets from a *different* string than the match was found in
 turned `السكون ضد الحركة` into `ضد لحركة`: a word of Ibn Manẓūr's corrupted by
 one character, in a card carrying his name. Trap 8 again.
 
-## Urdu beside the Arabic
+### Trap 21 — a control that redraws itself stale reads as one that does nothing
+
+The Urdu switch did flip its flag, and the Urdu did appear — and then the box
+drew itself unchecked again a moment later, so it looked dead. Two causes,
+both of them the switch being treated as something it is not:
+
+- `TABBAR` was a **const**: a snapshot built once at load. Every `draw()`
+  re-inserted the switch in its *original* state, so the flag stayed set
+  while the control reverted. Anything whose markup depends on mutable state
+  must be a function, not a string built once.
+- `m.querySelectorAll("input[type=checkbox]")` caught it along with the
+  source toggles, so each click *also* ran the source-hiding handler with
+  `dataset.k` undefined — putting `undefined` into `HIDDEN` and firing a
+  second `draw()` that fought the first. The handler is scoped to `.srcsel`,
+  which is what it was always for.
+
+And separately: **a translation is not a dictionary.** Jalandhry was listed
+under the "Dictionaries" heading, which has no card for him; his toggle
+belongs in the Qurʾān view, where translations are rendered. It must also
+mean the same thing everywhere — the āyāt quoted inside a dictionary entry
+honour it too, which they did not at first.
+
+## A scan-only source: Kīlānī, whose stored text is not his words
+
+Every other source here stores its book **verbatim**. This one cannot: the
+KitaboSunnat scan of ʿAbd al-Raḥmān Kīlānī's *Mutarādifāt al-Qurʾān* has no
+text layer at all — measured, 0 text operators on every one of its 1,026
+pages — so what exists is OCR at **0.483 mean confidence**.
+
+The schema already had the slot, and no new rule was needed:
+
+    text_raw IS NULL     there is nothing verbatim to show
+    text_norm            the OCR — a search key, never displayed, as it has
+                         always been for every other source
+    scan_uri             the page, which the CHECK constraint then makes
+                         compulsory:
+                         CHECK (text_raw IS NOT NULL OR scan_uri IS NOT NULL)
+
+So **nothing from this book is ever rendered.** The reader gets a page number
+and *this program's own muṣḥaf text* for the āyāt the page quotes.
+
+**Do not filter on engine confidence.** Counter-intuitive and measured:
+vowelled Qurʾānic Arabic scores mean 0.376 while the unvowelled Urdu around
+it scores 0.517. Confidence is *anti-correlated* with correctness on this
+book, so a "keep words above 0.8" rule would discard the only usable half.
+
+### It is keyed by Urdu headword, and the OCR lost exactly that key
+
+The book is arranged **by Urdu headword**. Azure ran an *Arabic* model over
+Nastaʿlīq, so only **82 of its 6,585 words** came back holding an Urdu-only
+letter — پ ٹ ڈ ڑ ں ہ ے are mapped onto Arabic look-alikes. The one key the
+book is organised on is the one thing the OCR destroyed.
+
+`keyed_by` is therefore `'urdu'`, and the consequence is the same as
+al-Khaṣāʾiṣ's: it cannot be *asked* about a root, it gets **no root card**,
+and the page states this rather than showing an empty card — which would be a
+claim about the book's contents when the truth is about its organisation.
+Urdu search is refused outright, with the measurement above as the reason.
+
+### A root link needs two agreeing facts, because the OCR corrupts headwords
+
+`دَابِر` came back `دَايِر`, a bāʾ read as a yāʾ. So "the headword contains
+these radicals" cannot by itself file a page under a root — that is how a
+scanner's error becomes a claim about a book. Same problem as the tafsir
+anchor, same shape of answer:
+
+| | |
+|---|---|
+| **fact 1, the proposal** | the OCR'd headword contains the root's radicals in order, by the same written-down rule the `mentions` search uses |
+| **fact 2, the confirmation** | the āyāt the page quotes — recovered independently, by folding the OCR through `mushaf_key()` — intersect the āyāt where that root actually occurs |
+
+**Fact 2 confirms; it cannot propose, and this fails plausibly rather than
+loudly.** Intersecting recovered āyāt against *all* roots just ranks the
+commonest function roots first, because every āyah contains الله or قال: run
+that way, the entry on **صبر ranked صبر fifth**, behind وقي، صلو، رزق، ءمر.
+The direction of the inference is the whole thing. It is trap 4 again — an
+exact string match against a *verb* is not evidence the *noun* is attested.
+
+Measured on scan pp. 395–414: **50 entries ingested, 7 confirmed by both
+facts.** The other 43 are stored unconfirmed and keyed to nothing — 23
+recover no āyah at all, and 20 recover āyāt but have a headword too corrupt
+to propose a root, or propose two and are refused. A 7-of-50 yield is a true
+report of what 20 pages of this OCR can support, and inflating it by dropping
+fact 2 would trade a measured gap for an unmeasured claim.
+
+The entry delimiter is `numeral + dash + vowelled headword + colon`. **The
+numeral is noise and is thrown away**: the OCR gives `٣-` for an entry the
+book prints `٢-`, and two consecutive `٣-` appear on scan 395 and again on
+396. It is never used for ordering and never becomes an id.
+
+### Trap 20 — a misread page number is worse than a missing one
+
+The printed folio is the scan page minus **17**, confirmed on 13 of the 20
+OCR'd pages and independently at scan 45 (prints 28) and scan 72 (prints 55).
+Of the remaining seven, one header was unread and **six were read WRONG**:
+scan 396's header came back 349, and scan 411's came back 392 for a page
+printed **394**.
+
+A header the OCR could not read leaves a hole. A header it read *wrong* names
+**a real page of this book that does not contain the entry** — and Kīlānī's
+article on قِتَال was cited to printed p. 392 until this was caught. The
+citation is the whole product, so the printed number is trusted **only where
+it agrees with the offset**, and `entries.page_method` records which warrant
+applies: `header`, or `offset+17 (header misread as 392)`.
+
+It does **not** go in `flags`. That column drives the alphabetical-order
+badge, and a warrant true of a third of a source would dilute the badge until
+a reviewer stopped reading it — which is the exact failure the order check
+was tuned to avoid.
+
+The general form, and it cost a day: **the warrant must travel with the
+value, in every format.** The OCR's own JSON first stored the raw header
+reading in a field called `printed` with nothing marking the six that were
+wrong. The Markdown beside it marked them; the machine-readable file did not,
+and so it invited the bug. It now carries `page_method` next to an
+always-populated `printed_page`.
+
+## Urdu beside the Arabic, in two layers that are not the same claim
 
 A translation shown next to a scholar's words is where generated prose would
-be least visible, so **the tool refuses to translate** and installs a
-published translator's own lines instead. Eight are installable and **none by
-default**: these translators belong to different schools, and choosing one
-silently is a judgement this program has no business making.
+be least visible. For the **Qurʾān** the tool therefore refuses to translate
+and installs a published translator's own lines instead. Eight are
+installable and **none by default**: these translators belong to different
+schools, and choosing one silently is a judgement this program has no
+business making.
+
+For the **lexicons** there is no published Urdu translation of Maqāyīs, the
+Mufradāt or the Lisān to install, and the owner of this database asked for a
+machine one to read beside the Arabic, knowing what it is. That is a
+legitimate reading aid and a standing hazard, so it is built to be
+unmistakable rather than refused:
+
+| | `translations` | `glosses` |
+|---|---|---|
+| who wrote it | a named translator | nobody — a neural model |
+| covers | the Qurʾān, by āyah | a lexicon entry, by paragraph |
+| shown | with attribution | with the engine and model that made it |
+| where | in the card, like a source | **outside** the card, never inside it |
+| default | on once installed | **off** until switched on |
+
+The card's border means *verbatim, cited*. A machine's output may not borrow
+it, so the gloss is rendered outside the card, in a different colour, with
+`MACHINE TRANSLATION — not a source, not checked by anyone` on **every**
+block. A label shown once at the top of a long page is a label the reader
+scrolls past and then forgets while reading the thing it qualifies.
+
+It is not reviewed, and must never be. `review` stamps `verified = 1`, which
+in this program means *a person vouched for this source*. Nobody can vouch
+for this, so it does not enter that gate at all — it carries an engine and a
+model instead of an approval.
+
+**It is wrong often, and confidently.** Measured on the first run: `سكن` came
+back as English *"housing"*; `آنس من نار` ("more sociable than fire") became
+*run from the fire*; `إن صلاتك سكن لهم` became a sentence about
+relationships; and the sūra name **الأنعام was translated to گائے** — "cow",
+which is al-Baqara. That last one is the argument for the second layer below.
+
+### Where an entry quotes the Qurʾān, the machine does not get the last word
+
+A lexicon quotes the Qurʾān constantly, and where it does, this program
+already **holds** the āyah and, if the reader installed one, a named
+translator's Urdu for it. Both beat a machine's rendering of the same words,
+so a quoted āyah is shown from the muṣḥaf with the translator's line and his
+name, and the gloss is left to the prose around it.
+
+Finding the quotation is the same fold the tafsir anchoring uses, and it
+needs a **higher** bar here. The tafsir can afford two matching trigrams
+because it *also* demands the editor's printed āyah number; inside an entry
+there is usually no number, so the text alone must carry it. Measured on
+al-Rāghib's article on سكن, one paragraph at a threshold of two matched
+**eight āyāt of which six were wrong** — 50:9, 25:48, 31:10 and 43:11 all
+share `من السماء ماء`, and 16:72 and 16:81 share `والله جعل لكم`. At three,
+exactly the two quoted āyāt survive, and both are confirmed by al-Rāghib's
+own printed `[النحل/ 80]` and `[المؤمنون/ 18]`.
+
+Two is still accepted where the author printed the āyah **number** himself,
+which is a second and independent fact. The cost is real and is the right way
+to fail: a short quotation of 6:13 in one paragraph is no longer found. A gap
+is a gap; a wrong āyah under a real translator's name would be a fabricated
+attribution wearing a citation.
+
+`lughat.py` stays **stdlib-only and only ever reads** `glosses`. The
+translator is `tools/gloss_urdu.py`, it runs in the build path, and no model
+runs while anyone is reading — the query path is still pure retrieval.
 
 These rows are **not gated**, and the distinction matters. `entries` and
 `tafsir` are reviewed because their key is *derived* — a parser decided which
@@ -765,7 +942,12 @@ changes, find out which roots moved and why.
 
 ## Layout
 
-Single file, stdlib only, offline after `setup`.
+`lughat.py` is a single file, stdlib only, offline after `setup`. That is not
+a style preference: it is *why* the query path can be trusted to be pure
+retrieval. There is exactly one thing beside it, and it is outside the file
+for the same reason — `tools/gloss_urdu.py` needs a gigabyte of weights and
+three third-party packages, so it lives out there, runs only in the build
+path, and only ever WRITES. Nothing in `lughat.py` imports it.
 
     lughat.py setup [--from PATH]   download / load the corpus
     lughat.py test                  INTEGRITY + HONESTY suites
@@ -782,7 +964,8 @@ Single file, stdlib only, offline after `setup`.
     lughat.py tafsir <sura:aya>     approved commentary on an ayah
     lughat.py ingest <source> --from PATH
                                     maqayis | mufradat | lisan | sirr |
-                                    khasais | furuq | baghawi
+                                    khasais | furuq | baghawi |
+                                    mutaradifaat (scan-only, from OCR JSON)
     lughat.py serve [--port=N]      the approval gate as a local page
     lughat.py review [--stats]      the approval gate
     lughat.py review --root=<root>  approve one root's entries now
@@ -791,6 +974,13 @@ Single file, stdlib only, offline after `setup`.
     lughat.py review --approve-all --everything  both queues at once
     lughat.py review --tafsir       the same gate, for commentary
     lughat.py read [--port=N]       the reading surface: approved sources only
+
+    tools/gloss_urdu.py --model DIR [--source K] [--root R] [--limit N]
+                                    machine Urdu into `glosses`. NOT part of
+                                    lughat.py: needs ctranslate2 + NLLB-200,
+                                    runs offline in the build path, resumable.
+                                    ~0.55 paragraphs/s; 20,739 paragraphs in
+                                    the three lexicons.
 
 ## Two servers, and why they are two
 
@@ -816,6 +1006,11 @@ dictionaries under it.
     Ishtiqāq — Ibn Jinnī the six permutations, his chapter on each radical,
                         al-Khaṣāʾiṣ searched, and his own table of contents
     Qurʾān              the tafsir on each āyah, and every occurrence
+    Synonyms            Kīlānī — a page to open in the scan, never his words
+
+A fourth control sits with the tabs: **Urdu**, off by default, which turns on
+the machine gloss and the published translations of quoted āyāt. It is not a
+source toggle and must not be wired as one — see below.
 
 Because his books cannot be *asked* about a root, the Ibn Jinnī view also
 lets them be entered the way he wrote them: a list of his chapter titles,
@@ -850,6 +1045,16 @@ attestation* and shown with the corpus's grammatical tag, per trap 4.
 - al-Baghawī, *Maʿālim al-Tanzīl fī Tafsīr al-Qurʾān*, ed. al-Nimr,
   Ḍamīriyya and al-Ḥarsh (Dār Ṭayba, 1417/1997), 8 vols. Digital text:
   OpenITI, CC BY-NC-SA. <https://github.com/OpenITI>
+- ʿAbd al-Raḥmān Kīlānī, *Mutarādifāt al-Qurʾān maʿa al-Furūq
+  al-Lughawiyya* (Urdu). **In copyright and not redistributable.** No text of
+  this book is stored or served by this program: only an OCR search key and a
+  page number. The page image is the citation.
+- OCR by Azure AI Document Intelligence, `prebuilt-read`, api-version
+  2024-11-30. The OCR is not the book and is never displayed.
+- Machine Urdu by NLLB-200 (distilled, 600M) — © Meta AI, CC BY-NC 4.0,
+  via CTranslate2. <https://huggingface.co/facebook/nllb-200-distilled-600M>
+  Nobody wrote these lines and nobody has checked them; they are labelled as
+  machine output wherever they appear.
 - Quranic Arabic Corpus, morphology v0.4 — © 2011 Kais Dukes, GNU GPL.
   <http://corpus.quran.com>
 - Tanzil Qur'an text (Uthmani) 1.0.2 — © 2008–2009 Tanzil.info,
