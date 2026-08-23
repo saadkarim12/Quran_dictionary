@@ -674,7 +674,43 @@ wrong. The Markdown beside it marked them; the machine-readable file did not,
 and so it invited the bug. It now carries `page_method` next to an
 always-populated `printed_page`.
 
-## Urdu beside the Arabic, in two layers that are not the same claim
+## Machine glosses: allowed, and quarantined
+
+A reader asked for the dictionary articles in Urdu and English knowing that
+no such translation exists — that it would be a machine's rendering, nobody's
+published work, checked by no one. That is a decision the reader is entitled
+to make about their own tool. It is allowed on four conditions, and the test
+is what keeps them after the asking is forgotten:
+
+`tools/gloss_batch.py` is where the model lives — outside `lughat.py`, by
+design. It reads the approved entries, asks an engine, writes JSONL, and
+reports what it skipped. `--engine=echo` costs the run before a penny is
+spent.
+
+1. **This program does not make them.** It has no model in it and the test
+   forbidding one is not relaxed. A gloss is produced by whatever engine the
+   reader chooses, *outside* the tool, and imported as a JSONL file of
+   `{entry_id, lang, text, engine}` — the same shape as a Tanzil translation.
+   So the query path stays pure retrieval, and the whole corpus can be
+   re-glossed by a better engine without touching a line of a scholar's text.
+2. **Its own table.** `glosses`, never a column on `entries`: the scholar's
+   words and a machine's rendering of them must be impossible to confuse at
+   the storage layer, not merely on screen.
+3. **Its own column beside the Arabic**, and as a WHOLE — never interleaved
+   paragraph against paragraph, which would imply a correspondence nobody
+   checked and is the arrangement where a wrong line reads as the scholar's
+   meaning. Each language is switched on and off in the source selector,
+   labelled *machine* in the switch itself and not only in the card.
+4. **A warning on every one, naming the engine**: *not Ibn Fāris's words, and
+   not checked by anyone.* `gloss --clear` deletes them all and touches
+   nothing else.
+
+What this is not: `entries.text_raw` is still byte-exact, still the only
+thing a citation points at, and a gloss carries no page number, because there
+is no page it was printed on.
+
+
+## Urdu beside the Arabic
 
 A translation shown next to a scholar's words is where generated prose would
 be least visible. For the **Qurʾān** the tool therefore refuses to translate
@@ -992,8 +1028,18 @@ would put a single `unguarded(conn)` call between the reader and a
 fabrication. Its one unguarded query is a `COUNT(*)` of pending rows — a
 number, never text — so an empty card can say *why* it is empty.
 
-Both bind `127.0.0.1`. There is no link to give anyone: the tool is offline by
-architecture, and a "share" would mean serving unreviewed lexicon text.
+Both bind `127.0.0.1`. Neither can be shared as a link, because a server on
+this machine is not reachable from another one — and a "share" of the review
+gate would mean serving unreviewed lexicon text.
+
+`export` is the answer to that: **the reading surface with its server
+removed**, one file, no database. The payload is built by the same
+`read_root()` the server uses, on a **guarded** connection, so an export can
+no more carry an unreviewed article than the page it is made from. What it
+loses is the database, so it holds only the roots it was built with and
+**says so in a banner** rather than pretending to be the whole tool. Sharing
+one shares CC BY-NC-SA lexicon text: every card carries its attribution, and
+that has to travel with it.
 
 The page has **three views**, because the three questions are different and
 the books answering them are keyed differently — a dictionary by **root**, Ibn
