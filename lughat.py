@@ -6597,82 +6597,78 @@ def _t(conn):
     return "the offset is the warrant where the header disagrees"
 
 
-@test("HONESTY", "machine Urdu is never a source and never says it is")
+@test("HONESTY", "per-paragraph glosses are stored apart and shown whole")
 def _t(conn):
-    """The owner of this database asked for a machine translation to read
-    beside the Arabic, knowing it is not a source. That is a legitimate
-    reading aid and a standing hazard: generated prose is least visible
-    exactly where it sits next to a scholar's words. So it is kept in its own
-    table, its own payload key, its own block outside the card, behind a
-    switch that is off, and labelled at every appearance."""
-    # it is NOT in entries, and so cannot be reviewed into a source
+    """The merge of two builds left one table and two truths, and both have
+    to hold at once.
+
+    STORED per paragraph, because that is how they are made: each row is a
+    rendering of that paragraph and of nothing else, so a better engine can
+    replace one paragraph without redoing an article of 16,000 characters.
+
+    SHOWN as one block per language, because laying a machine's lines against
+    a scholar's paragraph by paragraph would imply a correspondence nobody
+    checked. `glosses_for` is the seam where the first becomes the second,
+    and a test that did not pin it would let the two drift apart -- trap 8,
+    arriving through the display instead of the loader."""
     cols = {r[1] for r in conn.execute("PRAGMA table_info(glosses)")}
     ck({"engine", "model", "para", "lang"} <= cols,
        "a gloss does not record which machine produced it")
     ck("verified" not in cols,
        "glosses have a review flag -- nobody can vouch for a machine")
 
-    h = READ_HTML
-    # the card's border means verbatim-and-cited; the gloss must be OUTSIDE
-    ck("'</div></div>'+glossBlock(e)" in h,
-       "the gloss is not appended outside the closing card div")
-    ck("if(!GLOSS) return \"\";" in h,
-       "the gloss renders without the switch being on")
-    ck('localStorage.getItem("lughat.gloss")==="1"' in h,
-       "the gloss switch does not default to off")
-    ck("MACHINE TRANSLATION" in h, "the gloss block carries no label")
-    ck("esc(g[i].text)" in h, "gloss text reaches innerHTML unescaped")
-    # the label must be inside the block, not once at the top of the page
-    blk = h[h.index("function glossBlock("):]
-    blk = blk[:blk.index("\n}")]
-    ck("MACHINE TRANSLATION" in blk,
-       "the label is not emitted with every block")
-    # the published translation is a DIFFERENT claim and must not borrow the
-    # machine's block, nor the machine the published one's attribution
-    qblk = h[h.index("function quotedBlock("):]
-    qblk = qblk[:qblk.index("\n}")]
-    ck("MACHINE" not in qblk,
-       "a named translator's Urdu is labelled as machine output")
-    ck("esc(t.author)" in qblk,
-       "a published translation is shown without its translator")
-    ck("esc(q.ayah)" in qblk,
-       "the quoted ayah is not this program's own mushaf text")
-    ck("if(!GLOSS)" in qblk, "the quoted block ignores the switch")
-
-    # and the payload keeps it in its own key, never merged into `lines`
-    marker = "MACHINE-URDU-MUST-NOT-BE-A-LINE"
     with unguarded(conn):
         conn.execute("SAVEPOINT gl")
         row = conn.execute(
             "SELECT e.id FROM entries e JOIN sources s ON s.id=e.source_id "
             "WHERE e.verified=1 AND s.key IN ('maqayis','lisan','mufradat') "
-            "AND e.root_ar='سكن' LIMIT 1").fetchone()
+            "LIMIT 1").fetchone()
     try:
         if row is None:
-            raise Skip("no approved entry on سكن to gloss")
+            raise Skip("nothing approved to attach a gloss to")
+        eid = row["id"]
         with unguarded(conn):
-            # OR REPLACE: this database may already hold a real gloss for
-            # this paragraph, and the test must not depend on it being empty
+            conn.execute("DELETE FROM glosses WHERE entry_id=?", (eid,))
+            for i, txt in enumerate(("PARA-ZERO", "PARA-ONE", "PARA-TWO")):
+                conn.execute(
+                    "INSERT INTO glosses "
+                    "(entry_id,para,lang,text,engine,model) "
+                    "VALUES (?,?,'ur',?,'t-engine','t-model')", (eid, i, txt))
+        got = glosses_for(conn, eid)
+        ck(len(got) == 1,
+           "three paragraphs of one language became %d blocks" % len(got))
+        ck(got[0]["text"] == "PARA-ZERO PARA-ONE PARA-TWO",
+           "paragraphs were not joined in order: %r" % got[0]["text"])
+        ck(got[0]["engine"] == "t-engine", "the engine was not carried")
+        ck(got[0]["rtl"] is True, "Urdu was not marked right-to-left")
+
+        # ...and the join must be BY PARAGRAPH ORDER, not by rowid, or an
+        # entry re-glossed out of order silently reads backwards
+        with unguarded(conn):
+            conn.execute("DELETE FROM glosses WHERE entry_id=? AND para=1",
+                         (eid,))
             conn.execute(
-                "INSERT OR REPLACE INTO glosses "
-                "(entry_id,para,lang,text,engine,model) "
-                "VALUES (?,0,'ur',?,'nllb','600M')", (row["id"], marker))
-        data = read_root(conn, "سكن")
+                "INSERT INTO glosses (entry_id,para,lang,text,engine,model) "
+                "VALUES (?,1,'ur','PARA-ONE','t-engine','t-model')", (eid,))
+        ck(glosses_for(conn, eid)[0]["text"] == "PARA-ZERO PARA-ONE PARA-TWO",
+           "a re-glossed paragraph came back out of order")
+
+        # and none of it may reach the scholar's own lines.  The root is
+        # read UNGUARDED: `entries` is a base table and the authorizer is
+        # right to refuse it on the query path -- which it just did.
+        with unguarded(conn):
+            rt = conn.execute("SELECT root_ar FROM entries WHERE id=?",
+                              (eid,)).fetchone()[0]
+        data = read_root(conn, rt)
         for c in data["cards"]:
             for e in c["entries"]:
-                ck(marker not in " ".join(e["lines"]),
-                   "machine Urdu was merged into the scholar's own lines")
-        found = [g for c in data["cards"] for e in c["entries"]
-                 for g in e["gloss"].values() if g["text"] == marker]
-        ck(found, "a stored gloss did not reach its own payload key")
-        ck(found[0]["engine"] == "nllb", "the engine was not carried through")
-        ck("MACHINE TRANSLATION" in data["gloss_note"],
-           "the payload does not say what a gloss is")
+                ck("PARA-ZERO" not in " ".join(e["lines"]),
+                   "a machine gloss was merged into the scholar's lines")
     finally:
         with unguarded(conn):
             conn.execute("ROLLBACK TO gl")
             conn.execute("RELEASE gl")
-    return "own table, own key, own block, off by default, labelled"
+    return "stored per paragraph, joined in order, shown as one block"
 
 
 @test("HONESTY", "an inferred root is recorded as inferred")
@@ -9198,8 +9194,6 @@ const VIEWS=[["dict","Dictionary"],["jinni","Ishtiqāq — Ibn Jinnī"],
               ["quran","Qur’an"],["syn","Synonyms"]];
 let VIEW=(()=>{try{return localStorage.getItem("lughat.view")||"dict";}
               catch(e){return "dict";}})();
-let GLOSS=(()=>{try{return localStorage.getItem("lughat.gloss")==="1";}
-                catch(e){return false;}})();
 // A FUNCTION, not a const. As a const this was a snapshot taken once at
 // load, so every redraw re-inserted the switch in its ORIGINAL state: GLOSS
 // flipped and the Urdu appeared, but the box drew itself unchecked again a
@@ -9207,8 +9201,6 @@ let GLOSS=(()=>{try{return localStorage.getItem("lughat.gloss")==="1";}
 function tabbar(){
  return '<nav class="tabs">'+VIEWS.map(v=>
   '<button data-v="'+v[0]+'">'+v[1]+'</button>').join("")+
-  '<label class="gsw" title="machine-translated Urdu beside the Arabic">'+
-  '<input type="checkbox" id="gsw"'+(GLOSS?" checked":"")+'> Urdu</label>'+
   '</nav>';
 }
 
@@ -9217,46 +9209,7 @@ function tabbar(){
 // borrow it. Off unless switched on, and labelled every time it appears: a
 // label shown once at the top of a long page is a label the reader scrolls
 // past and then forgets while reading the thing it qualifies.
-function quotedBlock(e){
- if(!GLOSS) return "";
- const Q=e.quoted||{}; const ks=Object.keys(Q);
- if(!ks.length) return "";
- let h="";
- for(const k of ks) for(const q of Q[k]){
-  // the ayah is OUR mushaf text and the Urdu is a NAMED translator's, so
-  // this block carries an attribution and the machine block cannot
-  // FOLDED. An ayah is long -- 2:102 alone outruns the article quoting it --
-  // and 41 of them opened at once on ع ل م buried the scholar's own words,
-  // which is the same mistake the sarf grid made before it was folded. The
-  // summary still names the ayah, so nothing is hidden, only closed.
-  h+='<details class="quoted"><summary class="qhead">Qur\u2019\u0101n '+
-   esc(q.ref)+' &mdash; quoted here'+
-   ((q.translations||[]).length?', with '+esc(q.translations[0].author):'')+
-   '</summary>'+
-   '<div class="aya ar">'+esc(q.ayah)+'</div>';
-  for(const t of (q.translations||[])){
-   if(HIDDEN.has(t.key)) continue;
-   h+='<div class="tr ur">'+esc(t.text)+'<span class="by">'+esc(t.title)+
-    ' &middot; '+esc(t.author)+'</span></div>';}
-  h+='</details>';
- }
- return h;
-}
 
-function glossBlock(e){
- if(!GLOSS) return "";
- const g=e.gloss||{}, ks=Object.keys(g);
- if(!ks.length) return "";
- const eng=g[ks[0]];
- let h='<div class="gloss"><div class="glosshead">MACHINE TRANSLATION'+
-  ' &mdash; not a source, not checked by anyone &middot; '+
-  esc(eng.engine)+' '+esc(eng.model)+'</div>';
- // paragraph indices line up with e.lines, so the two can be read against
- // each other; a paragraph with no gloss is left out rather than blanked
- for(let i=0;i<e.lines.length;i++)
-  if(g[i]) h+='<p class="ur">'+esc(g[i].text)+'</p>';
- return h+'</div>';
-}
 
 function showView(v){
  VIEW=v;
@@ -9289,7 +9242,7 @@ function draw(){
  // Jinni by LETTER and by TOPIC, the mushaf by AYAH.
  h+='<section data-view="dict">';
  h+='<h2>Dictionaries</h2><div class="srcsel">';
- for(const c of r.cards.concat(r.tafsir_sources||[]))
+ for(const c of r.cards)
   h+='<label><input type="checkbox" data-k="'+esc(c.key)+
   '"'+(HIDDEN.has(c.key)?"":" checked")+'> '+esc(c.title)+'</label>';
  // the machine glosses are switched separately, and labelled as machine
@@ -9391,8 +9344,8 @@ function draw(){
    h+='<div class="card"><div class="ct"><b class="ar">'+esc(L.letter)+'</b>'+
     '<span class="who">'+esc(e.title)+'</span>'+
     '<span class="cite">vol '+esc(e.vol)+' p. '+esc(e.page)+'</span></div>'+
-    '<div class="txt ar">'+e.lines.map(l=>"<p>"+esc(l)+"</p>").join("")+'</div>'+
-    '<div class="attrib">'+esc(e.attribution)+'</div></div>'+glossBlock(e)+quotedBlock(e);
+    body(e, e.title, r.gloss_warning)+
+    '<div class="attrib">'+esc(e.attribution)+'</div></div>';
  }
 
  if(r.tafsir&&r.tafsir.length){
@@ -9450,13 +9403,17 @@ function draw(){
 
  h+='</details>';
  h+='</section><section data-view="quran">';
- if((r.translations||[]).length){
-  h+='<div class="srcsel">';
-  for(const c of r.translations)
-   h+='<label><input type="checkbox" data-k="'+esc(c.key)+
-   '"'+(HIDDEN.has(c.key)?"":" checked")+'> '+esc(c.title)+'</label>';
-  h+='</div>';
- }
+ // every switch for something rendered in THIS view: the commentaries and
+ // the translations. Neither has a card in the Dictionary tab, so neither
+ // had any business being switched from there.
+ {const qs=(r.tafsir_sources||[]).concat(r.translations||[]);
+  if(qs.length){
+   h+='<div class="srcsel">';
+   for(const c of qs)
+    h+='<label><input type="checkbox" data-k="'+esc(c.key)+
+    '"'+(HIDDEN.has(c.key)?"":" checked")+'> '+esc(c.title)+'</label>';
+   h+='</div>';
+  }}
  h+='<h2>Tafsir</h2><div class="cls" style="margin:-.3rem 0 .6rem">'+
   'on the āyāt where this root occurs</div>';
   for(const a of r.tafsir){
@@ -9556,11 +9513,6 @@ function draw(){
  if(toc) toc.addEventListener("toggle",()=>{if(toc.open)tocOpen();});
  m.querySelectorAll(".tabs button").forEach(b=>
   b.addEventListener("click",()=>showView(b.dataset.v)));
- const gs=document.getElementById("gsw");
- if(gs) gs.addEventListener("change",()=>{
-  GLOSS=gs.checked;
-  try{localStorage.setItem("lughat.gloss",GLOSS?"1":"0");}catch(e){}
-  draw();showView(VIEW);});
  m.querySelectorAll(".srcsel input[type=checkbox]").forEach(cb=>{
   cb.addEventListener("change",()=>{
    const k=cb.dataset.k;
@@ -9580,17 +9532,6 @@ if(q0){box.value=q0;go();}
 """
 
 READ_PORT = 8766
-
-
-GLOSS_IS_A_MACHINE = (
-    "MACHINE TRANSLATION. No translator wrote this and nobody has checked "
-    "it. It was produced by a neural model run over the Arabic beside it, "
-    "offline, in the build path -- this program does not translate anything "
-    "while you read. It is a reading aid and it is NOT evidence: where it "
-    "disagrees with the Arabic, the Arabic is what the scholar wrote. These "
-    "texts are 10th-century technical prose, which is the register machine "
-    "translation is worst at, so expect it to be fluent and wrong rather "
-    "than obviously broken.")
 
 
 def entry_glosses(conn, entry_id, lang="ur"):
@@ -9788,17 +9729,6 @@ def read_root(conn, query):
                 "lines": (render_entry(e["text_raw"])
                           if e["text_raw"] is not None
                           else ["[scan only]", e["scan_uri"] or ""]),
-                # kept in its OWN key, never merged into `lines`: a reader
-                # and a later maintainer must both be able to see at a glance
-                # which strings are the scholar's and which are a machine's.
-                "gloss": entry_glosses(conn, e["id"]),
-                # where a paragraph QUOTES the Qur'an, this program already
-                # holds the ayah and a named translator's Urdu for it. Those
-                # beat a machine's rendering of the same words outright, and
-                # they carry an attribution, so they are kept apart from the
-                # gloss as well as from the scholar's own lines.
-                "quoted": (quoted_by_para(conn, e["text_raw"])
-                           if e["text_raw"] is not None else {}),
             })
         out["cards"].append(card)
 
@@ -9811,8 +9741,7 @@ def read_root(conn, query):
             "entries": [{"lines": render_entry(e["text_raw"])[:3],
                          "vol": e["vol"], "page": e["page"],
                          "title": e["title"], "attribution": e["attribution"],
-                         "gloss": entry_glosses(conn, e["id"]),
-                         "quoted": quoted_by_para(conn, e["text_raw"])}
+                         "glosses": glosses_for(conn, e["id"])}
                         for e in ents]})
     out["letter_cards"] = letter_cards
 
@@ -9921,19 +9850,6 @@ def read_root(conn, query):
 
     out["akbar_refusal"] = REFUSAL_AKBAR_SENSE
     out["synonyms"] = kilani_for_root(conn, root)
-    out["gloss_note"] = GLOSS_IS_A_MACHINE
-    # engines present for THIS root, so the switch is offered only where it
-    # would do something and the reader can see which machine wrote the Urdu
-    seen = {}
-    for c in out["cards"]:
-        for e in c["entries"]:
-            for g in e["gloss"].values():
-                seen[(g["engine"], g["model"])] = True
-    for c in out["letter_cards"]:
-        for e in c["entries"]:
-            for g in e["gloss"].values():
-                seen[(g["engine"], g["model"])] = True
-    out["gloss_engines"] = [{"engine": k[0], "model": k[1]} for k in seen]
     return out
 
 
